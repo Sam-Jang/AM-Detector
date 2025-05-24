@@ -1,0 +1,232 @@
+package com.ecommerce.pricing;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+class PricingConfig {
+    private double basePriceWeight;
+    private double competitorPriceWeight;
+    private double demandWeight;
+    private double minPriceMargin;
+    private double maxPriceMargin;
+
+    public double getBasePriceWeight() { return basePriceWeight; }
+    public void setBasePriceWeight(double basePriceWeight) { this.basePriceWeight = basePriceWeight; }
+    public double getCompetitorPriceWeight() { return competitorPriceWeight; }
+    public void setCompetitorPriceWeight(double competitorPriceWeight) { this.competitorPriceWeight = competitorPriceWeight; }
+    public double getDemandWeight() { return demandWeight; }
+    public void setDemandWeight(double demandWeight) { this.demandWeight = demandWeight; }
+    public double getMinPriceMargin() { return minPriceMargin; }
+    public void setMinPriceMargin(double minPriceMargin) { this.minPriceMargin = minPriceMargin; }
+    public double getMaxPriceMargin() { return maxPriceMargin; }
+    public void setMaxPriceMargin(double maxPriceMargin) { this.maxPriceMargin = maxPriceMargin; }
+}
+
+class Product {
+    private int id;
+    private String name;
+    private String description;
+    private double basePrice;
+    private double currentPrice;
+    private double discount;
+    private int stock;
+    private List<String> keywords;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public double getBasePrice() { return basePrice; }
+    public void setBasePrice(double basePrice) { this.basePrice = basePrice; }
+    public double getCurrentPrice() { return currentPrice; }
+    public void setCurrentPrice(double currentPrice) { this.currentPrice = currentPrice; }
+    public double getDiscount() { return discount; }
+    public void setDiscount(double discount) { this.discount = discount; }
+    public int getStock() { return stock; }
+    public void setStock(int stock) { this.stock = stock; }
+    public List<String> getKeywords() { return keywords; }
+    public void setKeywords(List<String> keywords) { this.keywords = keywords; }
+}
+
+class CompetitorPrice {
+    private int productId;
+    private String competitorName;
+    private double price;
+    private Instant lastUpdated;
+
+    public int getProductId() { return productId; }
+    public void setProductId(int productId) { this.productId = productId; }
+    public String getCompetitorName() { return competitorName; }
+    public void setCompetitorName(String competitorName) { this.competitorName = competitorName; }
+    public double getPrice() { return price; }
+    public void setPrice(double price) { this.price = price; }
+    public Instant getLastUpdated() { return lastUpdated; }
+    public void setLastUpdated(Instant lastUpdated) { this.lastUpdated = lastUpdated; }
+}
+
+class CartItem {
+    private int productId;
+    private int quantity;
+    private double priceAtAdd;
+
+    public int getProductId() { return productId; }
+    public void setProductId(int productId) { this.productId = productId; }
+    public int getQuantity() { return quantity; }
+    public void setQuantity(int quantity) { this.quantity = quantity; }
+    public double getPriceAtAdd() { return priceAtAdd; }
+    public void setPriceAtAdd(double priceAtAdd) { this.priceAtAdd = priceAtAdd; }
+}
+
+class Order {
+    private int id;
+    private String userId;
+    private List<CartItem> items;
+    private double total;
+    private Instant orderDate;
+    private String status;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+    public List<CartItem> getItems() { return items; }
+    public void setItems(List<CartItem> items) { this.items = items; }
+    public double getTotal() { return total; }
+    public void setTotal(double total) { this.total = total; }
+    public Instant getOrderDate() { return orderDate; }
+    public void setOrderDate(Instant orderDate) { this.orderDate = orderDate; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+}
+
+@Service
+public class ECommerceService {
+    private final JdbcTemplate jdbcTemplate;
+    private final PricingConfig config;
+
+    @Value("${pricing.config.path}")
+    private String configFilePath;
+
+    public ECommerceService(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+        this.config = loadPricingConfig();
+    }
+
+    @PostConstruct
+    private PricingConfig loadPricingConfig() {
+        try {
+            String json = Files.readString(Paths.get(configFilePath));
+            ObjectMapper mapper = new ObjectMapper();
+            return mapper.readValue(json, PricingConfig.class);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load pricing config", e);
+        }
+    }
+
+    public void updateProductPrices() {
+        List<Product> products = getAllProducts();
+        for (Product product : products) {
+            double newPrice = calculateNewPrice(product);
+            updateProductPrice(product.getId(), newPrice);
+        }
+    }
+
+    private double calculateNewPrice(Product product) {
+        List<CompetitorPrice> competitorPrices = getCompetitorPrices(product.getId());
+        double avgCompetitorPrice = competitorPrices.isEmpty()
+                ? product.getBasePrice()
+                : competitorPrices.stream().mapToDouble(CompetitorPrice::getPrice).average().orElse(product.getBasePrice());
+
+        double demandFactor = calculateDemandFactor(product.getId());
+        double weightedPrice = (config.getBasePriceWeight() * product.getBasePrice() +
+                config.getCompetitorPriceWeight() * avgCompetitorPrice +
+                config.getDemandWeight() * demandFactor * product.getBasePrice()) /
+                (config.getBasePriceWeight() + config.getCompetitorPriceWeight() + config.getDemandWeight());
+
+        double minPrice = product.getBasePrice() * config.getMinPriceMargin();
+        double maxPrice = product.getBasePrice() * config.getMaxPriceMargin();
+        return Math.max(minPrice, Math.min(maxPrice, weightedPrice));
+    }
+
+    private double calculateDemandFactor(int productId) {
+        int salesLastMonth = getSalesCount(productId, Instant.now().minusSeconds(30L * 24 * 60 * 60));
+        int avgSales = getAverageSalesCount(productId);
+        return (salesLastMonth > 0 && avgSales > 0) ? (double) salesLastMonth / avgSales : 1.0;
+    }
+
+    private List<Product> getAllProducts() {
+        String query = "SELECT Id, Name, Description, BasePrice, CurrentPrice, Discount, Stock, Keywords FROM Products";
+        return jdbcTemplate.query(query, (rs, rowNum) -> {
+            Product product = new Product();
+            product.setId(rs.getInt("Id"));
+            product.setName(rs.getString("Name"));
+            product.setDescription(rs.getString("Description"));
+            product.setBasePrice(rs.getDouble("BasePrice"));
+            product.setCurrentPrice(rs.getDouble("CurrentPrice"));
+            product.setDiscount(rs.getDouble("Discount"));
+            product.setStock(rs.getInt("Stock"));
+            product.setKeywords(Arrays.asList(rs.getString("Keywords").split(",")));
+            return product;
+        });
+    }
+
+    private List<CompetitorPrice> getCompetitorPrices(int productId) {
+        String query = "SELECT ProductId, CompetitorName, Price, LastUpdated FROM CompetitorPrices WHERE ProductId = ?";
+        return jdbcTemplate.query(query, new Object[]{productId}, (rs, rowNum) -> {
+            CompetitorPrice cp = new CompetitorPrice();
+            cp.setProductId(rs.getInt("ProductId"));
+            cp.setCompetitorName(rs.getString("CompetitorName"));
+            cp.setPrice(rs.getDouble("Price"));
+            cp.setLastUpdated(rs.getTimestamp("LastUpdated").toInstant());
+            return cp;
+        });
+    }
+
+    private int getSalesCount(int productId, Instant startDate) {
+        String query = "SELECT COALESCE(SUM(Quantity), 0) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)";
+        return jdbcTemplate.queryForObject(query, new Object[]{productId, Timestamp.from(startDate)}, Integer.class);
+    }
+
+    private int getAverageSalesCount(int productId) {
+        String query = "SELECT COALESCE(AVG(Quantity), 1) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)";
+        return jdbcTemplate.queryForObject(query, new Object[]{productId, Timestamp.from(Instant.now().minusSeconds(365L * 24 * 60 * 60))}, Integer.class);
+    }
+
+    private void updateProductPrice(int productId, double newPrice) {
+        String query = "UPDATE Products SET CurrentPrice = ?, LastUpdated = ? WHERE Id = ?";
+        jdbcTemplate.update(query, newPrice, Timestamp.from(Instant.now()), productId);
+    }
+
+    public List<Product> searchProducts(String keyword, String sortBy) {
+        List<Product> products = getAllProducts();
+        List<Product> filtered = products.stream()
+                .filter(p -> p.getName().toLowerCase().contains(keyword.toLowerCase()) ||
+                        p.getDescription().toLowerCase().contains(keyword.toLowerCase()) ||
+                        p.getKeywords().stream().anyMatch(k -> k.toLowerCase().contains(keyword.toLowerCase())))
+                .collect(Collectors.toList());
+
+        switch (sortBy.toLowerCase()) {
+            case "priceasc":
+                filtered.sort((p1, p2) -> Double.compare(p1.getCurrentPrice(), p2.getCurrentPrice()));
+                break;
+            default:
+                break;
+        }
+        return filtered;
+    }
+}

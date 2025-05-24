@@ -1,0 +1,54 @@
+import heapq
+import math
+
+class Taxi:
+    def __init__(self, taxi_id, location):
+        self.taxi_id = taxi_id
+        self.location = location
+        self.available = True
+
+    def __lt__(self, other):
+        return self.distance_to_request < other.distance_to_request
+
+class Request:
+    def __init__(self, request_id, location):
+        self.request_id = request_id
+        self.location = location
+
+def calculate_distance(loc1, loc2):
+    return math.sqrt((loc1[0] - loc2[0]) ** 2 + (loc1[1] - loc2[1]) ** 2)
+
+class TaxiDispatchSystem:
+    def __init__(self):
+        self.taxis = []
+        self.requests = []
+
+    def add_taxi(self, taxi):
+        heapq.heappush(self.taxis, taxi)
+
+    def add_request(self, request):
+        self.requests.append(request)
+        self.dispatch_request(request)
+
+    def dispatch_request(self, request):
+        if not self.taxis:
+            print(f"No taxis available for request {request.request_id}")
+            return
+
+        available_taxis = [taxi for taxi in self.taxis if taxi.available]
+        
+        if not available_taxis:
+            print(f"No available taxis for request {request.request_id}")
+            return
+
+        for taxi in available_taxis:
+            taxi.distance_to_request = calculate_distance(taxi.location, request.location)
+
+        sorted_taxis = sorted(available_taxis, key=lambda taxi: taxi.distance_to_request)
+
+        closest_taxi = sorted_taxis[0]
+        closest_taxi.available = False
+
+        print(f"Request {request.request_id} dispatched to Taxi {closest_taxi.taxi_id}")
+
+        self.taxis.remove(closest_taxi)

@@ -1,0 +1,293 @@
+import sqlite3
+
+class UserProfile:
+    def __init__(self, username, password, address):
+        self.username = username
+        self.password = password
+        self.address = address
+        self.coupons = []
+
+class Category:
+    def __init__(self, name, description):
+        self.name = name
+        self.description = description
+
+class Product:
+    def __init__(self, name, description, price, category, stock):
+        self.name = name
+        self.description = description
+        self.price = price
+        self.category = category
+        self.stock = stock
+        self.liked_by = []
+        self.reviews = []
+
+class Review:
+    def __init__(self, user, comment, rating):
+        self.user = user
+        self.comment = comment
+        self.rating = rating
+
+class Coupon:
+    def __init__(self, code, discount):
+        self.code = code
+        self.discount = discount
+
+class Order:
+    def __init__(self, user, product, quantity):
+        self.user = user
+        self.product = product
+        self.quantity = quantity
+        self.status = "Processing"
+
+class SupportTicket:
+    def __init__(self, user, message):
+        self.user = user
+        self.message = message
+        self.status = "Open"
+
+class ShoppingCart:
+    def __init__(self):
+        self.items = []
+
+    def add_product(self, order):
+        self.items.append(order)
+
+    def remove_product(self, order):
+        self.items.remove(order)
+
+    def calculate_total(self):
+        return sum(item.product.price * item.quantity for item in self.items)
+
+    def apply_coupon(self, coupon):
+        return self.calculate_total() * (1 - coupon.discount / 100)
+
+class Shop:
+    def __init__(self):
+        self.users = []
+        self.categories = []
+        self.products = []
+        self.available_coupons = []
+        self.support_tickets = []
+        self.orders = []
+        self.shopping_cart = ShoppingCart()
+        self.current_user = None
+        self.connection_string = "shop.db"
+        self.load_data_from_database()
+
+    def load_data_from_database(self):
+        conn = sqlite3.connect(self.connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM Users")
+        for row in cursor.fetchall():
+            self.users.append(UserProfile(row[0], row[1], row[2]))
+
+        cursor.execute("SELECT * FROM Categories")
+        for row in cursor.fetchall():
+            self.categories.append(Category(row[0], row[1]))
+
+        cursor.execute("SELECT * FROM Products")
+        for row in cursor.fetchall():
+            self.products.append(Product(row[0], row[1], float(row[2]), row[3], int(row[4])))
+
+        cursor.execute("SELECT * FROM Coupons")
+        for row in cursor.fetchall():
+            self.available_coupons.append(Coupon(row[0], float(row[1])))
+
+        conn.close()
+
+    def login(self, username, password):
+        for user in self.users:
+            if user.username == username and user.password == password:
+                self.current_user = user
+                print(f"Logged in as {username}")
+                return True
+        print("Login failed")
+        return False
+
+    def signup(self, username, password, address):
+        conn = sqlite3.connect(self.connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("INSERT INTO Users (Username, Password, Address) VALUES (?, ?, ?)", (username, password, address))
+        conn.commit()
+        conn.close()
+
+        self.users.append(UserProfile(username, password, address))
+        print("User registered successfully!")
+
+    def search_products(self, query):
+        print(f"Search results for '{query}':")
+        for product in self.products:
+            if query in product.name or query in product.description:
+                print(f"{product.name} - {product.price} USD")
+
+    def filter_products_by_category(self, category):
+        print(f"Products in category '{category}':")
+        for product in self.products:
+            if product.category == category:
+                print(f"{product.name} - {product.price} USD")
+
+    def toggle_like_product(self, product_name):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        for product in self.products:
+            if product.name == product_name:
+                if self.current_user.username in product.liked_by:
+                    product.liked_by.remove(self.current_user.username)
+                    print("Product removed from wishlist.")
+                else:
+                    product.liked_by.append(self.current_user.username)
+                    print("Product added to wishlist.")
+                return
+        print("Product not found.")
+
+    def add_to_cart(self, product_name, quantity):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        for product in self.products:
+            if product.name == product_name:
+                if product.stock >= quantity:
+                    order = Order(self.current_user, product, quantity)
+                    self.shopping_cart.add_product(order)
+                    self.orders.append(order)
+                    print(f"{product_name} added to cart.")
+                else:
+                    print(f"Not enough stock for {product_name}. Only {product.stock} left.")
+                return
+        print("Product not found.")
+
+    def view_cart(self):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        print("Your Cart:")
+        for order in self.shopping_cart.items:
+            if order.user == self.current_user:
+                print(f"{order.product.name} - {order.quantity} units - {order.product.price * order.quantity} USD")
+
+    def apply_coupon(self, coupon_code):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        coupon = next((c for c in self.available_coupons if c.code == coupon_code), None)
+        if coupon:
+            total = self.shopping_cart.apply_coupon(coupon)
+            print(f"Coupon applied. Total after discount: {total} USD")
+        else:
+            print("Invalid coupon code.")
+
+    def checkout(self):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        total = self.shopping_cart.calculate_total()
+        print(f"Total amount to pay: {total} USD")
+        print("Order placed successfully!")
+
+        for order in self.shopping_cart.items:
+            order.product.stock -= order.quantity
+
+        self.shopping_cart.items.clear()
+
+    def write_review(self, product_name, comment, rating):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        for product in self.products:
+            if product.name == product_name:
+                product.reviews.append(Review(self.current_user, comment, rating))
+                print("Review added.")
+                return
+        print("Product not found.")
+
+    def view_reviews(self, product_name):
+        for product in self.products:
+            if product.name == product_name:
+                print(f"Reviews for {product.name}:")
+                for review in product.reviews:
+                    print(f"{review.user.username}: {review.comment} (Rating: {review.rating}/5)")
+                return
+        print("Product not found.")
+
+    def contact_support(self, message):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        self.support_tickets.append(SupportTicket(self.current_user, message))
+        print("Support ticket created. We will get back to you soon.")
+
+    def view_support_tickets(self):
+        if self.current_user is None:
+            print("Please login first.")
+            return
+
+        print("Your Support Tickets:")
+        for ticket in self.support_tickets:
+            if ticket.user == self.current_user:
+                print(f"{ticket.message} - Status: {ticket.status}")
+
+    def run(self):
+        while True:
+            command = input("\nEnter a command (signup, login, search, category, like, add, cart, applycoupon, checkout, review, viewreviews, support, viewsupport, exit): ")
+
+            if command == "signup":
+                username = input("Username: ")
+                password = input("Password: ")
+                address = input("Address: ")
+                self.signup(username, password, address)
+            elif command == "login":
+                username = input("Username: ")
+                password = input("Password: ")
+                self.login(username, password)
+            elif command == "search":
+                query = input("Search: ")
+                self.search_products(query)
+            elif command == "category":
+                category = input("Category: ")
+                self.filter_products_by_category(category)
+            elif command == "like":
+                product_name = input("Product name: ")
+                self.toggle_like_product(product_name)
+            elif command == "add":
+                product_name = input("Product name: ")
+                quantity = int(input("Quantity: "))
+                self.add_to_cart(product_name, quantity)
+            elif command == "cart":
+                self.view_cart()
+            elif command == "applycoupon":
+                coupon_code = input("Coupon code: ")
+                self.apply_coupon(coupon_code)
+            elif command == "checkout":
+                self.checkout()
+            elif command == "review":
+                product_name = input("Product name: ")
+                comment = input("Your review: ")
+                rating = int(input("Rating (1-5): "))
+                self.write_review(product_name, comment, rating)
+            elif command == "viewreviews":
+                product_name = input("Product name: ")
+                self.view_reviews(product_name)
+            elif command == "support":
+                message = input("Your message: ")
+                self.contact_support(message)
+            elif command == "viewsupport":
+                self.view_support_tickets()
+            elif command == "exit":
+                break
+            else:
+                print("Invalid command")
+
+if __name__ == "__main__":
+    shop = Shop()
+    shop.run()

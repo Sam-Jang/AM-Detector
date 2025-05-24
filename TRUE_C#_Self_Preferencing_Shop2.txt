@@ -1,0 +1,429 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using System.Text.Json;
+using System.IO;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ECommerceSearchService
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddDbContext<AppDbContext>(options =>
+                options.UseMySql(builder.Configuration.GetConnectionString("DefaultConnection"),
+                    new MySqlServerVersion(new Version(8, 0, 21))));
+            builder.Services.AddControllers();
+            var app = builder.Build();
+            app.UseAuthorization();
+            app.MapControllers();
+            app.Run();
+        }
+    }
+
+    public class AppDbContext : DbContext
+    {
+        public DbSet<Product> Products { get; set; }
+        public DbSet<User> Users { get; set; }
+        public DbSet<CartItem> CartItems { get; set; }
+
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<Product>().HasIndex(p => p.Name).HasMethod("FULLTEXT");
+            modelBuilder.Entity<Product>().HasIndex(p => p.Description).HasMethod("FULLTEXT");
+        }
+    }
+
+    public class Product
+    {
+        public int Id { get; set; }
+        [Required]
+        public string Name { get; set; }
+        public string Description { get; set; }
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal Price { get; set; }
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal DiscountedPrice { get; set; }
+        public bool IsSponsored { get; set; }
+        public bool IsOwnBrand { get; set; }
+        public int StockQuantity { get; set; }
+        public string Category { get; set; }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        [Required]
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public string PasswordHash { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int ProductId { get; set; }
+        public int Quantity { get; set; }
+        public User User { get; set; }
+        public Product Product { get; set; }
+    }
+
+    public class SearchConfig
+    {
+        public double RelevanceWeight { get; set; }
+        public double PriceWeight { get; set; }
+        public double DiscountWeight { get; set; }
+        public double SponsorBias { get; set; }
+        public double OwnBrandBias { get; set; }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class SearchController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly SearchConfig _config;
+
+        public SearchController(AppDbContext context, IConfiguration configuration)
+        {
+            _context = context;
+            var configPath = configuration["SearchConfigPath"];
+            var json = File.ReadAllText(configPath);
+            _config = JsonSerializer.Deserialize<SearchConfig>(json);
+        }
+
+        [HttpGet("search")]
+        public async Task<ActionResult<IEnumerable<Product>>> SearchProducts(
+            string query, 
+            string sortBy = "relevance", 
+            int page = 1, 
+            int pageSize = 10)
+        {
+            var products = await _context.Products
+                .Where(p => EF.Functions.Match(p.Name, query, MySqlMatchMode.Boolean) ||
+                            EF.Functions.Match(p.Description, query, MySqlMatchMode.Boolean))
+                .ToListAsync();
+
+            var scoredProducts = products.Select(p => new
+            {
+                Product = p,
+                Score = CalculateProductScore(p, query, sortBy)
+            }).OrderByDescending(x => x.Score);
+
+            var pagedProducts = scoredProducts
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Select(x => x.Product);
+
+            return Ok(pagedProducts);
+        }
+
+        private double CalculateProductScore(Product product, string query, string sortBy)
+        {
+            double score = 0;
+
+            if (sortBy == "relevance")
+            {
+                score += CalculateRelevanceScore(product, query) * _config.RelevanceWeight;
+                score += (1 - (product.Price / GetMaxPrice())) * _config.PriceWeight;
+                score += (product.Price - product.DiscountedPrice) / product.Price * _config.DiscountWeight;
+                if (product.IsSponsored) score += _config.SponsorBias;
+                if (product.IsOwnBrand) score += _config.OwnBrandBias;
+            }
+            else if (sortBy == "price_asc")
+            {
+                score = product.DiscountedPrice == 0 ? product.Price : product.DiscountedPrice;
+                score = 1 / (score + 1);
+            }
+            else if (sortBy == "price_desc")
+            {
+                score = product.DiscountedPrice == 0 ? product.Price : product.DiscountedPrice;
+            }
+            else if (sortBy == "discount")
+            {
+                score = (product.Price - product.DiscountedPrice) / product.Price;
+            }
+
+            return score;
+        }
+
+        private double CalculateRelevanceScore(Product product, string query)
+        {
+            var queryWords = query.ToLower().Split(' ');
+            var nameWords = product.Name.ToLower().Split(' ');
+            var descWords = product.Description?.ToLower().Split(' ') ?? new string[0];
+
+            double score = queryWords.Count(q => nameWords.Contains(q)) * 0.6;
+            score += queryWords.Count(q => descWords.Contains(q)) * 0.4;
+
+            return score / queryWords.Length;
+        }
+
+        private decimal GetMaxPrice()
+        {
+            return _context.Products.Max(p => p.Price);
+        }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class CartController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public CartController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpGet("{userId}")]
+        public async Task<ActionResult<IEnumerable<CartItem>>> GetCart(int userId)
+        {
+            var cartItems = await _context.CartItems
+                .Include(ci => ci.Product)
+                .Where(ci => ci.UserId == userId)
+                .ToListAsync();
+            return Ok(cartItems);
+        }
+
+        [HttpPost]
+        public async Task<ActionResult<CartItem>> AddToCart([FromBody] CartItemRequest request)
+        {
+            var product = await _context.Products.FindAsync(request.ProductId);
+            if (product == null || product.StockQuantity < request.Quantity)
+                return BadRequest("Product unavailable or insufficient stock");
+
+            var cartItem = new CartItem
+            {
+                UserId = request.UserId,
+                ProductId = request.ProductId,
+                Quantity = request.Quantity
+            };
+
+            _context.CartItems.Add(cartItem);
+            product.StockQuantity -= request.Quantity;
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetCart), new { userId = cartItem.UserId }, cartItem);
+        }
+
+        [HttpPut("{id}")]
+        public async Task<IActionResult> UpdateCartItem(int id, [FromBody] UpdateCartItemRequest request)
+        {
+            var cartItem = await _context.CartItems.FindAsync(id);
+            if (cartItem == null) return NotFound();
+
+            var product = await _context.Products.FindAsync(cartItem.ProductId);
+            var quantityDiff = request.Quantity - cartItem.Quantity;
+
+            if (product.StockQuantity < quantityDiff)
+                return BadRequest("Insufficient stock");
+
+            cartItem.Quantity = request.Quantity;
+            product.StockQuantity -= quantityDiff;
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> RemoveFromCart(int id)
+        {
+            var cartItem = await _context.CartItems.FindAsync(id);
+            if (cartItem == null) return NotFound();
+
+            var product = await _context.Products.FindAsync(cartItem.ProductId);
+            product.StockQuantity += cartItem.Quantity;
+
+            _context.CartItems.Remove(cartItem);
+            await _context.SaveChangesAsync();
+
+            return NoContent();
+        }
+    }
+
+    public class CartItemRequest
+    {
+        public int UserId { get; set; }
+        public int ProductId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class UpdateCartItemRequest
+    {
+        public int Quantity { get; set; }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class UserController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public UserController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost("register")]
+        public async Task<ActionResult<User>> Register([FromBody] RegisterRequest request)
+        {
+            if (await _context.Users.AnyAsync(u => u.Username == request.Username))
+                return BadRequest("Username already exists");
+
+            var user = new User
+            {
+                Username = request.Username,
+                Email = request.Email,
+                PasswordHash = HashPassword(request.Password)
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetUser), new { id = user.Id }, user);
+        }
+
+        [HttpPost("login")]
+        public async Task<ActionResult<User>> Login([FromBody] LoginRequest request)
+        {
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == request.Username);
+
+            if (user == null || !VerifyPassword(request.Password, user.PasswordHash))
+                return Unauthorized("Invalid credentials");
+
+            return Ok(user);
+        }
+
+        [HttpGet("{id}")]
+        public async Task<ActionResult<User>> GetUser(int id)
+        {
+            var user = await _context.Users.FindAsync(id);
+            if (user == null) return NotFound();
+            return Ok(user);
+        }
+
+        private string HashPassword(string password)
+        {
+            return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(password));
+        }
+
+        private bool VerifyPassword(string password, string hash)
+        {
+            return HashPassword(password) == hash;
+        }
+    }
+
+    public class RegisterRequest
+    {
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class LoginRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class ProductController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public ProductController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<Product>>> GetProducts()
+        {
+            return await _context.Products.ToListAsync();
+        }
+
+        [HttpGet("{id}")]
+        public async Task<ActionResult<Product>> GetProduct(int id)
+        {
+            var product = await _context.Products.FindAsync(id);
+            if (product == null) return NotFound();
+            return Ok(product);
+        }
+
+        [HttpPost]
+        public async Task<ActionResult<Product>> CreateProduct([FromBody] ProductRequest request)
+        {
+            var product = new Product
+            {
+                Name = request.Name,
+                Description = request.Description,
+                Price = request.Price,
+                DiscountedPrice = request.DiscountedPrice,
+                IsSponsored = request.IsSponsored,
+                IsOwnBrand = request.IsOwnBrand,
+                StockQuantity = request.StockQuantity,
+                Category = request.Category
+            };
+
+            _context.Products.Add(product);
+            await _context.SaveChangesAsync();
+
+            return CreatedAtAction(nameof(GetProduct), new { id = product.Id }, product);
+        }
+
+        [HttpPut("{id}")]
+        public async Task<IActionResult> UpdateProduct(int id, [FromBody] ProductRequest request)
+        {
+            var product = await _context.Products.FindAsync(id);
+            if (product == null) return NotFound();
+
+            product.Name = request.Name;
+            product.Description = request.Description;
+            product.Price = request.Price;
+            product.DiscountedPrice = request.DiscountedPrice;
+            product.IsSponsored = request.IsSponsored;
+            product.IsOwnBrand = request.IsOwnBrand;
+            product.StockQuantity = request.StockQuantity;
+            product.Category = request.Category;
+
+            await _context.SaveChangesAsync();
+            return NoContent();
+        }
+
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteProduct(int id)
+        {
+            var product = await _context.Products.FindAsync(id);
+            if (product == null) return NotFound();
+
+            _context.Products.Remove(product);
+            await _context.SaveChangesAsync();
+            return NoContent();
+        }
+    }
+
+    public class ProductRequest
+    {
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public decimal Price { get; set; }
+        public decimal DiscountedPrice { get; set; }
+        public bool IsSponsored { get; set; }
+        public bool IsOwnBrand { get; set; }
+        public int StockQuantity { get; set; }
+        public string Category { get; set; }
+    }
+}

@@ -1,0 +1,418 @@
+#include <cpprest/http_listener.h>
+#include <cpprest/json.h>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/resultset.h>
+#include <vector>
+#include <string>
+#include <memory>
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+
+using namespace web;
+using namespace web::http;
+using namespace web::http::experimental::listener;
+
+struct Product {
+    int id;
+    std::string name;
+    double price;
+    double discount;
+    std::string category;
+    bool is_preferred;
+    int stock;
+    std::string description;
+};
+
+struct CartItem {
+    int user_id;
+    int product_id;
+    int quantity;
+};
+
+struct SearchWeights {
+    double price_weight;
+    double discount_weight;
+    double platform_weight;
+    double relevance_weight;
+};
+
+struct SearchRequest {
+    std::string keyword;
+    std::string sort_by;
+    std::string category;
+    int page;
+    int page_size;
+};
+
+struct CartRequest {
+    int user_id;
+    int product_id;
+    int quantity;
+};
+
+class ShoppingController {
+private:
+    std::string conn_string = "tcp://127.0.0.1:3306";
+    std::string db_user = "root";
+    std::string db_pass = "securepass";
+    SearchWeights weights;
+
+    SearchWeights load_search_weights() {
+        std::ifstream file("config/weights.json");
+        if (!file.is_open()) {
+            return {0.3, 0.3, 0.3, 0.1};
+        }
+        json::value json_data;
+        file >> json_data;
+        SearchWeights w;
+        w.price_weight = json_data.at(U("PriceWeight")).as_double();
+        w.discount_weight = json_data.at(U("DiscountWeight")).as_double();
+        w.platform_weight = json_data.at(U("PlatformWeight")).as_double();
+        w.relevance_weight = json_data.at(U("RelevanceWeight")).as_double();
+        return w;
+    }
+
+    std::unique_ptr<sql::Connection> get_db_connection() {
+        sql::mysql::MySQL_Driver* driver = sql::mysql::get_mysql_driver_instance();
+        return std::unique_ptr<sql::Connection>(driver->connect(conn_string, db_user, db_pass));
+    }
+
+    std::string build_product_query(const SearchRequest& req) {
+        std::string query = "SELECT id, name, price, discount, category, is_preferred, stock, description FROM shop_mall.products WHERE 1=1";
+        if (!req.keyword.empty()) {
+            query += " AND (name LIKE ? OR description LIKE ?)";
+        }
+        if (!req.category.empty()) {
+            query += " AND category = ?";
+        }
+        return query;
+    }
+
+    void add_query_parameters(sql::PreparedStatement* stmt, const SearchRequest& req, int& param_index) {
+        if (!req.keyword.empty()) {
+            std::string keyword = "%" + req.keyword + "%";
+            stmt->setString(param_index++, keyword);
+            stmt->setString(param_index++, keyword);
+        }
+        if (!req.category.empty()) {
+            stmt->setString(param_index++, req.category);
+        }
+    }
+
+    double normalize_price(double price, const std::vector<Product>& products) {
+        if (products.empty()) return 0;
+        double max_price = products[0].price;
+        double min_price = products[0].price;
+        for (const auto& p : products) {
+            max_price = std::max(max_price, p.price);
+            min_price = std::min(min_price, p.price);
+        }
+        if (max_price == min_price) return 0.5;
+        return (max_price - price) / (max_price - min_price);
+    }
+
+    double calculate_relevance(const Product& p, const std::string& keyword) {
+        if (keyword.empty()) return 0;
+        int matches = 0;
+        std::string lower_name = p.name;
+        std::string lower_desc = p.description;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+        std::transform(lower_desc.begin(), lower_desc.end(), lower_desc.begin(), ::tolower);
+        std::string lower_keyword = keyword;
+        std::transform(lower_keyword.begin(), lower_keyword.end(), lower_keyword.begin(), ::tolower);
+        size_t pos = 0;
+        while ((pos = lower_keyword.find(' ', pos)) != std::string::npos) {
+            std::string word = lower_keyword.substr(0, pos);
+            if (!word.empty() && (lower_name.find(word) != std::string::npos || lower_desc.find(word) != std::string::npos)) {
+                matches++;
+            }
+            lower_keyword.erase(0, pos + 1);
+            pos = 0;
+        }
+        if (!lower_keyword.empty() && (lower_name.find(lower_keyword) != std::string::npos || lower_desc.find(lower_keyword) != std::string::npos)) {
+            matches++;
+        }
+        return static_cast<double>(matches) / std::max(1.0, static_cast<double>(std::count(lower_keyword.begin(), lower_keyword.end(), ' ') + 1));
+    }
+
+    double calculate_product_score(const Product& p, const std::string& keyword) {
+        double price_score = normalize_price(p.price, {p});
+        double discount_score = p.discount / std::max(p.price, 1.0);
+        double platform_score = p.is_preferred ? 1.0 : 0.0;
+        double relevance_score = calculate_relevance(p, keyword);
+        return (weights.price_weight * price_score) +
+               (weights.discount_weight * discount_score) +
+               (weights.platform_weight * platform_score) +
+               (weights.relevance_weight * relevance_score);
+    }
+
+    std::vector<Product> apply_manipulated_ranking(std::vector<Product>& products, const std::string& keyword) {
+        std::vector<std::pair<Product, double>> scored_products;
+        for (const auto& p : products) {
+            scored_products.emplace_back(p, calculate_product_score(p, keyword));
+        }
+        std::sort(scored_products.begin(), scored_products.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::vector<Product> result;
+        for (const auto& sp : scored_products) {
+            result.push_back(sp.first);
+        }
+        return result;
+    }
+
+    std::vector<Product> rank_products(std::vector<Product>& products, const SearchRequest& req) {
+        if (req.sort_by.empty()) {
+            return apply_manipulated_ranking(products, req.keyword);
+        }
+        std::string sort_by = req.sort_by;
+        std::transform(sort_by.begin(), sort_by.end(), sort_by.begin(), ::tolower);
+        if (sort_by == "price_asc") {
+            std::sort(products.begin(), products.end(), [](const Product& a, const Product& b) { return a.price < b.price; });
+        } else if (sort_by == "price_desc") {
+            std::sort(products.begin(), products.end(), [](const Product& a, const Product& b) { return a.price > b.price; });
+        } else if (sort_by == "discount") {
+            std::sort(products.begin(), products.end(), [](const Product& a, const Product& b) { return a.discount > b.discount; });
+        } else if (sort_by == "recommend") {
+            return apply_manipulated_ranking(products, req.keyword);
+        }
+        return products;
+    }
+
+public:
+    ShoppingController() : weights(load_search_weights()) {}
+
+    void handle_get_products(http_request request) {
+        SearchRequest req;
+        auto query = uri::split_query(request.request_uri().query());
+        req.keyword = utility::conversions::to_utf8string(query[U("Keyword")]);
+        req.sort_by = utility::conversions::to_utf8string(query[U("SortBy")]);
+        req.category = utility::conversions::to_utf8string(query[U("Category")]);
+        req.page = query.find(U("Page")) != query.end() ? std::stoi(query[U("Page")]) : 1;
+        req.page_size = query.find(U("PageSize")) != query.end() ? std::stoi(query[U("PageSize")]) : 20;
+
+        std::vector<Product> products;
+        auto conn = get_db_connection();
+        conn->setSchema("shop_mall");
+        std::string query_str = build_product_query(req);
+        std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement(query_str));
+        int param_index = 1;
+        add_query_parameters(stmt.get(), req, param_index);
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
+        while (res->next()) {
+            Product p;
+            p.id = res->getInt("id");
+            p.name = res->getString("name");
+            p.price = res->getDouble("price");
+            p.discount = res->getDouble("discount");
+            p.category = res->getString("category");
+            p.is_preferred = res->getBoolean("is_preferred");
+            p.stock = res->getInt("stock");
+            p.description = res->getString("description");
+            products.push_back(p);
+        }
+
+        auto ranked = rank_products(products, req);
+        int start = (req.page - 1) * req.page_size;
+        int end = std::min(start + req.page_size, static_cast<int>(ranked.size()));
+        std::vector<Product> paged_products(ranked.begin() + start, ranked.begin() + end);
+
+        json::value response = json::value::array();
+        for (size_t i = 0; i < paged_products.size(); ++i) {
+            response[i] = json::value::object();
+            response[i][U("id")] = json::value::number(paged_products[i].id);
+            response[i][U("name")] = json::value::string(U(paged_products[i].name));
+            response[i][U("price")] = json::value::number(paged_products[i].price);
+            response[i][U("discount")] = json::value::number(paged_products[i].discount);
+            response[i][U("category")] = json::value::string(U(paged_products[i].category));
+            response[i][U("is_preferred")] = json::value::boolean(paged_products[i].is_preferred);
+            response[i][U("stock")] = json::value::number(paged_products[i].stock);
+            response[i][U("description")] = json::value::string(U(paged_products[i].description));
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handle_add_to_cart(http_request request) {
+        request.extract_json().then([=](json::value body) {
+            CartRequest req;
+            req.user_id = body.at(U("UserId")).as_integer();
+            req.product_id = body.at(U("ProductId")).as_integer();
+            req.quantity = body.at(U("Quantity")).as_integer();
+
+            auto conn = get_db_connection();
+            conn->setSchema("shop_mall");
+            std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement("SELECT stock FROM products WHERE id = ?"));
+            stmt->setInt(1, req.product_id);
+            std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
+            if (!res->next()) {
+                request.reply(status_codes::NotFound, U("Product not found"));
+                return;
+            }
+            int stock = res->getInt("stock");
+            if (stock < req.quantity) {
+                request.reply(status_codes::BadRequest, U("Insufficient stock"));
+                return;
+            }
+
+            stmt.reset(conn->prepareStatement(
+                "INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, ?) "
+                "ON DUPLICATE KEY UPDATE quantity = quantity + ?"));
+            stmt->setInt(1, req.user_id);
+            stmt->setInt(2, req.product_id);
+            stmt->setInt(3, req.quantity);
+            stmt->setInt(4, req.quantity);
+            stmt->execute();
+
+            request.reply(status_codes::OK, U("Item added to cart"));
+        }).wait();
+    }
+
+    void handle_get_cart(http_request request) {
+        int user_id = std::stoi(utility::conversions::to_utf8string(request.request_uri().path().substr(9)));
+        std::vector<CartItem> cart_items;
+        auto conn = get_db_connection();
+        conn->setSchema("shop_mall");
+        std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement(
+            "SELECT c.user_id, c.product_id, c.quantity "
+            "FROM cart c JOIN products p ON c.product_id = p.id "
+            "WHERE c.user_id = ?"));
+        stmt->setInt(1, user_id);
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
+        while (res->next()) {
+            CartItem item;
+            item.user_id = res->getInt("user_id");
+            item.product_id = res->getInt("product_id");
+            item.quantity = res->getInt("quantity");
+            cart_items.push_back(item);
+        }
+
+        json::value response = json::value::array();
+        for (size_t i = 0; i < cart_items.size(); ++i) {
+            response[i] = json::value::object();
+            response[i][U("user_id")] = json::value::number(cart_items[i].user_id);
+            response[i][U("product_id")] = json::value::number(cart_items[i].product_id);
+            response[i][U("quantity")] = json::value::number(cart_items[i].quantity);
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handle_remove_from_cart(http_request request) {
+        request.extract_json().then([=](json::value body) {
+            CartRequest req;
+            req.user_id = body.at(U("UserId")).as_integer();
+            req.product_id = body.at(U("ProductId")).as_integer();
+
+            auto conn = get_db_connection();
+            conn->setSchema("shop_mall");
+            std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement(
+                "DELETE FROM cart WHERE user_id = ? AND product_id = ?"));
+            stmt->setInt(1, req.user_id);
+            stmt->setInt(2, req.product_id);
+            int rows_affected = stmt->executeUpdate();
+            if (rows_affected == 0) {
+                request.reply(status_codes::NotFound, U("Item not found in cart"));
+                return;
+            }
+            request.reply(status_codes::OK, U("Item removed from cart"));
+        }).wait();
+    }
+
+    void handle_get_categories(http_request request) {
+        std::vector<std::string> categories;
+        auto conn = get_db_connection();
+        conn->setSchema("shop_mall");
+        std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement("SELECT DISTINCT category FROM products"));
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
+        while (res->next()) {
+            categories.push_back(res->getString("category"));
+        }
+
+        json::value response = json::value::array();
+        for (size_t i = 0; i < categories.size(); ++i) {
+            response[i] = json::value::string(U(categories[i]));
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handle_get_product_details(http_request request) {
+        int id = std::stoi(utility::conversions::to_utf8string(request.request_uri().path().substr(12)));
+        auto conn = get_db_connection();
+        conn->setSchema("shop_mall");
+        std::unique_ptr<sql::PreparedStatement> stmt(conn->prepareStatement(
+            "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE id = ?"));
+        stmt->setInt(1, id);
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery());
+        if (!res->next()) {
+            request.reply(status_codes::NotFound, U("Product not found"));
+            return;
+        }
+
+        Product p;
+        p.id = res->getInt("id");
+        p.name = res->getString("name");
+        p.price = res->getDouble("price");
+        p.discount = res->getDouble("discount");
+        p.category = res->getString("category");
+        p.is_preferred = res->getBoolean("is_preferred");
+        p.stock = res->getInt("stock");
+        p.description = res->getString("description");
+
+        json::value response = json::value::object();
+        response[U("id")] = json::value::number(p.id);
+        response[U("name")] = json::value::string(U(p.name));
+        response[U("price")] = json::value::number(p.price);
+        response[U("discount")] = json::value::number(p.discount);
+        response[U("category")] = json::value::string(U(p.category));
+        response[U("is_preferred")] = json::value::boolean(p.is_preferred);
+        response[U("stock")] = json::value::number(p.stock);
+        response[U("description")] = json::value::string(U(p.description));
+        request.reply(status_codes::OK, response);
+    }
+};
+
+int main() {
+    http_listener products_listener(U("http://localhost:5000/api/products"));
+    http_listener cart_add_listener(U("http://localhost:5000/api/cart/add"));
+    http_listener cart_get_listener(U("http://localhost:5000/api/cart/"));
+    http_listener cart_remove_listener(U("http://localhost:5000/api/cart/remove"));
+    http_listener categories_listener(U("http://localhost:5000/api/categories"));
+    http_listener product_details_listener(U("http://localhost:5000/api/product/"));
+
+    ShoppingController controller;
+
+    products_listener.support(methods::GET, [&controller](http_request request) {
+        controller.handle_get_products(request);
+    });
+    cart_add_listener.support(methods::POST, [&controller](http_request request) {
+        controller.handle_add_to_cart(request);
+    });
+    cart_get_listener.support(methods::GET, [&controller](http_request request) {
+        controller.handle_get_cart(request);
+    });
+    cart_remove_listener.support(methods::DEL, [&controller](http_request request) {
+        controller.handle_remove_from_cart(request);
+    });
+    categories_listener.support(methods::GET, [&controller](http_request request) {
+        controller.handle_get_categories(request);
+    });
+    product_details_listener.support(methods::GET, [&controller](http_request request) {
+        controller.handle_get_product_details(request);
+    });
+
+    try {
+        products_listener.open().wait();
+        cart_add_listener.open().wait();
+        cart_get_listener.open().wait();
+        cart_remove_listener.open().wait();
+        categories_listener.open().wait();
+        product_details_listener.open().wait();
+        std::cout << "Server running on http://localhost:5000\n";
+        std::this_thread::sleep_for(std::chrono::hours(24));
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    return 0;
+}

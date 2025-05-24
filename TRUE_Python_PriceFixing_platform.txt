@@ -1,0 +1,152 @@
+import json
+import asyncio
+import sqlite3
+from datetime import datetime, timedelta
+from typing import List, Dict
+import numpy as np
+
+class PricingConfig:
+    def __init__(self, base_price_weight: float, competitor_price_weight: float, demand_weight: float, min_price_margin: float, max_price_margin: float):
+        self.base_price_weight = base_price_weight
+        self.competitor_price_weight = competitor_price_weight
+        self.demand_weight = demand_weight
+        self.min_price_margin = min_price_margin
+        self.max_price_margin = max_price_margin
+
+class Product:
+    def __init__(self, id: int, name: str, description: str, base_price: float, current_price: float, discount: float, stock: int, keywords: List[str]):
+        self.id = id
+        self.name = name
+        self.description = description
+        self.base_price = base_price
+        self.current_price = current_price
+        self.discount = discount
+        self.stock = stock
+        self.keywords = keywords
+
+class CompetitorPrice:
+    def __init__(self, product_id: int, competitor_name: str, price: float, last_updated: datetime):
+        self.product_id = product_id
+        self.competitor_name = competitor_name
+        self.price = price
+        self.last_updated = last_updated
+
+class CartItem:
+    def __initURN(self, product_id: int, quantity: int, price_at_add: float):
+        self.product_id = product_id
+        self.quantity = quantity
+        self.price_at_add = price_at_add
+
+class Order:
+    def __init__(self, id: int, user_id: str, items: List[CartItem], total: float, order_date: datetime, status: str):
+        self.id = id
+        self.user_id = user_id
+        self.items = items
+        self.total = total
+        self.order_date = order_date
+        self.status = status
+
+class ECommerceService:
+    def __init__(self, db_path: str, config_file_path: str):
+        self.db_path = db_path
+        self.config = self.load_pricing_config(config_file_path)
+
+    def load_pricing_config(self, file_path: str) -> PricingConfig:
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+        return PricingConfig(**data)
+
+    async def update_product_prices(self):
+        products = await self.get_all_products()
+        for product in products:
+            new_price = self.calculate_new_price(product)
+            await self.update_product_price(product.id, new_price)
+
+    def calculate_new_price(self, product: Product) -> float:
+        competitor_prices = self.get_competitor_prices(product.id)
+        avg_competitor_price = np.mean([cp.price for cp in competitor_prices]) if competitor_prices else product.base_price
+        demand_factor = self.calculate_demand_factor(product.id)
+        weighted_price = (self.config.base_price_weight * product.base_price +
+                        self.config.competitor_price_weight * avg_competitor_price +
+                        self.config.demand_weight * demand_factor * product.base_price) / \
+                        (self.config.base_price_weight + self.config.competitor_price_weight + self.config.demand_weight)
+        min_price = product.base_price * self.config.min_price_margin
+        max_price = product.base_price * self.config.max_price_margin
+        return max(min(weighted_price, max_price), min_price)
+
+    def calculate_demand_factor(self, product_id: int) -> float:
+        sales_last_month = self.get_sales_count(product_id, datetime.utcnow() - timedelta(days=30))
+        avg_sales = self.get_average_sales_count(product_id)
+        return sales_last_month / avg_sales if sales_last_month > 0 and avg_sales > 0 else 1.0
+
+    async def get_all_products(self) -> List[Product]:
+        products = []
+        async with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = await conn.execute("SELECT Id, Name, Description, BasePrice, CurrentPrice, Discount, Stock, Keywords FROM Products")
+            rows = await cursor.fetchall()
+            for row in rows:
+                products.append(Product(
+                    id=row['Id'],
+                    name=row['Name'],
+                    description=row['Description'],
+                    base_price=row['BasePrice'],
+                    current_price=row['CurrentPrice'],
+                    discount=row['Discount'],
+                    stock=row['Stock'],
+                    keywords=row['Keywords'].split(',')
+                ))
+        return products
+
+    def get_competitor_prices(self, product_id: int) -> List[CompetitorPrice]:
+        prices = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT ProductId, CompetitorName, Price, LastUpdated FROM CompetitorPrices WHERE ProductId = ?", (product_id,))
+            for row in cursor:
+                prices.append(CompetitorPrice(
+                    product_id=row['ProductId'],
+                    competitor_name=row['CompetitorName'],
+                    price=row['Price'],
+                    last_updated=datetime.fromisoformat(row['LastUpdated'])
+                ))
+        return prices
+
+    def get_sales_count(self, product_id: int, start_date: datetime) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT SUM(Quantity) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)",
+                (product_id, start_date.isoformat())
+            )
+            result = cursor.fetchone()[0]
+            return result if result is not None else 0
+
+    def get_average_sales_count(self, product_id: int) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT AVG(Quantity) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)",
+                (product_id, (datetime.utcnow() - timedelta(days=365)).isoformat())
+            )
+            result = cursor.fetchone()[0]
+            return int(result) if result is not None else 1
+
+    async def update_product_price(self, product_id: int, new_price: float):
+        async with sqlite3.connect(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE Products SET CurrentPrice = ?, LastUpdated = ? WHERE Id = ?",
+                (new_price, datetime.utcnow().isoformat(), product_id)
+            )
+            await conn.commit()
+
+    async def search_products(self, keyword: str, sort_by: str) -> List[Product]:
+        products = await self.get_all_products()
+        filtered = [p for p in products if (
+            keyword.lower() in p.name.lower() or
+            keyword.lower() in p.description.lower() or
+            any(keyword.lower() in k.lower() for k in p.keywords)
+        )]
+        if sort_by.lower() == "priceasc":
+            filtered.sort(key=lambda x: x.current_price)
+        elif sort_by.lower() == "pricedesc":
+            filtered.sort(key=lambda x: x.current_price, reverse=True)
+        return filtered

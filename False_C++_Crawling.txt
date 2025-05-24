@@ -1,0 +1,141 @@
+#include <iostream>
+#include <sqlite3.h>
+#include <curl/curl.h>
+#include <gumbo.h>
+#include <sstream>
+#include <fstream>
+#include <vector>
+#include <thread>
+#include <chrono>
+
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
+    size_t newLength = size * nmemb;
+    s->append((char*)contents, newLength);
+    return newLength;
+}
+
+std::vector<unsigned char> downloadImage(const std::string& url) {
+    CURL* curl;
+    CURLcode res;
+    std::vector<unsigned char> image_data;
+
+    curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &image_data);
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    return image_data;
+}
+
+std::string getText(GumboNode* node) {
+    if (node->type != GUMBO_NODE_ELEMENT) return "";
+
+    GumboVector* children = &node->v.element.children;
+    std::string text;
+    for (unsigned int i = 0; i < children->length; ++i) {
+        GumboNode* child = static_cast<GumboNode*>(children->data[i]);
+        if (child->type == GUMBO_NODE_TEXT) {
+            text.append(child->v.text.text);
+        } else {
+            text.append(getText(child));
+        }
+    }
+    return text;
+}
+
+std::vector<GumboNode*> parseHTML(const std::string& html) {
+    GumboOutput* output = gumbo_parse(html.c_str());
+    std::vector<GumboNode*> hotelNodes;
+
+    GumboNode* root = output->root;
+    GumboVector* root_children = &root->v.element.children;
+    for (unsigned int i = 0; i < root_children->length; ++i) {
+        GumboNode* child = static_cast<GumboNode*>(root_children->data[i]);
+        if (child->type == GUMBO_NODE_ELEMENT) {
+            hotelNodes.push_back(child);
+        }
+    }
+    gumbo_destroy_output(&kGumboDefaultOptions, output);
+    return hotelNodes;
+}
+
+void scrapeHotels(sqlite3* db, int& page) {
+    std::string base_url = "https://www.hotelbookworld.co.kr/hotels?page=";
+    bool has_more_hotels = true;
+    CURL* curl;
+    CURLcode res;
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl = curl_easy_init();
+
+    while (has_more_hotels) {
+        std::string url = base_url + std::to_string(page);
+        std::string readBuffer;
+
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+            res = curl_easy_perform(curl);
+
+            if (res != CURLE_OK) {
+                std::cerr << "Failed to download page: " << curl_easy_strerror(res) << std::endl;
+                break;
+            }
+
+            std::vector<GumboNode*> hotels = parseHTML(readBuffer);
+
+            if (hotels.empty()) {
+                has_more_hotels = false;
+                break;
+            }
+
+            for (auto& hotel : hotels) {
+                std::string name = getText(hotel);
+                std::string location = "Location"; 
+                std::string phone = "Phone";
+                std::string breakfast = "Breakfast"; 
+                std::string amenities = "Amenities";
+
+                std::string image_url = "https://example.com/image.jpg";
+                std::vector<unsigned char> imageBlob = downloadImage(image_url);
+
+                sqlite3_stmt* stmt;
+                const char* sql = "INSERT INTO hotels (name, location, phone, breakfast, amenities, image) VALUES (?, ?, ?, ?, ?, ?)";
+                sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+                sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 2, location.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 3, phone.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 4, breakfast.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 5, amenities.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_blob(stmt, 6, imageBlob.data(), imageBlob.size(), SQLITE_STATIC);
+
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+
+            page++;
+            std::this_thread::sleep_for(std::chrono::seconds(1));         }
+    }
+
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+}
+
+int main() {
+    sqlite3* db;
+    int rc = sqlite3_open("hotels.db", &db);
+    if (rc) {
+        std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+        return 1;
+    }
+
+    int page = 1;
+    scrapeHotels(db, page);
+
+    sqlite3_close(db);
+    return 0;
+}

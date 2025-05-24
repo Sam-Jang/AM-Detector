@@ -1,0 +1,250 @@
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.access.annotation.Secured;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Entity
+class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+    private Double price;
+    private String description;
+    private String image;
+    private Integer stock;
+
+    // Getters and Setters
+
+    @Override
+    public String toString() {
+        return this.name;
+    }
+}
+
+@Entity
+class Order {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne
+    private User user;
+
+    @ManyToOne
+    private Product product;
+
+    private Integer quantity;
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    @Override
+    public String toString() {
+        return "Order " + this.id + " by " + this.user.getUsername();
+    }
+}
+
+@Entity
+class CartItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne
+    private User user;
+
+    @ManyToOne
+    private Product product;
+
+    private Integer quantity = 1;
+
+    @Override
+    public String toString() {
+        return this.product.getName() + " (" + this.quantity + ")";
+    }
+}
+
+@Entity
+class Review {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne
+    private Product product;
+
+    @ManyToOne
+    private User user;
+
+    private Integer rating;
+    private String comment;
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    @Override
+    public String toString() {
+        return this.rating + " by " + this.user.getUsername() + " on " + this.product.getName();
+    }
+}
+
+@Entity
+class SupportTicket {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne
+    private User user;
+
+    private String subject;
+    private String message;
+    private LocalDateTime createdAt = LocalDateTime.now();
+    private Boolean resolved = false;
+
+    @Override
+    public String toString() {
+        return "Ticket " + this.id + " by " + this.user.getUsername();
+    }
+}
+
+@Controller
+@RequestMapping("/")
+public class MainController {
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Autowired
+    private CartItemRepository cartItemRepository;
+
+    @Autowired
+    private ReviewRepository reviewRepository;
+
+    @Autowired
+    private SupportTicketRepository supportTicketRepository;
+
+    @GetMapping("/products")
+    public String productList(@RequestParam(required = false) String q, @RequestParam(required = false) String sort_by, Model model) {
+        List<Product> products = productRepository.findAll();
+
+        if (q != null && !q.isEmpty()) {
+            products = productRepository.findByNameContainingIgnoreCase(q);
+        }
+
+        if ("price".equals(sort_by)) {
+            products.sort((p1, p2) -> p1.getPrice().compareTo(p2.getPrice()));
+        } else if ("name".equals(sort_by)) {
+            products.sort((p1, p2) -> p1.getName().compareTo(p2.getName()));
+        }
+
+        model.addAttribute("products", products);
+        return "product_list";
+    }
+
+    @GetMapping("/products/{id}")
+    public String productDetail(@PathVariable Long id, Model model) {
+        Product product = productRepository.findById(id).orElseThrow(() -> new IllegalArgumentException("Invalid product Id:" + id));
+        model.addAttribute("product", product);
+        return "product_detail";
+    }
+
+    @Secured("ROLE_USER")
+    @PostMapping("/purchase/{productId}")
+    @Transactional
+    public String purchaseProduct(@PathVariable Long productId, @RequestParam Integer quantity, @AuthenticationPrincipal User user) {
+        Product product = productRepository.findById(productId).orElseThrow(() -> new IllegalArgumentException("Invalid product Id:" + productId));
+
+        if (product.getStock() >= quantity) {
+            product.setStock(product.getStock() - quantity);
+            productRepository.save(product);
+
+            Order order = new Order();
+            order.setUser(user);
+            order.setProduct(product);
+            order.setQuantity(quantity);
+            orderRepository.save(order);
+
+            return "redirect:/order_success";
+        }
+
+        return "redirect:/products/" + productId + "?error=NotEnoughStock";
+    }
+
+    @Secured("ROLE_USER")
+    @GetMapping("/order_history")
+    public String orderHistory(@AuthenticationPrincipal User user, Model model) {
+        List<Order> orders = orderRepository.findByUser(user);
+        model.addAttribute("orders", orders);
+        return "order_history";
+    }
+
+    @Secured("ROLE_USER")
+    @PostMapping("/cart/add/{productId}")
+    public String addToCart(@PathVariable Long productId, @AuthenticationPrincipal User user) {
+        Product product = productRepository.findById(productId).orElseThrow(() -> new IllegalArgumentException("Invalid product Id:" + productId));
+        CartItem cartItem = cartItemRepository.findByUserAndProduct(user, product);
+
+        if (cartItem == null) {
+            cartItem = new CartItem();
+            cartItem.setUser(user);
+            cartItem.setProduct(product);
+            cartItemRepository.save(cartItem);
+        } else {
+            cartItem.setQuantity(cartItem.getQuantity() + 1);
+            cartItemRepository.save(cartItem);
+        }
+
+        return "redirect:/cart";
+    }
+
+    @Secured("ROLE_USER")
+    @GetMapping("/cart")
+    public String cartDetail(@AuthenticationPrincipal User user, Model model) {
+        List<CartItem> cartItems = cartItemRepository.findByUser(user);
+        model.addAttribute("cartItems", cartItems);
+        return "cart_detail";
+    }
+
+    @Secured("ROLE_USER")
+    @PostMapping("/review/add/{productId}")
+    public String addReview(@PathVariable Long productId, @RequestParam Integer rating, @RequestParam String comment, @AuthenticationPrincipal User user) {
+        Product product = productRepository.findById(productId).orElseThrow(() -> new IllegalArgumentException("Invalid product Id:" + productId));
+
+        Review review = new Review();
+        review.setUser(user);
+        review.setProduct(product);
+        review.setRating(rating);
+        review.setComment(comment);
+        reviewRepository.save(review);
+
+        return "redirect:/products/" + productId;
+    }
+
+    @Secured("ROLE_USER")
+    @GetMapping("/support")
+    public String supportTickets(@AuthenticationPrincipal User user, Model model) {
+        List<SupportTicket> tickets = supportTicketRepository.findByUser(user);
+        model.addAttribute("tickets", tickets);
+        return "support_tickets";
+    }
+
+    @Secured("ROLE_USER")
+    @PostMapping("/support/create")
+    public String createTicket(@RequestParam String subject, @RequestParam String message, @AuthenticationPrincipal User user) {
+        SupportTicket ticket = new SupportTicket();
+        ticket.setUser(user);
+        ticket.setSubject(subject);
+        ticket.setMessage(message);
+        supportTicketRepository.save(ticket);
+
+        return "redirect:/support";
+    }
+}

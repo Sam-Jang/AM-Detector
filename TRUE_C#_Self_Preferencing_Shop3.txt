@@ -1,0 +1,447 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
+using System.IO;
+using System.Data.SqlClient;
+
+namespace ECommercePlatform
+{
+    public class Constants
+    {
+        public double PriceWeight { get; set; }
+        public double DeliverySpeedWeight { get; set; }
+        public double SellerRatingWeight { get; set; }
+        public double PrimeBiasFactor { get; set; }
+        public double FeaturedOfferPriceDiff { get; set; }
+        public double SecondOfferMinPriceDiff { get; set; }
+        public int MinSellerSales { get; set; }
+        public double FraudRiskThreshold { get; set; }
+    }
+
+    public class Product
+    {
+        public int ProductId { get; set; }
+        public string ASIN { get; set; }
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public string Category { get; set; }
+        public decimal BasePrice { get; set; }
+        public int StockQuantity { get; set; }
+    }
+
+    public class Seller
+    {
+        public int SellerId { get; set; }
+        public string SellerName { get; set; }
+        public bool IsPlatformRetail { get; set; }
+        public double Rating { get; set; }
+        public int TotalSales { get; set; }
+        public bool IsActive { get; set; }
+        public DateTime AccountCreated { get; set; }
+    }
+
+    public class Offer
+    {
+        public int OfferId { get; set; }
+        public int ProductId { get; set; }
+        public int SellerId { get; set; }
+        public decimal Price { get; set; }
+        public decimal ShippingCost { get; set; }
+        public int DeliveryDays { get; set; }
+        public bool IsPrimeEligible { get; set; }
+        public int StockQuantity { get; set; }
+        public Product Product { get; set; }
+        public Seller Seller { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int CartItemId { get; set; }
+        public int UserId { get; set; }
+        public int OfferId { get; set; }
+        public int Quantity { get; set; }
+        public Offer Offer { get; set; }
+    }
+
+    public class ECommerceDbContext : DbContext
+    {
+        public DbSet<Product> Products { get; set; }
+        public DbSet<Seller> Sellers { get; set; }
+        public DbSet<Offer> Offers { get; set; }
+        public DbSet<CartItem> CartItems { get; set; }
+
+        public ECommerceDbContext(DbContextOptions<ECommerceDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<Product>().ToTable("Products");
+            modelBuilder.Entity<Seller>().ToTable("Sellers");
+            modelBuilder.Entity<Offer>().ToTable("Offers");
+            modelBuilder.Entity<CartItem>().ToTable("CartItems");
+        }
+    }
+
+    public class FeaturedOfferResult
+    {
+        public Offer FeaturedOffer { get; set; }
+        public Offer SecondOffer { get; set; }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class ECommerceController : ControllerBase
+    {
+        private readonly ECommerceDbContext _context;
+        private readonly Constants _constants;
+
+        public ECommerceController(ECommerceDbContext context)
+        {
+            _context = context;
+            _constants = LoadConstants();
+        }
+
+        private Constants LoadConstants()
+        {
+            var json = File.ReadAllText("constants.json");
+            return JsonSerializer.Deserialize<Constants>(json);
+        }
+
+        [HttpGet("products/search")]
+        public async Task<ActionResult<IEnumerable<Offer>>> SearchProducts(string keyword, string sortBy = "relevance", int page = 1, int pageSize = 20)
+        {
+            var query = _context.Offers
+                .Include(o => o.Product)
+                .Include(o => o.Seller)
+                .Where(o => o.StockQuantity > 0 && o.Seller.IsActive);
+
+            if (!string.IsNullOrEmpty(keyword))
+            {
+                query = query.Where(o => o.Product.Name.Contains(keyword) || o.Product.Description.Contains(keyword));
+            }
+
+            query = sortBy.ToLower() switch
+            {
+                "priceasc" => query.OrderBy(o => o.Price + o.ShippingCost),
+                "pricedesc" => query.OrderByDescending(o => o.Price + o.ShippingCost),
+                "discount" => query.OrderByDescending(o => (o.Product.BasePrice - o.Price) / o.Product.BasePrice),
+                "rating" => query.OrderByDescending(o => o.Seller.Rating),
+                _ => query.OrderBy(o => o.Product.Name)
+            };
+
+            var offers = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return Ok(offers);
+        }
+
+        [HttpGet("products/{asin}/offers")]
+        public async Task<ActionResult<FeaturedOfferResult>> GetProductOffers(string asin)
+        {
+            var offers = await _context.Offers
+                .Include(o => o.Product)
+                .Include(o => o.Seller)
+                .Where(o => o.Product.ASIN == asin && o.StockQuantity > 0 && o.Seller.IsActive)
+                .ToListAsync();
+
+            if (!offers.Any())
+            {
+                return NotFound();
+            }
+
+            var result = SelectFeaturedAndSecondOffer(offers);
+            return Ok(result);
+        }
+
+        private FeaturedOfferResult SelectFeaturedAndSecondOffer(List<Offer> offers)
+        {
+            var eligibleOffers = FilterEligibleOffers(offers);
+            if (!eligibleOffers.Any())
+            {
+                return new FeaturedOfferResult();
+            }
+
+            var scoredOffers = eligibleOffers.Select(o => new
+            {
+                Offer = o,
+                Score = CalculateOfferScore(o)
+            }).ToList();
+
+            var featured = scoredOffers.OrderByDescending(x => x.Score).First().Offer;
+            var secondOffer = SelectSecondOffer(scoredOffers, featured);
+
+            return new FeaturedOfferResult
+            {
+                FeaturedOffer = featured,
+                SecondOffer = secondOffer
+            };
+        }
+
+        private List<Offer> FilterEligibleOffers(List<Offer> offers)
+        {
+            return offers.Where(o =>
+            {
+                var isGenuine = IsGenuineSeller(o.Seller);
+                var isPriceValid = !IsAtypicalPrice(o);
+                var isCompetitorValid = !IsDisqualifiedCompetitor(o);
+                return isGenuine && isPriceValid && isCompetitorValid;
+            }).ToList();
+        }
+
+        private bool IsGenuineSeller(Seller seller)
+        {
+            var daysActive = (DateTime.UtcNow - seller.AccountCreated).TotalDays;
+            return seller.IsActive &&
+                   daysActive >= 90 &&
+                   seller.TotalSales >= _constants.MinSellerSales &&
+                   seller.Rating >= _constants.FraudRiskThreshold;
+        }
+
+        private bool IsAtypicalPrice(Offer offer)
+        {
+            var avgPrice = _context.Offers
+                .Where(o => o.ProductId == offer.ProductId)
+                .Average(o => o.Price) ?? offer.Price;
+
+            return Math.Abs(offer.Price - avgPrice) / avgPrice > 0.3m;
+        }
+
+        private bool IsDisqualifiedCompetitor(Offer offer)
+        {
+            return offer.Seller.Rating < 3.0 || offer.StockQuantity < 5;
+        }
+
+        private double CalculateOfferScore(Offer offer)
+        {
+            var landedPrice = (double)(offer.Price + offer.ShippingCost);
+            var deliveryScore = 1.0 / (offer.DeliveryDays + 1);
+            var ratingScore = offer.Seller.Rating / 5.0;
+
+            var score = (_constants.PriceWeight * (1.0 / landedPrice)) +
+                        (_constants.DeliverySpeedWeight * deliveryScore) +
+                        (_constants.SellerRatingWeight * ratingScore);
+
+            if (offer.IsPlatformRetail)
+            {
+                score *= (1.0 + _constants.PrimeBiasFactor);
+            }
+
+            return score;
+        }
+
+        private Offer SelectSecondOffer(List<dynamic> scoredOffers, Offer featured)
+        {
+            var candidates625 = scoredOffers
+                .Where(x => x.Offer.SellerId != featured.SellerId)
+                .Where(x => IsSufficientlyDifferentiated(x.Offer, featured))
+                .OrderByDescending(x => x.Score)
+                .ToList();
+
+            return candidates625.Any() ? candidates625.First().Offer : null;
+        }
+
+        private bool IsSufficientlyDifferentiated(Offer candidate, Offer featured)
+        {
+            var candidateLanded = candidate.Price + candidate.ShippingCost;
+            var featuredLanded = featured.Price + featured.ShippingCost;
+            var priceDiff = Math.Abs(candidateLanded - featuredLanded);
+            var deliveryDiff = Math.Abs(candidate.DeliveryDays - featured.DeliveryDays);
+
+            var minPriceDiff = _constants.SecondOfferMinPriceDiff +
+                (_constants.FeaturedOfferPriceDiff * deliveryDiff);
+
+            return priceDiff >= minPriceDiff ||
+                   candidateLanded <= featuredLanded * 0.9m;
+        }
+
+        [HttpGet("sellers/{sellerId}/prime-eligibility")]
+        public async Task<ActionResult<bool>> CheckPrimeEligibility(int sellerId)
+        {
+            var seller = await _context.Sellers.FindAsync(sellerId);
+
+            if (seller == null || !seller.IsActive)
+            {
+                return Ok(false);
+            }
+
+            var isEligible = await EvaluatePrimeEligibility(seller);
+            return Ok(isEligible);
+        }
+
+        private async Task<bool> EvaluatePrimeEligibility(Seller seller)
+        {
+            var recentOrders = await _context.Offers
+                .Where(o => o.SellerId == seller.SellerId)
+                .Join(_context.OrderItems,
+                    offer => offer.OfferId,
+                    order => order.OfferId,
+                    (offer, order) => order)
+                .Where(o => o.OrderDate >= DateTime.UtcNow.AddMonths(-1))
+                .ToListAsync();
+
+            var onTimeDeliveryRate = recentOrders.Any()
+                ? recentOrders.Count(o => o.DeliveryDate <= o.ExpectedDeliveryDate) / (double)recentOrders.Count
+                : 0.0;
+
+            var cancellationRate = recentOrders.Any()
+                ? recentOrders.Count(o => o.Status == "Cancelled") / (double)recentOrders.Count
+                : 0.0;
+
+            return onTimeDeliveryRate >= 0.95 &&
+                   cancellationRate <= 0.02 &&
+                   seller.Rating >= 4.0 &&
+                   !IsFraudRisk(seller);
+        }
+
+        private bool IsFraudRisk(Seller seller)
+        {
+            return seller.Rating < _constants.FraudRiskThreshold ||
+                   seller.TotalSales < _constants.MinSellerSales / 2;
+        }
+
+        [HttpPost("cart/add")]
+        public async Task<ActionResult<CartItem>> AddToCart(int userId, int offerId, int quantity)
+        {
+            var offer = await _context.Offers.FindAsync(offerId);
+            if (offer == null || offer.StockQuantity < quantity)
+            {
+                return BadRequest("Invalid offer or insufficient stock");
+            }
+
+            var cartItem = await _context.CartItems
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.OfferId == offerId);
+
+            if (cartItem != null)
+            {
+                cartItem.Quantity += quantity;
+            }
+            else
+            {
+                cartItem = new CartItem
+                {
+                    UserId = userId,
+                    OfferId = offerId,
+                    Quantity = quantity
+                };
+                _context.CartItems.Add(cartItem);
+            }
+
+            await _context.SaveChangesAsync();
+            return Ok(cartItem);
+        }
+
+        [HttpGet("cart/{userId}")]
+        public async Task<ActionResult<IEnumerable<CartItem>>> GetCart(int userId)
+        {
+            var items = await _context.CartItems
+                .Include(c => c.Offer)
+                .ThenInclude(o => o.Product)
+                .Include(c => c.Offer)
+                .ThenInclude(o => o.Seller)
+                .Where(c => c.UserId == userId)
+                .ToListAsync();
+
+            return Ok(items);
+        }
+
+        [HttpPut("cart/update")]
+        public async Task<ActionResult<CartItem>> UpdateCartItem(int cartItemId, int quantity)
+        {
+            var cartItem = await _context.CartItems.FindAsync(cartItemId);
+            if (cartItem == null)
+            {
+                return NotFound();
+            }
+
+            var offer = await _context.Offers.FindAsync(cartItem.OfferId);
+            if (offer.StockQuantity < quantity)
+            {
+                return BadRequest("Insufficient stock");
+            }
+
+            cartItem.Quantity = quantity;
+            await _context.SaveChangesAsync();
+            return Ok(cartItem);
+        }
+
+        [HttpDelete("cart/remove/{cartItemId}")]
+        public async Task<ActionResult> RemoveFromCart(int cartItemId)
+        {
+            var cartItem = await _context.CartItems.FindAsync(cartItemId);
+            if (cartItem == null)
+            {
+                return NotFound();
+            }
+
+            _context.CartItems.Remove(cartItem);
+            await _context.SaveChangesAsync();
+            return NoContent();
+        }
+
+        [HttpPost("orders/checkout")]
+        public async Task<ActionResult<Order>> Checkout(int userId)
+        {
+            var cartItems = await _context.CartItems
+                .Include(c => c.Offer)
+                .Where(c => c.UserId == userId)
+                .ToListAsync();
+
+            if (!cartItems.Any())
+            {
+                return BadRequest("Cart is empty");
+            }
+
+            var order = new Order
+            {
+                UserId = userId,
+                OrderDate = DateTime.UtcNow,
+                Status = "Pending",
+                OrderItems = cartItems.Select(c => new OrderItem
+                {
+                    OfferId = c.OfferId,
+                    Quantity = c.Quantity,
+                    Price = c.Offer.Price,
+                    ExpectedDeliveryDate = DateTime.UtcNow.AddDays(c.Offer.DeliveryDays)
+                }).ToList()
+            };
+
+            foreach (var item in cartItems)
+            {
+                var offer = await _context.Offers.FindAsync(item.OfferId);
+                offer.StockQuantity -= item.Quantity;
+            }
+
+            _context.Orders.Add(order);
+            _context.CartItems.RemoveRange(cartItems);
+            await _context.SaveChangesAsync();
+
+            return Ok(order);
+        }
+    }
+
+    public class Order
+    {
+        public int OrderId { get; set; }
+        public int UserId { get; set; }
+        public DateTime OrderDate { get; set; }
+        public string Status { get; set; }
+        public List<OrderItem> OrderItems { get; set; }
+    }
+
+    public class OrderItem
+    {
+        public int OrderItemId { get; set; }
+        public int OrderId { get; set; }
+        public int OfferId { get; set; }
+        public int Quantity { get; set; }
+        public decimal Price { get; set; }
+        public DateTime ExpectedDeliveryDate { get; set; }
+        public DateTime? DeliveryDate { get; set; }
+        public string Status { get; set; }
+    }
+}

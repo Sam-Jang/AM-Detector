@@ -1,0 +1,215 @@
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+class User {
+    String username;
+    String password;
+
+    User(String u, String p) {
+        username = u;
+        password = p;
+    }
+}
+
+class Product {
+    String name;
+    String description;
+    double price;
+    String category;
+    int stock;
+
+    Product(String n, String d, double p, String c, int s) {
+        name = n;
+        description = d;
+        price = p;
+        category = c;
+        stock = s;
+    }
+}
+
+class CartItem {
+    Product product;
+    int quantity;
+
+    CartItem(Product p, int q) {
+        product = p;
+        quantity = q;
+    }
+}
+
+class Cart {
+    List<CartItem> items = new ArrayList<>();
+
+    void addProduct(Product product, int quantity) {
+        items.add(new CartItem(product, quantity));
+    }
+
+    void showCart() {
+        System.out.println("Your Cart:");
+        for (CartItem item : items) {
+            System.out.println(item.product.name + " - " + item.product.price + " USD - Quantity: " + item.quantity);
+        }
+    }
+
+    double calculateTotal() {
+        double total = 0;
+        for (CartItem item : items) {
+            total += item.product.price * item.quantity;
+        }
+        return total;
+    }
+}
+
+class ShopEasy {
+    private List<User> users = new ArrayList<>();
+    private List<Product> products = new ArrayList<>();
+    private User currentUser = null;
+    private Connection conn;
+
+    ShopEasy() {
+        connectToDatabase();
+        loadUsers();
+        loadProducts();
+    }
+
+    private void connectToDatabase() {
+        try {
+            String url = "jdbc:sqlserver://YOUR_SERVER_NAME;databaseName=YOUR_DB_NAME;integratedSecurity=true;";
+            conn = DriverManager.getConnection(url);
+            System.out.println("Connected to database!");
+        } catch (SQLException e) {
+            System.err.println("Failed to connect to database.");
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    private void loadUsers() {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT username, password FROM Users")) {
+
+            while (rs.next()) {
+                users.add(new User(rs.getString("username"), rs.getString("password")));
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadProducts() {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT name, description, price, category, stock FROM Products")) {
+
+            while (rs.next()) {
+                products.add(new Product(rs.getString("name"), rs.getString("description"),
+                        rs.getDouble("price"), rs.getString("category"), rs.getInt("stock")));
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    boolean login(String username, String password) {
+        for (User user : users) {
+            if (user.username.equals(username) && user.password.equals(password)) {
+                currentUser = user;
+                System.out.println("Logged in as " + username);
+                return true;
+            }
+        }
+        System.out.println("Login failed");
+        return false;
+    }
+
+    void searchProducts(String query) {
+        System.out.println("Search results for '" + query + "':");
+        for (Product product : products) {
+            if (product.name.contains(query) || product.description.contains(query)) {
+                System.out.println(product.name + " - " + product.price + " USD");
+            }
+        }
+    }
+
+    void filterProductsByCategory(String category) {
+        System.out.println("Products in category '" + category + "':");
+        for (Product product : products) {
+            if (product.category.equals(category)) {
+                System.out.println(product.name + " - " + product.price + " USD");
+            }
+        }
+    }
+
+    void checkout(Cart cart) {
+        double total = cart.calculateTotal();
+        System.out.println("Total amount to pay: " + total + " USD");
+        System.out.println("Order placed successfully!");
+        cart.items.clear();
+    }
+
+    void run() {
+        Cart cart = new Cart();
+        Scanner scanner = new Scanner(System.in);
+
+        while (true) {
+            System.out.print("\nEnter a command (login, search, category, add, cart, checkout, exit): ");
+            String command = scanner.next();
+
+            switch (command) {
+                case "login":
+                    System.out.print("Username: ");
+                    String username = scanner.next();
+                    System.out.print("Password: ");
+                    String password = scanner.next();
+                    login(username, password);
+                    break;
+                case "search":
+                    System.out.print("Search: ");
+                    String query = scanner.next();
+                    searchProducts(query);
+                    break;
+                case "category":
+                    System.out.print("Category: ");
+                    String category = scanner.next();
+                    filterProductsByCategory(category);
+                    break;
+                case "add":
+                    System.out.print("Product name: ");
+                    String productName = scanner.next();
+                    System.out.print("Quantity: ");
+                    int quantity = scanner.nextInt();
+                    boolean productFound = false;
+                    for (Product product : products) {
+                        if (product.name.equals(productName)) {
+                            cart.addProduct(product, quantity);
+                            System.out.println(productName + " added to cart");
+                            productFound = true;
+                            break;
+                        }
+                    }
+                    if (!productFound) {
+                        System.out.println("Product not found");
+                    }
+                    break;
+                case "cart":
+                    cart.showCart();
+                    break;
+                case "checkout":
+                    checkout(cart);
+                    break;
+                case "exit":
+                    scanner.close();
+                    return;
+                default:
+                    System.out.println("Invalid command");
+                    break;
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        ShopEasy shop = new ShopEasy();
+        shop.run();
+    }
+}

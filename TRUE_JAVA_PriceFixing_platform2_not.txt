@@ -1,0 +1,531 @@
+package com.ecommerceservice;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.authentication.AuthenticationProvider;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import jakarta.persistence.*;
+import jakarta.servlet.http.HttpServletRequest;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import javax.crypto.SecretKey;
+import java.util.*;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.math.BigDecimal;
+
+@SpringBootApplication
+public class ECommerceServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ECommerceServiceApplication.class, args);
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf().disable()
+            .authorizeHttpRequests()
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/api/products/adjust-prices").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            .and()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .authenticationProvider(authenticationProvider());
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationProvider authenticationProvider() {
+        return new AuthenticationProvider() {
+            @Autowired
+            private UserRepository userRepository;
+            @Autowired
+            private PasswordEncoder passwordEncoder;
+
+            @Override
+            public Authentication authenticate(Authentication authentication) {
+                String username = authentication.getName();
+                String password = authentication.getCredentials().toString();
+                User user = userRepository.findByUsername(username)
+                    .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+                if (passwordEncoder.matches(password, user.getPasswordHash())) {
+                    return new UsernamePasswordAuthenticationToken(
+                        username, password, Collections.singletonList(() -> "ROLE_USER"));
+                }
+                throw new UsernameNotFoundException("Invalid credentials");
+            }
+
+            @Override
+            public boolean supports(Class<?> authentication) {
+                return authentication.equals(UsernamePasswordAuthenticationToken.class);
+            }
+        };
+    }
+}
+
+@Entity
+class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private String name;
+    private String description;
+    private BigDecimal price;
+    private BigDecimal discount;
+    private Integer stock;
+    private String keywords;
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public BigDecimal getPrice() { return price; }
+    public void setPrice(BigDecimal price) { this.price = price; }
+    public BigDecimal getDiscount() { return discount; }
+    public void setDiscount(BigDecimal discount) { this.discount = discount; }
+    public Integer getStock() { return stock; }
+    public void setStock(Integer stock) { this.stock = stock; }
+    public String getKeywords() { return keywords; }
+    public void setKeywords(String keywords) { this.keywords = keywords; }
+}
+
+@Entity
+class CartItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private Integer userId;
+    private Integer productId;
+    private Integer quantity;
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Integer getProductId() { return productId; }
+    public void setProductId(Integer productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+}
+
+@Entity
+class Order {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private Integer userId;
+    private Instant orderDate;
+    private BigDecimal totalAmount;
+    private String status;
+    @OneToMany(cascade = CascadeType.ALL)
+    private List<OrderItem> items = new ArrayList<>();
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Instant getOrderDate() { return orderDate; }
+    public void setOrderDate(Instant orderDate) { this.orderDate = orderDate; }
+    public BigDecimal getTotalAmount() { return totalAmount; }
+    public void setTotalAmount(BigDecimal totalAmount) { this.totalAmount = totalAmount; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public List<OrderItem> getItems() { return items; }
+    public void setItems(List<OrderItem> items) { this.items = items; }
+}
+
+@Entity
+class OrderItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private Integer orderId;
+    private Integer productId;
+    private Integer quantity;
+    private BigDecimal price;
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getOrderId() { return orderId; }
+    public void setOrderId(Integer orderId) { this.orderId = orderId; }
+    public Integer getProductId() { return productId; }
+    public void setProductId(Integer productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    public BigDecimal getPrice() { return price; }
+    public void setPrice(BigDecimal price) { this.price = price; }
+}
+
+@Entity
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private String username;
+    private String passwordHash;
+    private String email;
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+}
+
+@Entity
+class CompetitorPrice {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private Integer productId;
+    private BigDecimal price;
+    private String source;
+    private Instant lastUpdated;
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getProductId() { return productId; }
+    public void setProductId(Integer productId) { this.productId = productId; }
+    public BigDecimal getPrice() { return price; }
+    public void setPrice(BigDecimal price) { this.price = price; }
+    public String getSource() { return source; }
+    public void setSource(String source) { this.source = source; }
+    public Instant getLastUpdated() { return lastUpdated; }
+    public void setLastUpdated(Instant lastUpdated) { this.lastUpdated = lastUpdated; }
+}
+
+class PricingConfig {
+    private BigDecimal minPrice;
+    private BigDecimal maxPrice;
+    private BigDecimal adjustmentFactor;
+    private BigDecimal weightCompetitor;
+    private BigDecimal weightBase;
+
+    public BigDecimal getMinPrice() { return minPrice; }
+    public void setMinPrice(BigDecimal minPrice) { this.minPrice = minPrice; }
+    public BigDecimal getMaxPrice() { return maxPrice; }
+    public void setMaxPrice(BigDecimal maxPrice) { this.maxPrice = maxPrice; }
+    public BigDecimal getAdjustmentFactor() { return adjustmentFactor; }
+    public void setAdjustmentFactor(BigDecimal adjustmentFactor) { this.adjustmentFactor = adjustmentFactor; }
+    public BigDecimal getWeightCompetitor() { return weightCompetitor; }
+    public void setWeightCompetitor(BigDecimal weightCompetitor) { this.weightCompetitor = weightCompetitor; }
+    public BigDecimal getWeightBase() { return weightBase; }
+    public void setWeightBase(BigDecimal weightBase) { this.weightBase = weightBase; }
+}
+
+interface ProductRepository extends JpaRepository<Product, Integer> {
+    List<Product> findByKeywordsContainingOrNameContaining(String keyword, String name);
+}
+
+interface CartItemRepository extends JpaRepository<CartItem, Integer> {
+    List<CartItem> findByUserId(Integer userId);
+    Optional<CartItem> findByUserIdAndProductId(Integer userId, Integer productId);
+    Optional<CartItem> findByIdAndUserId(Integer id, Integer userId);
+}
+
+interface OrderRepository extends JpaRepository<Order, Integer> {
+    List<Order> findByUserId(Integer userId);
+}
+
+interface UserRepository extends JpaRepository<User, Integer> {
+    Optional<User> findByUsername(String username);
+}
+
+interface CompetitorPriceRepository extends JpaRepository<CompetitorPrice, Integer> {
+    List<CompetitorPrice> findByProductIdAndLastUpdatedAfter(Integer productId, Instant lastUpdated);
+}
+
+@RestController
+@RequestMapping("/api/products")
+class ProductsController {
+    @Autowired
+    private ProductRepository productRepository;
+    @Autowired
+    private CompetitorPriceRepository competitorPriceRepository;
+    private final PricingConfig pricingConfig;
+
+    public ProductsController() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        pricingConfig = mapper.readValue(Files.readString(Paths.get("pricing_config.json")), PricingConfig.class);
+    }
+
+    @GetMapping
+    public ResponseEntity<Map<String, Object>> getProducts(
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "price_asc") String sortBy,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "10") int pageSize) {
+        Sort sort = switch (sortBy) {
+            case "price_asc" -> Sort.by("price").ascending();
+            case "price_desc" -> Sort.by("price").descending();
+            case "discount" -> Sort.by("discount").descending();
+            case "recommend" -> Sort.by("stock").descending(); // Simplified
+            default -> Sort.by("id").ascending();
+        };
+
+        List<Product> products;
+        long total;
+        if (!keyword.isEmpty()) {
+            products = productRepository.findByKeywordsContainingOrNameContaining(keyword, keyword);
+            total = products.size();
+            products = products.stream()
+                    .sorted(sort.toString().contains("price") ? Comparator.comparing(Product::getPrice) : Comparator.comparing(Product::getId))
+                    .skip((page - 1) * pageSize)
+                    .limit(pageSize)
+                    .toList();
+        } else {
+            total = productRepository.count();
+            products = productRepository.findAll(PageRequest.of(page - 1, pageSize, sort)).getContent();
+        }
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("Total", total);
+        response.put("Products", products);
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Product> getProduct(@PathVariable Integer id) {
+        return productRepository.findById(id)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/adjust-prices")
+    public ResponseEntity<Map<String, String>> adjustPrices() {
+        List<Product> products = productRepository.findAll();
+        for (Product product : products) {
+            List<CompetitorPrice> compPrices = competitorPriceRepository.findByProductIdAndLastUpdatedAfter(
+                    product.getId(), Instant.now().minus(7, ChronoUnit.DAYS));
+            if (!compPrices.isEmpty()) {
+                BigDecimal avgCompPrice = compPrices.stream()
+                        .map(CompetitorPrice::getPrice)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add)
+                        .divide(BigDecimal.valueOf(compPrices.size()), 2, BigDecimal.ROUND_HALF_UP);
+                BigDecimal basePrice = product.getPrice();
+                BigDecimal newPrice = pricingConfig.getWeightCompetitor().multiply(avgCompPrice)
+                        .add(pricingConfig.getWeightBase().multiply(basePrice))
+                        .divide(pricingConfig.getWeightCompetitor().add(pricingConfig.getWeightBase()), 2, BigDecimal.ROUND_HALF_UP)
+                        .multiply(pricingConfig.getAdjustmentFactor());
+                newPrice = newPrice.max(pricingConfig.getMinPrice()).min(pricingConfig.getMaxPrice());
+                product.setPrice(newPrice.setScale(2, BigDecimal.ROUND_HALF_UP));
+                productRepository.save(product);
+            }
+        }
+        Map<String, String> response = new HashMap<>();
+        response.put("Message", "Prices adjusted successfully");
+        return ResponseEntity.ok(response);
+    }
+}
+
+@RestController
+@RequestMapping("/api/cart")
+class CartController {
+    @Autowired
+    private CartItemRepository cartItemRepository;
+    @Autowired
+    private ProductRepository productRepository;
+
+    @GetMapping
+    public ResponseEntity<List<CartItem>> getCart(HttpServletRequest request) {
+        Integer userId = getUserIdFromRequest(request);
+        return ResponseEntity.ok(cartItemRepository.findByUserId(userId));
+    }
+
+    @PostMapping
+    public ResponseEntity<CartItem> addToCart(@RequestParam Integer productId, @RequestParam Integer quantity, HttpServletRequest request) {
+        Integer userId = getUserIdFromRequest(request);
+        Product product = productRepository.findById(productId)
+                .orElseThrow(() -> new RuntimeException("Product not found"));
+        if (product.getStock() < quantity) {
+            throw new RuntimeException("Insufficient stock");
+        }
+
+        Optional<CartItem> existingItem = cartItemRepository.findByUserIdAndProductId(userId, productId);
+        CartItem cartItem;
+        if (existingItem.isPresent()) {
+            cartItem = existingItem.get();
+            cartItem.setQuantity(cartItem.getQuantity() + quantity);
+        } else {
+            cartItem = new CartItem();
+            cartItem.setUserId(userId);
+            cartItem.setProductId(productId);
+            cartItem.setQuantity(quantity);
+        }
+
+        product.setStock(product.getStock() - quantity);
+        productRepository.save(product);
+        cartItemRepository.save(cartItem);
+        return ResponseEntity.ok(cartItem);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Map<String, String>> removeFromCart(@PathVariable Integer id, HttpServletRequest request) {
+        Integer userId = getUserIdFromRequest(request);
+        Optional<CartItem> cartItem = cartItemRepository.findByIdAndUserId(id, userId);
+        if (cartItem.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Product product = productRepository.findById(cartItem.get().getProductId())
+                .orElseThrow(() -> new RuntimeException("Product not found"));
+        product.setStock(product.getStock() + cartItem.get().getQuantity());
+        productRepository.save(product);
+        cartItemRepository.delete(cartItem.get());
+
+        Map<String, String> response = new HashMap<>();
+        response.put("Message", "Item removed from cart");
+        return ResponseEntity.ok(response);
+    }
+
+    private Integer getUserIdFromRequest(HttpServletRequest request) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        return Integer.parseInt(authentication.getName());
+    }
+}
+
+@RestController
+@RequestMapping("/api/orders")
+class OrdersController {
+    @Autowired
+    private OrderRepository orderRepository;
+    @Autowired
+    private CartItemRepository cartItemRepository;
+    @Autowired
+    private ProductRepository productRepository;
+
+    @PostMapping
+    public ResponseEntity<Order> createOrder(HttpServletRequest request) {
+        Integer userId = getUserIdFromRequest(request);
+        List<CartItem> cartItems = cartItemRepository.findByUserId(userId);
+        if (cartItems.isEmpty()) {
+            throw new RuntimeException("Cart is empty");
+        }
+
+        Order order = new Order();
+        order.setUserId(userId);
+        order.setOrderDate(Instant.now());
+        order.setStatus("Pending");
+        order.setTotalAmount(BigDecimal.ZERO);
+        order.setItems(new ArrayList<>());
+
+        for (CartItem cartItem : cartItems) {
+            Product product = productRepository.findById(cartItem.getProductId())
+                    .orElseThrow(() -> new RuntimeException("Product not found"));
+            OrderItem orderItem = new OrderItem();
+            orderItem.setProductId(cartItem.getProductId());
+            orderItem.setQuantity(cartItem.getQuantity());
+            orderItem.setPrice(product.getPrice().subtract(product.getDiscount()));
+            order.getItems().add(orderItem);
+            order.setTotalAmount(order.getTotalAmount()
+                    .add(orderItem.getPrice().multiply(BigDecimal.valueOf(orderItem.getQuantity()))));
+        }
+
+        orderRepository.save(order);
+        cartItemRepository.deleteAll(cartItems);
+        return ResponseEntity.ok(order);
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Order>> getOrders(HttpServletRequest request) {
+        Integer userId = getUserIdFromRequest(request);
+        return ResponseEntity.ok(orderRepository.findByUserId(userId));
+    }
+
+    private Integer getUserIdFromRequest(HttpServletRequest request) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        return Integer.parseInt(authentication.getName());
+    }
+}
+
+@RestController
+@RequestMapping("/api/auth")
+class AuthController {
+    @Autowired
+    private UserRepository userRepository;
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+    private final SecretKey jwtKey = Keys.secretKeyFor(SignatureAlgorithm.HS256);
+
+    @PostMapping("/register")
+    public ResponseEntity<Map<String, String>> register(@RequestParam String username, @RequestParam String password, @RequestParam String email) {
+        if (userRepository.findByUsername(username).isPresent()) {
+            throw new RuntimeException("Username already exists");
+        }
+
+        User user = new User();
+        user.setUsername(username);
+        user.setPasswordHash(passwordEncoder.encode(password));
+        user.setEmail(email);
+        userRepository.save(user);
+
+        Map<String, String> response = new HashMap<>();
+        response.put("Message", "User registered successfully");
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<Map<String, String>> login(@RequestParam String username, @RequestParam String password) {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new RuntimeException("Invalid credentials"));
+
+        if (!passwordEncoder.matches(password, user.getPasswordHash())) {
+            throw new RuntimeException("Invalid credentials");
+        }
+
+        String token = Jwts.builder()
+                .setSubject(String.valueOf(user.getId()))
+                .claim("username", user.getUsername())
+                .claim("role", "User")
+                .setIssuedAt(Date.from(Instant.now()))
+                .setExpiration(Date.from(Instant.now().plus(1, ChronoUnit.DAYS)))
+                .signWith(jwtKey)
+                .compact();
+
+        Map<String, String> response = new HashMap<>();
+        response.put("Token", token);
+        return ResponseEntity.ok(response);
+    }
+}

@@ -1,0 +1,489 @@
+package com.ecommercesearch;
+
+import jakarta.persistence.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@SpringBootApplication
+public class ECommerceSearchApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ECommerceSearchApplication.class, args);
+    }
+}
+
+@Configuration
+class AppConfig {
+    @Bean
+    public SearchConfig searchConfig() throws IOException {
+        String json = new String(Files.readAllBytes(Paths.get("search-config.json")));
+        return new ObjectMapper().readValue(json, SearchConfig.class);
+    }
+}
+
+@Entity
+class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+
+    @NotNull
+    private String name;
+
+    private String description;
+
+    @Column(precision = 18, scale = 2)
+    private BigDecimal price;
+
+    @Column(precision = 18, scale = 2)
+    private BigDecimal discountedPrice;
+
+    private boolean isSponsored;
+
+    private boolean isOwnBrand;
+
+    private Integer stockQuantity;
+
+    private String category;
+
+    // Getters and setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public BigDecimal getPrice() { return price; }
+    public void setPrice(BigDecimal price) { this.price = price; }
+    public BigDecimal getDiscountedPrice() { return discountedPrice; }
+    public void setDiscountedPrice(BigDecimal discountedPrice) { this.discountedPrice = discountedPrice; }
+    public boolean getIsSponsored() { return isSponsored; }
+    public void setIsSponsored(boolean isSponsored) { this.isSponsored = isSponsored; }
+    public boolean getIsOwnBrand() { return isOwnBrand; }
+    public void setIsOwnBrand(boolean isOwnBrand) { this.isOwnBrand = isOwnBrand; }
+    public Integer getStockQuantity() { return stockQuantity; }
+    public void setStockQuantity(Integer stockQuantity) { this.stockQuantity = stockQuantity; }
+    public String getCategory() { return category; }
+    public void setCategory(String category) { this.category = category; }
+}
+
+@Entity
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+
+    @NotNull
+    private String username;
+
+    private String email;
+
+    private String passwordHash;
+
+    // Getters and setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+}
+
+@Entity
+class CartItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+
+    private Integer userId;
+
+    private Integer productId;
+
+    private Integer quantity;
+
+    @ManyToOne
+    @JoinColumn(name = "userId", insertable = false, updatable = false)
+    private User user;
+
+    @ManyToOne
+    @JoinColumn(name = "productId", insertable = false, updatable = false)
+    private Product product;
+
+    // Getters and setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Integer getProductId() { return productId; }
+    public void setProductId(Integer productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+    public User getUser() { return user; }
+    public void setUser(User user) { this.user = user; }
+    public Product getProduct() { return product; }
+    public void setProduct(Product product) { this.product = product; }
+}
+
+class SearchConfig {
+    private double relevanceWeight;
+    private double priceWeight;
+    private double discountWeight;
+    private double sponsorBias;
+    private double ownBrandBias;
+
+    // Getters and setters
+    public double getRelevanceWeight() { return relevanceWeight; }
+    public void setRelevanceWeight(double relevanceWeight) { this.relevanceWeight = relevanceWeight; }
+    public double getPriceWeight() { return priceWeight; }
+    public void setPriceWeight(double priceWeight) { this.priceWeight = priceWeight; }
+    public double getDiscountWeight() { return discountWeight; }
+    public void setDiscountWeight(double discountWeight) { this.discountWeight = discountWeight; }
+    public double getSponsorBias() { return sponsorBias; }
+    public void setSponsorBias(double sponsorBias) { this.sponsorBias = sponsorBias; }
+    public double getOwnBrandBias() { return ownBrandBias; }
+    public void setOwnBrandBias(double ownBrandBias) { this.ownBrandBias = ownBrandBias; }
+}
+
+interface ProductRepository extends JpaRepository<Product, Integer> {
+    List<Product> findByNameContainingIgnoreCaseOrDescriptionContainingIgnoreCase(String name, String description);
+}
+
+interface UserRepository extends JpaRepository<User, Integer> {
+    Optional<User> findByUsername(String username);
+}
+
+interface CartItemRepository extends JpaRepository<CartItem, Integer> {
+    List<CartItem> findByUserId(Integer userId);
+}
+
+@RestController
+@RequestMapping("/api/search")
+class SearchController {
+    @Autowired
+    private ProductRepository productRepository;
+
+    @Autowired
+    private SearchConfig config;
+
+    @GetMapping("/search")
+    public ResponseEntity<List<Product>> searchProducts(
+            @RequestParam String query,
+            @RequestParam(defaultValue = "relevance") String sortBy,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "10") int pageSize) {
+        List<Product> products = productRepository.findByNameContainingIgnoreCaseOrDescriptionContainingIgnoreCase(query, query);
+        List<Product> scoredProducts = products.stream()
+                .map(p -> new AbstractMap.SimpleEntry<>(p, calculateProductScore(p, query, sortBy)))
+                .sorted((e1, e2) -> Double.compare(e2.getValue(), e1.getValue()))
+                .skip((page - 1) * pageSize)
+                .limit(pageSize)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(scoredProducts);
+    }
+
+    private double calculateProductScore(Product product, String query, String sortBy) {
+        double score = 0;
+        if ("relevance".equals(sortBy)) {
+            score += calculateRelevanceScore(product, query) * config.getRelevanceWeight();
+            score += (1 - (product.getPrice().doubleValue() / getMaxPrice())) * config.getPriceWeight();
+            score += (product.getPrice().doubleValue() - product.getDiscountedPrice().doubleValue()) / product.getPrice().doubleValue() * config.getDiscountWeight();
+            if (product.getIsSponsored()) score += config.getSponsorBias();
+            if (product.getIsOwnBrand()) score += config.getOwnBrandBias();
+        } else if ("price_asc".equals(sortBy)) {
+            score = product.getDiscountedPrice().doubleValue() == 0 ? product.getPrice().doubleValue() : product.getDiscountedPrice().doubleValue();
+            score = 1 / (score + 1);
+        } else if ("price_desc".equals(sortBy)) {
+            score = product.getDiscountedPrice().doubleValue() == 0 ? product.getPrice().doubleValue() : product.getDiscountedPrice().doubleValue();
+        } else if ("discount".equals(sortBy)) {
+            score = (product.getPrice().doubleValue() - product.getDiscountedPrice().doubleValue()) / product.getPrice().doubleValue();
+        }
+        return score;
+    }
+
+    private double calculateRelevanceScore(Product product, String query) {
+        String[] queryWords = query.toLowerCase().split(" ");
+        String[] nameWords = product.getName().toLowerCase().split(" ");
+        String[] descWords = product.getDescription() != null ? product.getDescription().toLowerCase().split(" ") : new String[0];
+        double score = Arrays.stream(queryWords).filter(q -> Arrays.asList(nameWords).contains(q)).count() * 0.6;
+        score += Arrays.stream(queryWords).filter(q -> Arrays.asList(descWords).contains(q)).count() * 0.4;
+        return score / queryWords.length;
+    }
+
+    private double getMaxPrice() {
+        return productRepository.findAll().stream().mapToDouble(p -> p.getPrice().doubleValue()).max().orElse(1.0);
+    }
+}
+
+@RestController
+@RequestMapping("/api/cart")
+class CartController {
+    @Autowired
+    private CartItemRepository cartItemRepository;
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    @GetMapping("/{userId}")
+    public ResponseEntity<List<CartItem>> getCart(@PathVariable Integer userId) {
+        return ResponseEntity.ok(cartItemRepository.findByUserId(userId));
+    }
+
+    @PostMapping
+    public ResponseEntity<CartItem> addToCart(@Valid @RequestBody CartItemRequest request) {
+        Optional<Product> productOpt = productRepository.findById(request.getProductId());
+        if (productOpt.isEmpty() || productOpt.get().getStockQuantity() < request.getQuantity()) {
+            return ResponseEntity.badRequest().build();
+        }
+        Product product = productOpt.get();
+        CartItem cartItem = new CartItem();
+        cartItem.setUserId(request.getUserId());
+        cartItem.setProductId(request.getProductId());
+        cartItem.setQuantity(request.getQuantity());
+        product.setStockQuantity(product.getStockQuantity() - request.getQuantity());
+        cartItemRepository.save(cartItem);
+        productRepository.save(product);
+        return ResponseEntity.ok(cartItem);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<Void> updateCartItem(@PathVariable Integer id, @Valid @RequestBody UpdateCartItemRequest request) {
+        Optional<CartItem> cartItemOpt = cartItemRepository.findById(id);
+        if (cartItemOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        CartItem cartItem = cartItemOpt.get();
+        Optional<Product> productOpt = productRepository.findById(cartItem.getProductId());
+        int quantityDiff = request.getQuantity() - cartItem.getQuantity();
+        if (productOpt.isEmpty() || productOpt.get().getStockQuantity() < quantityDiff) {
+            return ResponseEntity.badRequest().build();
+        }
+        Product product = productOpt.get();
+        cartItem.setQuantity(request.getQuantity());
+        product.setStockQuantity(product.getStockQuantity() - quantityDiff);
+        cartItemRepository.save(cartItem);
+        productRepository.save(product);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> removeCartItem(@PathVariable Integer id) {
+        Optional<CartItem> cartItemOpt = cartItemRepository.findById(id);
+        if (cartItemOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        CartItem cartItem = cartItemOpt.get();
+        Optional<Product> productOpt = productRepository.findById(cartItem.getProductId());
+        if (productOpt.isPresent()) {
+            Product product = productOpt.get();
+            product.setStockQuantity(product.getStockQuantity() + cartItem.getQuantity());
+            productRepository.save(product);
+        }
+        cartItemRepository.delete(cartItem);
+        return ResponseEntity.noContent().build();
+    }
+}
+
+@RestController
+@RequestMapping("/api/user")
+class UserController {
+    @Autowired
+    private UserRepository userRepository;
+
+    @PostMapping("/register")
+    public ResponseEntity<User> register(@Valid @RequestBody RegisterRequest request) {
+        if (userRepository.findByUsername(request.getUsername()).isPresent()) {
+            return ResponseEntity.badRequest().build();
+        }
+        User user = new User();
+        user.setUsername(request.getUsername());
+        user.setEmail(request.getEmail());
+        user.setPasswordHash(hashPassword(request.getPassword()));
+        userRepository.save(user);
+        return ResponseEntity.ok(user);
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<User> login(@Valid @RequestBody LoginRequest request) {
+        Optional<User> userOpt = userRepository.findByUsername(request.getUsername());
+        if (userOpt.isEmpty() || !verifyPassword(request.getPassword(), userOpt.get().getPasswordHash())) {
+            return ResponseEntity.status(401).build();
+        }
+        return ResponseEntity.ok(userOpt.get());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<User> getUser(@PathVariable Integer id) {
+        Optional<User> userOpt = userRepository.findById(id);
+        if (userOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(userOpt.get());
+    }
+
+    private String hashPassword(String password) {
+        return Base64.getEncoder().encodeToString(password.getBytes());
+    }
+
+    private boolean verifyPassword(String password, String hash) {
+        return hashPassword(password).equals(hash);
+    }
+}
+
+@RestController
+@RequestMapping("/api/product")
+class ProductController {
+    @Autowired
+    private ProductRepository productRepository;
+
+    @GetMapping
+    public ResponseEntity<List<Product>> getProducts() {
+        return ResponseEntity.ok(productRepository.findAll());
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Product> getProduct(@PathVariable Integer id) {
+        Optional<Product> productOpt = productRepository.findById(id);
+        if (productOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(productOpt.get());
+    }
+
+    @PostMapping
+    public ResponseEntity<Product> createProduct(@Valid @RequestBody ProductRequest request) {
+        Product product = new Product();
+        product.setName(request.getName());
+        product.setDescription(request.getDescription());
+        product.setPrice(request.getPrice());
+        product.setDiscountedPrice(request.getDiscountedPrice());
+        product.setIsSponsored(request.getIsSponsored());
+        product.setIsOwnBrand(request.getIsOwnBrand());
+        product.setStockQuantity(request.getStockQuantity());
+        product.setCategory(request.getCategory());
+        productRepository.save(product);
+        return ResponseEntity.ok(product);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<Void> updateProduct(@PathVariable Integer id, @Valid @RequestBody ProductRequest request) {
+        Optional<Product> productOpt = productRepository.findById(id);
+        if (productOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Product product = productOpt.get();
+        product.setName(request.getName());
+        product.setDescription(request.getDescription());
+        product.setPrice(request.getPrice());
+        product.setDiscountedPrice(request.getDiscountedPrice());
+        product.setIsSponsored(request.getIsSponsored());
+        product.setIsOwnBrand(request.getIsOwnBrand());
+        product.setStockQuantity(request.getStockQuantity());
+        product.setCategory(request.getCategory());
+        productRepository.save(product);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteProduct(@PathVariable Integer id) {
+        Optional<Product> productOpt = productRepository.findById(id);
+        if (productOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        productRepository.delete(productOpt.get());
+        return ResponseEntity.noContent().build();
+    }
+}
+
+class CartItemRequest {
+    private Integer userId;
+    private Integer productId;
+    private Integer quantity;
+
+    // Getters and setters
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Integer getProductId() { return productId; }
+    public void setProductId(Integer productId) { this.productId = productId; }
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+}
+
+class UpdateCartItemRequest {
+    private Integer quantity;
+
+    // Getters and setters
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+}
+
+class RegisterRequest {
+    private String username;
+    private String email;
+    private String password;
+
+    // Getters and setters
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+}
+
+class LoginRequest {
+    private String username;
+    private String password;
+
+    // Getters and setters
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+}
+
+class ProductRequest {
+    private String name;
+    private String description;
+    private BigDecimal price;
+    private BigDecimal discountedPrice;
+    private boolean isSponsored;
+    private boolean isOwnBrand;
+    private Integer stockQuantity;
+    private String category;
+
+    // Getters and setters
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public BigDecimal getPrice() { return price; }
+    public void setPrice(BigDecimal price) { this.price = price; }
+    public BigDecimal getDiscountedPrice() { return discountedPrice; }
+    public void setDiscountedPrice(BigDecimal discountedPrice) { this.discountedPrice = discountedPrice; }
+    public boolean getIsSponsored() { return isSponsored; }
+    public void setIsSponsored(boolean isSponsored) { this.isSponsored = isSponsored; }
+    public boolean getIsOwnBrand() { return isOwnBrand; }
+    public void setIsOwnBrand(boolean isOwnBrand) { this.isOwnBrand = isOwnBrand; }
+    public Integer getStockQuantity() { return stockQuantity; }
+    public void setStockQuantity(Integer stockQuantity) { this.stockQuantity = stockQuantity; }
+    public String getCategory() { return category; }
+    public void setCategory(String category) { this.category = category; }
+}

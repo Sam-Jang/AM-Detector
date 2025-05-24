@@ -1,0 +1,690 @@
+#include <cpprest/http_listener.h>
+#include <cpprest/json.h>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/resultset.h>
+#include <jwt-cpp/jwt.h>
+#include <bcrypt/BCrypt.hpp>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <memory>
+
+using namespace web;
+using namespace web::http;
+using namespace web::http::experimental::listener;
+using namespace sql;
+using namespace std;
+
+struct WeightConfig {
+    double viewWeight;
+    double likeWeight;
+    double platformBias;
+    double keywordWeight;
+};
+
+struct Video {
+    int id;
+    string title;
+    string description;
+    string url;
+    bool isPlatformOwned;
+    int views;
+    int likes;
+    string keywords;
+    chrono::system_clock::time_point uploadDate;
+};
+
+struct User {
+    int id;
+    string username;
+    string passwordHash;
+    string email;
+};
+
+struct Favorite {
+    int id;
+    int userId;
+    int videoId;
+};
+
+struct Playlist {
+    int id;
+    int userId;
+    string name;
+};
+
+struct PlaylistVideo {
+    int playlistId;
+    int videoId;
+};
+
+struct WatchHistory {
+    int id;
+    int userId;
+    int videoId;
+    chrono::system_clock::time_point watchedAt;
+};
+
+struct SearchResult {
+    int videoId;
+    string title;
+    string description;
+    string url;
+    double score;
+};
+
+class VideoPlatform {
+private:
+    string connectionString;
+    WeightConfig weights;
+    string jwtKey;
+    string jwtIssuer;
+    string jwtAudience;
+    unique_ptr<mysql::MySQL_Driver> driver;
+    unique_ptr<Connection> conn;
+
+    WeightConfig loadWeights() {
+        ifstream file("weights.json");
+        json::value jsonData = json::value::parse(file);
+        WeightConfig config;
+        config.viewWeight = jsonData.at(U("ViewWeight")).as_double();
+        config.likeWeight = jsonData.at(U("LikeWeight")).as_double();
+        config.platformBias = jsonData.at(U("PlatformBias")).as_double();
+        config.keywordWeight = jsonData.at(U("KeywordWeight")).as_double();
+        return config;
+    }
+
+    Connection* getConnection() {
+        return driver->connect(connectionString)->clone();
+    }
+
+    vector<string> split(const string& str, char delimiter) {
+        vector<string> tokens;
+        stringstream ss(str);
+        string token;
+        while (getline(ss, token, delimiter)) {
+            tokens.push_back(token);
+        }
+        return tokens;
+    }
+
+    double calculateVideoScore(const Video& video, const string& query) {
+        double score = 0;
+        vector<string> queryTerms = split(query, ' ');
+        vector<string> videoKeywords = split(video.keywords, ',');
+
+        for (const auto& term : queryTerms) {
+            string lowerTerm = term;
+            transform(lowerTerm.begin(), lowerTerm.end(), lowerTerm.begin(), ::tolower);
+            string lowerTitle = video.title;
+            string lowerDesc = video.description;
+            transform(lowerTitle.begin(), lowerTitle.end(), lowerTitle.begin(), ::tolower);
+            transform(lowerDesc.begin(), lowerDesc.end(), lowerDesc.begin(), ::tolower);
+
+            if (lowerTitle.find(lowerTerm) != string::npos || lowerDesc.find(lowerTerm) != string::npos) {
+                score += weights.keywordWeight;
+            }
+            for (const auto& keyword : videoKeywords) {
+                string lowerKeyword = keyword;
+                transform(lowerKeyword.begin(), lowerKeyword.end(), lowerKeyword.begin(), ::tolower);
+                if (lowerKeyword == lowerTerm) {
+                    score += weights.keywordWeight * 1.5;
+                }
+            }
+        }
+
+        score += video.views * weights.viewWeight;
+        score += video.likes * weights.likeWeight;
+
+        if (video.isPlatformOwned) {
+            score += weights.platformBias;
+        }
+
+        auto now = chrono::system_clock::now();
+        auto duration = chrono::duration_cast<chrono::hours>(now - video.uploadDate).count() / 24.0;
+        score += max(0.0, 30 - duration) * 0.1;
+
+        return score;
+    }
+
+    vector<Video> getVideosFromDb() {
+        vector<Video> videos;
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos"));
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        while (res->next()) {
+            Video video;
+            video.id = res->getInt("id");
+            video.title = res->getString("title");
+            video.description = res->getString("description");
+            video.url = res->getString("url");
+            video.isPlatformOwned = res->getBoolean("is_platform_owned");
+            video.views = res->getInt("views");
+            video.likes = res->getInt("likes");
+            video.keywords = res->getString("keywords");
+            video.uploadDate = chrono::system_clock::from_time_t(res->getInt64("upload_date"));
+            videos.push_back(video);
+        }
+        return videos;
+    }
+
+    int getVideoViews(int videoId) {
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT views FROM videos WHERE id = ?"));
+        pstmt->setInt(1, videoId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+        return res->next() ? res->getInt("views") : 0;
+    }
+
+    chrono::system_clock::time_point getVideoUploadDate(int videoId) {
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT upload_date FROM videos WHERE id = ?"));
+        pstmt->setInt(1, videoId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+        return res->next() ? chrono::system_clock::from_time_t(res->getInt64("upload_date")) : chrono::system_clock::now();
+    }
+
+    string generateJwtToken(int userId, const string& username) {
+        auto now = chrono::system_clock::now();
+        auto expires = chrono::duration_cast<chrono::seconds>(now.time_since_epoch()).count() + 3600;
+
+        return jwt::create()
+            .set_issuer(jwtIssuer)
+            .set_audience(jwtAudience)
+            .set_payload_claim("userId", jwt::claim(to_string(userId)))
+            .set_payload_claim("username", jwt::claim(username))
+            .set_expires_at(chrono::system_clock::from_time_t(expires))
+            .sign(jwt::algorithm::hs256{jwtKey});
+    }
+
+    bool verifyJwtToken(const string& token, int& userId, string& username) {
+        try {
+            auto decoded = jwt::decode(token);
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{jwtKey})
+                .with_issuer(jwtIssuer)
+                .with_audience(jwtAudience);
+
+            verifier.verify(decoded);
+            userId = stoi(decoded.get_payload_claim("userId").as_string());
+            username = decoded.get_payload_claim("username").as_string();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+public:
+    VideoPlatform() {
+        connectionString = "tcp://localhost:3306;user=root;password=;database=videoplatform";
+        weights = loadWeights();
+        jwtKey = "your-secret-key";
+        jwtIssuer = "your-issuer";
+        jwtAudience = "your-audience";
+        driver.reset(mysql::get_mysql_driver_instance());
+    }
+
+    void handleSearch(http_request request) {
+        auto query = uri::split_query(request.request_uri().query());
+        string searchQuery = query["query"];
+        string sort = query.find("sort") != query.end() ? query["sort"] : "relevance";
+
+        vector<Video> videos = getVideosFromDb();
+        vector<SearchResult> results;
+
+        for (const auto& video : videos) {
+            SearchResult result;
+            result.videoId = video.id;
+            result.title = video.title;
+            result.description = video.description;
+            result.url = video.url;
+            result.score = calculateVideoScore(video, searchQuery);
+            results.push_back(result);
+        }
+
+        if (sort == "views") {
+            sort(results.begin(), results.end(), [this](const SearchResult& a, const SearchResult& b) {
+                return getVideoViews(a.videoId) > getVideoViews(b.videoId);
+            });
+        } else if (sort == "upload") {
+            sort(results.begin(), results.end(), [this](const SearchResult& a, const SearchResult& b) {
+                return getVideoUploadDate(a.videoId) > getVideoUploadDate(b.videoId);
+            });
+        } else {
+            sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+                return a.score > b.score;
+            });
+        }
+
+        json::value response = json::value::array();
+        for (size_t i = 0; i < results.size(); ++i) {
+            response[i]["videoId"] = results[i].videoId;
+            response[i]["title"] = json::value::string(results[i].title);
+            response[i]["description"] = json::value::string(results[i].description);
+            response[i]["url"] = json::value::string(results[i].url);
+            response[i]["score"] = results[i].score;
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleGetVideo(http_request request) {
+        int id = stoi(request.relative_uri().path().substr(1));
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos WHERE id = ?"));
+        pstmt->setInt(1, id);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (res->next()) {
+            json::value response;
+            response["id"] = res->getInt("id");
+            response["title"] = json::value::string(res->getString("title"));
+            response["description"] = json::value::string(res->getString("description"));
+            response["url"] = json::value::string(res->getString("url"));
+            response["isPlatformOwned"] = res->getBoolean("is_platform_owned");
+            response["views"] = res->getInt("views");
+            response["likes"] = res->getInt("likes");
+            response["keywords"] = json::value::string(res->getString("keywords"));
+            response["uploadDate"] = res->getInt64("upload_date");
+            request.reply(status_codes::OK, response);
+        } else {
+            request.reply(status_codes::NotFound);
+        }
+    }
+
+    void handleUploadVideo(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO videos (title, description, url, is_platform_owned, views, likes, keywords, upload_date) VALUES (?, ?, ?, ?, 0, 0, ?, ?)"));
+        pstmt->setString(1, body.at(U("title")).as_string());
+        pstmt->setString(2, body.at(U("description")).as_string());
+        pstmt->setString(3, body.at(U("url")).as_string());
+        pstmt->setBoolean(4, body.at(U("isPlatformOwned")).as_bool());
+        pstmt->setString(5, body.at(U("keywords")).as_string());
+        pstmt->setInt64(6, chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count());
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleLikeVideo(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        int videoId = body.at(U("videoId")).as_integer();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("UPDATE videos SET likes = likes + 1 WHERE id = ?"));
+        pstmt->setInt(1, videoId);
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleRecordView(http_request request) {
+        json::value body = request.extract_json().get();
+        int videoId = body.at(U("videoId")).as_integer();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("UPDATE videos SET views = views + 1 WHERE id = ?"));
+        pstmt->setInt(1, videoId);
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleRegister(http_request request) {
+        json::value body = request.extract_json().get();
+        string passwordHash = BCrypt::generateHash(body.at(U("passwordHash")).as_string());
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)"));
+        pstmt->setString(1, body.at(U("username")).as_string());
+        pstmt->setString(2, passwordHash);
+        pstmt->setString(3, body.at(U("email")).as_string());
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleLogin(http_request request) {
+        json::value body = request.extract_json().get();
+        string username = body.at(U("username")).as_string();
+        string password = body.at(U("passwordHash")).as_string();
+
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, username, password_hash FROM users WHERE username = ?"));
+        pstmt->setString(1, username);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        if (res->next() && BCrypt::validatePassword(password, res->getString("password_hash"))) {
+            json::value response;
+            response["token"] = json::value::string(generateJwtToken(res->getInt("id"), username));
+            request.reply(status_codes::OK, response);
+        } else {
+            request.reply(status_codes::Unauthorized);
+        }
+    }
+
+    void handleAddFavorite(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        int videoId = body.at(U("videoId")).as_integer();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO favorites (user_id, video_id) VALUES (?, ?)"));
+        pstmt->setInt(1, userId);
+        pstmt->setInt(2, videoId);
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleGetFavorites(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, user_id, video_id FROM favorites WHERE user_id = ?"));
+        pstmt->setInt(1, userId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        json::value response = json::value::array();
+        int i = 0;
+        while (res->next()) {
+            response[i]["id"] = res->getInt("id");
+            response[i]["userId"] = res->getInt("user_id");
+            response[i]["videoId"] = res->getInt("video_id");
+            ++i;
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleCreatePlaylist(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        string name = body.at(U("name")).as_string();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO playlists (user_id, name) VALUES (?, ?)"));
+        pstmt->setInt(1, userId);
+        pstmt->setString(2, name);
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleAddVideoToPlaylist(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        int playlistId = body.at(U("playlistId")).as_integer();
+        int videoId = body.at(U("videoId")).as_integer();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO playlist_videos (playlist_id, video_id) VALUES (?, ?)"));
+        pstmt->setInt(1, playlistId);
+        pstmt->setInt(2, videoId);
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleGetPlaylists(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, user_id, name FROM playlists WHERE user_id = ?"));
+        pstmt->setInt(1, userId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        json::value response = json::value::array();
+        int i = 0;
+        while (res->next()) {
+            response[i]["id"] = res->getInt("id");
+            response[i]["userId"] = res->getInt("user_id");
+            response[i]["name"] = json::value::string(res->getString("name"));
+            ++i;
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleGetPlaylistVideos(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int playlistId = stoi(request.relative_uri().path().substr(1));
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT v.id, v.title, v.description, v.url, v.is_platform_owned, v.views, v.likes, v.keywords, v.upload_date FROM videos v JOIN playlist_videos pv ON v.id = pv.video_id WHERE pv.playlist_id = ?"));
+        pstmt->setInt(1, playlistId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        json::value response = json::value::array();
+        int i = 0;
+        while (res->next()) {
+            response[i]["id"] = res->getInt("id");
+            response[i]["title"] = json::value::string(res->getString("title"));
+            response[i]["description"] = json::value::string(res->getString("description"));
+            response[i]["url"] = json::value::string(res->getString("url"));
+            response[i]["isPlatformOwned"] = res->getBoolean("is_platform_owned");
+            response[i]["views"] = res->getInt("views");
+            response[i]["likes"] = res->getInt("likes");
+            response[i]["keywords"] = json::value::string(res->getString("keywords"));
+            response[i]["uploadDate"] = res->getInt64("upload_date");
+            ++i;
+        }
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleAddWatchHistory(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value body = request.extract_json().get();
+        int videoId = body.at(U("videoId")).as_integer();
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("INSERT INTO watch_history (user_id, video_id, watched_at) VALUES (?, ?, ?)"));
+        pstmt->setInt(1, userId);
+        pstmt->setInt(2, videoId);
+        pstmt->setInt64(3, chrono::duration_cast<chrono::seconds>(chrono::system_clock::now().time_since_epoch()).count());
+        pstmt->execute();
+        request.reply(status_codes::OK);
+    }
+
+    void handleGetWatchHistory(http_request request) {
+        string auth = request.headers()["Authorization"];
+        if (auth.empty() || auth.find("Bearer ") != 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        int userId;
+        string username;
+        if (!verifyJwtToken(auth.substr(7), userId, username)) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        unique_ptr<Connection> conn(getConnection());
+        unique_ptr<PreparedStatement> pstmt(conn->prepareStatement("SELECT id, user_id, video_id, watched_at FROM watch_history WHERE user_id = ? ORDER BY watched_at DESC"));
+        pstmt->setInt(1, userId);
+        unique_ptr<ResultSet> res(pstmt->executeQuery());
+
+        json::value response = json::value::array();
+        int i = 0;
+        while (res->next()) {
+            response[i]["id"] = res->getInt("id");
+            response[i]["userId"] = res->getInt("user_id");
+            response[i]["videoId"] = res->getInt("video_id");
+            response[i]["watchedAt"] = res->getInt64("watched_at");
+            ++i;
+        }
+        request.reply(status_codes::OK, response);
+    }
+};
+
+int main() {
+    VideoPlatform platform;
+
+    http_listener searchListener(U("http://localhost:8080/api/video/search"));
+    searchListener.support(methods::GET, [&platform](http_request request) { platform.handleSearch(request); });
+
+    http_listener getVideoListener(U("http://localhost:8080/api/video/"));
+    getVideoListener.support(methods::GET, [&platform](http_request request) { platform.handleGetVideo(request); });
+
+    http_listener uploadVideoListener(U("http://localhost:8080/api/video"));
+    uploadVideoListener.support(methods::POST, [&platform](http_request request) { platform.handleUploadVideo(request); });
+
+    http_listener likeVideoListener(U("http://localhost:8080/api/video/like"));
+    likeVideoListener.support(methods::POST, [&platform](http_request request) { platform.handleLikeVideo(request); });
+
+    http_listener viewVideoListener(U("http://localhost:8080/api/video/view"));
+    viewVideoListener.support(methods::POST, [&platform](http_request request) { platform.handleRecordView(request); });
+
+    http_listener registerListener(U("http://localhost:8080/api/user/register"));
+    registerListener.support(methods::POST, [&platform](http_request request) { platform.handleRegister(request); });
+
+    http_listener loginListener(U("http://localhost:8080/api/user/login"));
+    loginListener.support(methods::POST, [&platform](http_request request) { platform.handleLogin(request); });
+
+    http_listener favoriteListener(U("http://localhost:8080/api/favorite"));
+    favoriteListener.support(methods::POST, [&platform](http_request request) { platform.handleAddFavorite(request); });
+    favoriteListener.support(methods::GET, [&platform](http_request request) { platform.handleGetFavorites(request); });
+
+    http_listener playlistListener(U("http://localhost:8080/api/playlist"));
+    playlistListener.support(methods::POST, [&platform](http_request request) { platform.handleCreatePlaylist(request); });
+    playlistListener.support(methods::GET, [&platform](http_request request) { platform.handleGetPlaylists(request); });
+
+    http_listener playlistVideoListener(U("http://localhost:8080/api/playlist/video"));
+    playlistVideoListener.support(methods::POST, [&platform](http_request request) { platform.handleAddVideoToPlaylist(request); });
+
+    http_listener playlistVideosListener(U("http://localhost:8080/api/playlist/"));
+    playlistVideosListener.support(methods::GET, [&platform](http_request request) { platform.handleGetPlaylistVideos(request); });
+
+    http_listener watchHistoryListener(U("http://localhost:8080/api/watchhistory"));
+    watchHistoryListener.support(methods::POST, [&platform](http_request request) { platform.handleAddWatchHistory(request); });
+    watchHistoryListener.support(methods::GET, [&platform](http_request request) { platform.handleGetWatchHistory(request); });
+
+    searchListener.open().wait();
+    getVideoListener.open().wait();
+    uploadVideoListener.open().wait();
+    likeVideoListener.open().wait();
+    viewVideoListener.open().wait();
+    registerListener.open().wait();
+    loginListener.open().wait();
+    favoriteListener.open().wait();
+    playlistListener.open().wait();
+    playlistVideoListener.open().wait();
+    playlistVideosListener.open().wait();
+    watchHistoryListener.open().wait();
+
+    cout << "Server running at http://localhost:8080" << endl;
+    cin.get();
+
+    searchListener.close().wait();
+    getVideoListener.close().wait();
+    uploadVideoListener.close().wait();
+    likeVideoListener.close().wait();
+    viewVideoListener.close().wait();
+    registerListener.close().wait();
+    loginListener.close().wait();
+    favoriteListener.close().wait();
+    playlistListener.close().wait();
+    playlistVideoListener.close().wait();
+    playlistVideosListener.close().wait();
+    watchHistoryListener.close().wait();
+
+    return 0;
+}

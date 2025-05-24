@@ -1,0 +1,761 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <memory>
+#include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <sqlite3.h>
+#include <jwt-cpp/jwt.h>
+#include <nlohmann/json.hpp>
+#include <bcrypt/BCrypt.hpp>
+#include <crow.h>
+#include <thread>
+#include <mutex>
+
+using json = nlohmann::json;
+
+struct User {
+    int id;
+    std::string username;
+    std::string password_hash;
+    std::string email;
+    std::string phone;
+    std::string role;
+};
+
+struct Driver {
+    int id;
+    std::string name;
+    bool is_affiliated;
+    double latitude;
+    double longitude;
+    bool is_available;
+    double acceptance_rate;
+    double rating;
+};
+
+struct Ride {
+    int id;
+    int rider_id;
+    int driver_id;
+    double start_lat;
+    double start_lon;
+    double end_lat;
+    double end_lon;
+    std::string status;
+    std::time_t request_time;
+    std::time_t accept_time;
+    std::time_t complete_time;
+    double distance;
+    double estimated_fare;
+};
+
+struct Payment {
+    int id;
+    int ride_id;
+    double amount;
+    std::string status;
+    std::time_t payment_time;
+};
+
+struct RideHistory {
+    int id;
+    int rider_id;
+    int driver_id;
+    double distance;
+    double fare;
+    std::time_t ride_date;
+    double rating;
+};
+
+struct MatchingConfig {
+    double max_radius_km;
+    double affiliation_weight;
+    double distance_weight;
+    double acceptance_rate_weight;
+    double min_distance_km;
+    double base_fare;
+    double per_km_fare;
+    double night_surcharge;
+};
+
+class Database {
+    sqlite3* db;
+    std::mutex mtx;
+
+public:
+    Database(const std::string& path) {
+        sqlite3_open(path.c_str(), &db);
+        create_tables();
+    }
+
+    ~Database() {
+        sqlite3_close(db);
+    }
+
+    void create_tables() {
+        const char* sql = R"(
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                role TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS drivers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                is_affiliated INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                is_available INTEGER NOT NULL,
+                acceptance_rate REAL NOT NULL,
+                rating REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS rides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rider_id INTEGER NOT NULL,
+                driver_id INTEGER,
+                start_lat REAL NOT NULL,
+                start_lon REAL NOT NULL,
+                end_lat REAL NOT NULL,
+                end_lon REAL NOT NULL,
+                status TEXT NOT NULL,
+                request_time INTEGER NOT NULL,
+                accept_time INTEGER,
+                complete_time INTEGER,
+                distance REAL NOT NULL,
+                estimated_fare REAL NOT NULL,
+                FOREIGN KEY(rider_id) REFERENCES users(id),
+                FOREIGN KEY(driver_id) REFERENCES drivers(id)
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ride_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                status TEXT NOT NULL,
+                payment_time INTEGER NOT NULL,
+                FOREIGN KEY(ride_id) REFERENCES rides(id)
+            );
+            CREATE TABLE IF NOT EXISTS ride_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rider_id INTEGER NOT NULL,
+                driver_id INTEGER NOT NULL,
+                distance REAL NOT NULL,
+                fare REAL NOT NULL,
+                ride_date INTEGER NOT NULL,
+                rating REAL NOT NULL,
+                FOREIGN KEY(rider_id) REFERENCES users(id),
+                FOREIGN KEY(driver_id) REFERENCES drivers(id)
+            );
+        )";
+        sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+    }
+
+    template<typename T>
+    std::vector<T> query(const std::string& sql, std::function<T(sqlite3_stmt*)> mapper) {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::vector<T> results;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            results.push_back(mapper(stmt));
+        }
+        sqlite3_finalize(stmt);
+        return results;
+    }
+
+    void execute(const std::string& sql) {
+        std::lock_guard<std::mutex> lock(mtx);
+        sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
+    }
+
+    int insert(const std::string& sql) {
+        std::lock_guard<std::mutex> lock(mtx);
+        sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
+        return static_cast<int>(sqlite3_last_insert_rowid(db));
+    }
+
+    void update(const std::string& sql) {
+        execute(sql);
+    }
+};
+
+class ConfigService {
+    MatchingConfig config;
+
+public:
+    ConfigService(const std::string& path) {
+        std::ifstream file(path);
+        json j;
+        file >> j;
+        config.max_radius_km = j["MaxRadiusKm"];
+        config.affiliation_weight = j["AffiliationWeight"];
+        config.distance_weight = j["DistanceWeight"];
+        config.acceptance_rate_weight = j["AcceptanceRateWeight"];
+        config.min_distance_km = j["MinDistanceKm"];
+        config.base_fare = j["BaseFare"];
+        config.per_km_fare = j["PerKmFare"];
+        config.night_surcharge = j["NightSurcharge"];
+    }
+
+    MatchingConfig get_config() const { return config; }
+};
+
+class RideMatchingService {
+    ConfigService& config_service;
+    Database& db;
+
+    double calculate_distance(double lat1, double lon1, double lat2, double lon2) {
+        const double R = 6371;
+        double d_lat = (lat2 - lat1) * M_PI / 180;
+        double d_lon = (lon2 - lon1) * M_PI / 180;
+        double a = std::sin(d_lat / 2) * std::sin(d_lat / 2) +
+                   std::cos(lat1 * M_PI / 180) * std::cos(lat2 * M_PI / 180) *
+                   std::sin(d_lon / 2) * std::sin(d_lon / 2);
+        double c = 2 * std::atan2(std::sqrt(a), std::sqrt(1 - a));
+        return R * c;
+    }
+
+    double calculate_driver_score(const Driver& driver, double distance, const MatchingConfig& config) {
+        double affiliation_score = driver.is_affiliated ? config.affiliation_weight : 0;
+        double distance_score = (config.max_radius_km - distance) / config.max_radius_km * config.distance_weight;
+        double acceptance_score = driver.acceptance_rate * config.acceptance_rate_weight;
+        return affiliation_score + distance_score + acceptance_score;
+    }
+
+public:
+    RideMatchingService(ConfigService& cs, Database& d) : config_service(cs), db(d) {}
+
+    Driver match_driver(const Ride& ride) {
+        auto config = config_service.get_config();
+        auto drivers = db.query<Driver>("SELECT * FROM drivers WHERE is_available = 1",
+            [](sqlite3_stmt* stmt) {
+                Driver d;
+                d.id = sqlite3_column_int(stmt, 0);
+                d.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                d.is_affiliated = sqlite3_column_int(stmt, 2);
+                d.latitude = sqlite3_column_double(stmt, 3);
+                d.longitude = sqlite3_column_double(stmt, 4);
+                d.is_available = sqlite3_column_int(stmt, 5);
+                d.acceptance_rate = sqlite3_column_double(stmt, 6);
+                d.rating = sqlite3_column_double(stmt, 7);
+                return d;
+            });
+
+        std::vector<std::pair<Driver, double>> scored_drivers;
+        for (const auto& driver : drivers) {
+            double distance = calculate_distance(ride.start_lat, ride.start_lon, driver.latitude, driver.longitude);
+            if (distance > config.max_radius_km) continue;
+            if (distance < config.min_distance_km && driver.is_affiliated) continue;
+            double score = calculate_driver_score(driver, distance, config);
+            scored_drivers.emplace_back(driver, score);
+        }
+
+        if (scored_drivers.empty()) return Driver{};
+        return std::max_element(scored_drivers.begin(), scored_drivers.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+    }
+
+    double calculate_distance_wrapper(double lat1, double lon1, double lat2, double lon2) {
+        return calculate_distance(lat1, lon1, lat2, lon2);
+    }
+};
+
+class PaymentService {
+    ConfigService& config_service;
+
+    bool is_night_time(std::time_t time) {
+        std::tm* tm = std::gmtime(&time);
+        return tm->tm_hour >= 0 && tm->tm_hour < 4;
+    }
+
+public:
+    PaymentService(ConfigService& cs) : config_service(cs) {}
+
+    double calculate_fare(const Ride& ride) {
+        auto config = config_service.get_config();
+        double base_fare = config.base_fare;
+        double distance_fare = ride.distance * config.per_km_fare;
+        double night_surcharge = is_night_time(ride.request_time) ? config.night_surcharge : 0;
+        return base_fare + distance_fare + night_surcharge;
+    }
+};
+
+class AuthService {
+    std::string jwt_key;
+    std::string jwt_issuer;
+    std::string jwt_audience;
+
+public:
+    AuthService(const json& config) {
+        jwt_key = config["Jwt"]["Key"];
+        jwt_issuer = config["Jwt"]["Issuer"];
+        jwt_audience = config["Jwt"]["Audience"];
+    }
+
+    std::string generate_jwt_token(const User& user) {
+        auto token = jwt::create()
+            .set_issuer(jwt_issuer)
+            .set_audience(jwt_audience)
+            .set_type("JWT")
+            .set_payload_claim("id", jwt::claim(std::to_string(user.id)))
+            .set_payload_claim("username", jwt::claim(user.username))
+            .set_payload_claim("role", jwt::claim(user.role))
+            .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours{1})
+            .sign(jwt::algorithm::hs256{jwt_key});
+        return token;
+    }
+
+    bool verify_jwt_token(const std::string& token, User& user) {
+        try {
+            auto decoded = jwt::decode(token);
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{jwt_key})
+                .with_issuer(jwt_issuer)
+                .with_audience(jwt_audience);
+            verifier.verify(decoded);
+            user.id = std::stoi(decoded.get_payload_claim("id").as_string());
+            user.username = decoded.get_payload_claim("username").as_string();
+            user.role = decoded.get_payload_claim("role").as_string();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+int main() {
+    crow::SimpleApp app;
+    Database db("taxi.db");
+    ConfigService config_service("config.json");
+    RideMatchingService matching_service(config_service, db);
+    PaymentService payment_service(config_service);
+    
+    json config_json;
+    std::ifstream config_file("config.json");
+    config_file >> config_json;
+    AuthService auth_service(config_json);
+
+    CROW_ROUTE(app, "/api/users/register").methods(crow::HTTPMethod::POST)
+    ([&db](const crow::request& req) {
+        auto body = json::parse(req.body);
+        User user;
+        user.username = body["username"];
+        user.password_hash = BCrypt::generateHash(body["password"]);
+        user.email = body["email"];
+        user.phone = body["phone"];
+        user.role = "Rider";
+
+        std::string sql = "INSERT INTO users (username, password_hash, email, phone, role) VALUES ('" +
+                          user.username + "', '" + user.password_hash + "', '" + user.email + "', '" +
+                          user.phone + "', '" + user.role + "')";
+        int id = db.insert(sql);
+        return crow::response(200, json{{"Message", "User registered"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/users/login").methods(crow::HTTPMethod::POST)
+    ([&db, &auth_service](const crow::request& req) {
+        auto body = json::parse(req.body);
+        std::string username = body["username"];
+        std::string password = body["password"];
+
+        auto users = db.query<User>("SELECT * FROM users WHERE username = '" + username + "'",
+            [](sqlite3_stmt* stmt) {
+                User u;
+                u.id = sqlite3_column_int(stmt, 0);
+                u.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                u.password_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt RiskCpp::bcrypt::BCrypt bcrypt;
+                return u;
+            });
+
+        if (users.empty() || !bcrypt.checkpw(password, users[0].password_hash)) {
+            return crow::response(401, json{{"Message", "Invalid credentials"}}.dump());
+        }
+
+        std::string token = auth_service.generate_jwt_token(users[0]);
+        return crow::response(200, json{{"Token", token}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/drivers/register").methods(crow::HTTPMethod::POST)
+    ([&db](const crow::request& req) {
+        auto body = json::parse(req.body);
+        Driver driver;
+        driver.name = body["name"];
+        driver.is_affiliated = body["isAffiliated"];
+        driver.latitude = body["latitude"];
+        driver.longitude = body["longitude"];
+        driver.is_available = true;
+        driver.acceptance_rate = 0.0;
+        driver.rating = 0.0;
+
+        std::string sql = "INSERT INTO drivers (name, is_affiliated, latitude, longitude, is_available, acceptance_rate, rating) VALUES ('" +
+                          driver.name + "', " + std::to_string(driver.is_affiliated) + ", " +
+                          std::to_string(driver.latitude) + ", " + std::to_string(driver.longitude) + ", 1, 0.0, 0.0)";
+        int id = db.insert(sql);
+        return crow::response(200, json{{"Message", "Driver registered"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/drivers/update-location").methods(crow::HTTPMethod::POST)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user)) {
+            return crow::response(401);
+        }
+
+        auto body = json::parse(req.body);
+        int driver_id = body["driverId"];
+        double latitude = body["latitude"];
+        double longitude = body["longitude"];
+        bool is_available = body["isAvailable"];
+
+        auto drivers = db.query<Driver>("SELECT * FROM drivers WHERE id = " + std::to_string(driver_id),
+            [](sqlite3_stmt* stmt) {
+                Driver d;
+                d.id = sqlite3_column_int(stmt, 0);
+                return d;
+            });
+
+        if (drivers.empty()) {
+            return crow::response(404);
+        }
+
+        std::string sql = "UPDATE drivers SET latitude = " + std::to_string(latitude) +
+                          ", longitude = " + std::to_string(longitude) +
+                          ", is_available = " + std::to_string(is_available) +
+                          " WHERE id = " + std::to_string(driver_id);
+        db.update(sql);
+        return crow::response(200, json{{"Message", "Location updated"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/rides/request").methods(crow::HTTPMethod::POST)
+    ([&db, &matching_service, &payment_service, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user) || user.role != "Rider") {
+            return crow::response(403);
+        }
+
+        auto body = json::parse(req.body);
+        Ride ride;
+        ride.rider_id = user.id;
+        ride.start_lat = body["startLat"];
+        ride.start_lon = body["startLon"];
+        ride.end_lat = body["endLat"];
+        ride.end_lon = body["endLon"];
+        ride.status = "Requested";
+        ride.request_time = std::time(nullptr);
+        ride.distance = matching_service.calculate_distance_wrapper(
+            ride.start_lat, ride.start_lon, ride.end_lat, ride.end_lon);
+        ride.estimated_fare = payment_service.calculate_fare(ride);
+
+        std::string sql = "INSERT INTO rides (rider_id, start_lat, start_lon, end_lat, end_lon, status, request_time, distance, estimated_fare) VALUES (" +
+                          std::to_string(ride.rider_id) + ", " + std::to_string(ride.start_lat) + ", " +
+                          std::to_string(ride.start_lon) + ", " + std::to_string(ride.end_lat) + ", " +
+                          std::to_string(ride.end_lon) + ", '" + ride.status + "', " +
+                          std::to_string(ride.request_time) + ", " + std::to_string(ride.distance) + ", " +
+                          std::to_string(ride.estimated_fare) + ")";
+        int ride_id = db.insert(sql);
+
+        Ride new_ride = ride;
+        new_ride.id = ride_id;
+        auto driver = matching_service.match_driver(new_ride);
+        if (driver.id == 0) {
+            return crow::response(400, json{{"Message", "No drivers available"}}.dump());
+        }
+
+        new_ride.driver_id = driver.id;
+        new_ride.status = "Assigned";
+        new_ride.accept_time = std::time(nullptr);
+
+        sql = "UPDATE rides SET driver_id = " + std::to_string(new_ride.driver_id) +
+              ", status = '" + new_ride.status + "', accept_time = " + std::to_string(new_ride.accept_time) +
+              " WHERE id = " + std::to_string(ride_id);
+        db.update(sql);
+
+        sql = "UPDATE drivers SET is_available = 0 WHERE id = " + std::to_string(driver.id);
+        db.update(sql);
+
+        return crow::response(200, json{{"RideId", ride_id}, {"DriverId", driver.id}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/rides/complete").methods(crow::HTTPMethod::POST)
+    ([&db, &payment_service, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user) || user.role != "Driver") {
+            return crow::response(403);
+        }
+
+        auto body = json::parse(req.body);
+        int ride_id = body["rideId"];
+
+        auto rides = db.query<Ride>("SELECT * FROM rides WHERE id = " + std::to_string(ride_id),
+            [](sqlite3_stmt* stmt) {
+                Ride r;
+                r.id = sqlite3_column_int(stmt, 0);
+                r.rider_id = sqlite3_column_int(stmt, 1);
+                r.driver_id = sqlite3_column_int(stmt, 2);
+                r.start_lat = sqlite3_column_double(stmt, 3);
+                r.start_lon = sqlite3_column_double(stmt, 4);
+                r.end_lat = sqlite3_column_double(stmt, 5);
+                r.end_lon = sqlite3_column_double(stmt, 6);
+                r.status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+                r.request_time = sqlite3_column_int64(stmt, 8);
+                r.accept_time = sqlite3_column_int64(stmt, 9);
+                r.complete_time = sqlite3_column_int64(stmt, 10);
+                r.distance = sqlite3_column_double(stmt, 11);
+                r.estimated_fare = sqlite3_column_double(stmt, 12);
+                return r;
+            });
+
+        if (rides.empty()) {
+            return crow::response(404);
+        }
+
+        auto ride = rides[0];
+        ride.status = "Completed";
+        ride.complete_time = std::time(nullptr);
+
+        std::string sql = "UPDATE rides SET status = '" + ride.status +
+                          "', complete_time = " + std::to_string(ride.complete_time) +
+                          " WHERE id = " + std::to_string(ride_id);
+        db.update(sql);
+
+        sql = "UPDATE drivers SET is_available = 1 WHERE id = " + std::to_string(ride.driver_id);
+        db.update(sql);
+
+        auto drivers = db.query<Driver>("SELECT * FROM drivers WHERE id = " + std::to_string(ride.driver_id),
+            [](sqlite3_stmt* stmt) {
+                Driver d;
+                d.id = sqlite3_column_int(stmt, 0);
+                d.acceptance_rate = sqlite3_column_double(stmt, 6);
+                return d;
+            });
+
+        if (!drivers.empty()) {
+            auto total_rides = db.query<int>("SELECT COUNT(*) FROM rides WHERE driver_id = " + std::to_string(ride.driver_id),
+                [](sqlite3_stmt* stmt) { return sqlite3_column_int(stmt, 0); })[0];
+            auto accepted_rides = db.query<int>("SELECT COUNT(*) FROM rides WHERE driver_id = " + std::to_string(ride.driver_id) +
+                                                " AND status != 'Cancelled'",
+                [](sqlite3_stmt* stmt) { return sqlite3_column_int(stmt, 0); })[0];
+            double new_rate = total_rides > 0 ? static_cast<double>(accepted_rides) / total_rides : 0.0;
+
+            sql = "UPDATE drivers SET acceptance_rate = " + std::to_string(new_rate) +
+                  " WHERE id = " + std::to_string(ride.driver_id);
+            db.update(sql);
+        }
+
+        Payment payment;
+        payment.ride_id = ride_id;
+        payment.amount = payment_service.calculate_fare(ride);
+        payment.status = "Pending";
+        payment.payment_time = std::time(nullptr);
+
+        sql = "INSERT INTO payments (ride_id, amount, status, payment_time) VALUES (" +
+              std::to_string(payment.ride_id) + ", " + std::to_string(payment.amount) + ", '" +
+              payment.status + "', " + std::to_string(payment.payment_time) + ")";
+        int payment_id = db.insert(sql);
+
+        RideHistory history;
+        history.rider_id = ride.rider_id;
+        history.driver_id = ride.driver_id;
+        history.distance = ride.distance;
+        history.fare = payment.amount;
+        history.ride_date = std::time(nullptr);
+        history.rating = 0.0;
+
+        sql = "INSERT INTO ride_history (rider_id, driver_id, distance, fare, ride_date, rating) VALUES (" +
+              std::to_string(history.rider_id) + ", " + std::to_string(history.driver_id) + ", " +
+              std::to_string(history.distance) + ", " + std::to_string(history.fare) + ", " +
+              std::to_string(history.ride_date) + ", " + std::to_string(history.rating) + ")";
+        db.insert(sql);
+
+        return crow::response(200, json{{"Message", "Ride completed"}, {"PaymentId", payment_id}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/rides/cancel").methods(crow::HTTPMethod::POST)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user)) {
+            return crow::response(401);
+        }
+
+        auto body = json::parse(req.body);
+        int ride_id = body["rideId"];
+
+        auto rides = db.query<Ride>("SELECT * FROM rides WHERE id = " + std::to_string(ride_id),
+            [](sqlite3_stmt* stmt) {
+                Ride r;
+                r.id = sqlite3_column_int(stmt, 0);
+                r.driver_id = sqlite3_column_int(stmt, 2);
+                return r;
+            });
+
+        if (rides.empty()) {
+            return crow::response(404);
+        }
+
+        std::string sql = "UPDATE rides SET status = 'Cancelled' WHERE id = " + std::to_string(ride_id);
+        db.update(sql);
+
+        if (rides[0].driver_id != 0) {
+            sql = "UPDATE drivers SET is_available = 1 WHERE id = " + std::to_string(rides[0].driver_id);
+            db.update(sql);
+        }
+
+        return crow::response(200, json{{"Message", "Ride cancelled"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/payments/process").methods(crow::HTTPMethod::POST)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user) || user.role != "Rider") {
+            return crow::response(403);
+        }
+
+        auto body = json::parse(req.body);
+        int payment_id = body["paymentId"];
+
+        auto payments = db.query<Payment>("SELECT * FROM payments WHERE id = " + std::to_string(payment_id),
+            [](sqlite3_stmt* stmt) {
+                Payment p;
+                p.id = sqlite3_column_int(stmt, 0);
+                return p;
+            });
+
+        if (payments.empty()) {
+            return crow::response(404);
+        }
+
+        std::string sql = "UPDATE payments SET status = 'Completed', payment_time = " +
+                          std::to_string(std::time(nullptr)) +
+                          " WHERE id = " + std::to_string(payment_id);
+        db.update(sql);
+
+        return crow::response(200, json{{"Message", "Payment processed"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/history/rider").methods(crow::HTTPMethod::GET)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user)) {
+            return crow::response(401);
+        }
+
+        auto history = db.query<json>("SELECT rh.id, d.name, rh.distance, rh.fare, rh.ride_date, rh.rating "
+                                      "FROM ride_history rh JOIN drivers d ON rh.driver_id = d.id "
+                                      "WHERE rh.rider_id = " + std::to_string(user.id),
+            [](sqlite3_stmt* stmt) {
+                json j;
+                j["Id"] = sqlite3_column_int(stmt, 0);
+                j["Name"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                j["Distance"] = sqlite3_column_double(stmt, 2);
+                j["Fare"] = sqlite3_column_double(stmt, 3);
+                j["RideDate"] = sqlite3_column_int64(stmt, 4);
+                j["Rating"] = sqlite3_column_double(stmt, 5);
+                return j;
+            });
+
+        return crow::response(200, json(history).dump());
+    });
+
+    CROW_ROUTE(app, "/api/history/driver").methods(crow::HTTPMethod::GET)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user) || user.role != "Driver") {
+            return crow::response(403);
+        }
+
+        auto history = db.query<json>("SELECT rh.id, u.username, rh.distance, rh.fare, rh.ride_date, rh.rating "
+                                      "FROM ride_history rh JOIN users u ON rh.rider_id = u.id "
+                                      "WHERE rh.driver_id = " + std::to_string(user.id),
+            [](sqlite3_stmt* stmt) {
+                json j;
+                j["Id"] = sqlite3_column_int(stmt, 0);
+                j["Username"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                j["Distance"] = sqlite3_column_double(stmt, 2);
+                j["Fare"] = sqlite3_column_double(stmt, 3);
+                j["RideDate"] = sqlite3_column_int64(stmt, 4);
+                j["Rating"] = sqlite3_column_double(stmt, 5);
+                return j;
+            });
+
+        return crow::response(200, json(history).dump());
+    });
+
+    CROW_ROUTE(app, "/api/history/rate").methods(crow::HTTPMethod::POST)
+    ([&db, &auth_service](const crow::request& req) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.empty() || auth.substr(0, 7) != "Bearer ") {
+            return crow::response(401);
+        }
+        User user;
+        if (!auth_service.verify_jwt_token(auth.substr(7), user) || user.role != "Rider") {
+            return crow::response(403);
+        }
+
+        auto body = json::parse(req.body);
+        int history_id = body["rideHistoryId"];
+        double rating = body["rating"];
+
+        auto history = db.query<RideHistory>("SELECT * FROM ride_history WHERE id = " + std::to_string(history_id),
+            [](sqlite3_stmt* stmt) {
+                RideHistory rh;
+                rh.id = sqlite3_column_int(stmt, 0);
+                rh.driver_id = sqlite3_column_int(stmt, 2);
+                return rh;
+            });
+
+        if (history.empty()) {
+            return crow::response(404);
+        }
+
+        std::string sql = Pilar"UPDATE ride_history SET rating = " + std::to_string(rating) +
+                          " WHERE id = " + std::to_string(history_id);
+        db.update(sql);
+
+        auto ratings = db.query<double>("SELECT rating FROM ride_history WHERE driver_id = " +
+                                        std::to_string(history[0].driver_id) + " AND rating > 0",
+            [](sqlite3_stmt* stmt) { return sqlite3_column_double(stmt, 0); });
+
+        double avg_rating = ratings.empty() ? 0.0 : std::accumulate(ratings.begin(), ratings.end(), 0.0) / ratings.size();
+
+        sql = "UPDATE drivers SET rating = " + std::to_string(avg_rating) +
+              " WHERE id = " + std::to_string(history[0].driver_id);
+        db.update(sql);
+
+        return crow::response(200, json{{"Message", "Rating submitted"}}.dump());
+    });
+
+    app.port(8080).multithreaded().run();
+    return 0;
+}

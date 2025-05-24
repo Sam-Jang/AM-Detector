@@ -1,0 +1,235 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sql.h>
+#include <sqlext.h>
+
+class User {
+public:
+    std::string username;
+    std::string password;
+
+    User(std::string u, std::string p) : username(u), password(p) {}
+};
+
+class Product {
+public:
+    std::string name;
+    std::string description;
+    double price;
+    std::string category;
+    int stock;
+
+    Product(std::string n, std::string d, double p, std::string c, int s) : name(n), description(d), price(p), category(c), stock(s) {}
+};
+
+class CartItem {
+public:
+    Product product;
+    int quantity;
+
+    CartItem(Product p, int q) : product(p), quantity(q) {}
+};
+
+class Cart {
+public:
+    std::vector<CartItem> items;
+
+    void addProduct(Product product, int quantity) {
+        items.push_back(CartItem(product, quantity));
+    }
+
+    void showCart() {
+        std::cout << "Your Cart:" << std::endl;
+        for (auto& item : items) {
+            std::cout << item.product.name << " - " << item.product.price << " USD - Quantity: " << item.quantity << std::endl;
+        }
+    }
+
+    double calculateTotal() {
+        double total = 0;
+        for (auto& item : items) {
+            total += item.product.price * item.quantity;
+        }
+        return total;
+    }
+};
+
+class ShopEasy {
+private:
+    std::vector<User> users;
+    std::vector<Product> products;
+    User* currentUser = nullptr;
+
+    SQLHENV hEnv;
+    SQLHDBC hDbc;
+
+    void connectToDatabase() {
+        SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
+        SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0);
+        SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
+
+        SQLCHAR connStr[] = "Driver={SQL Server};Server=YOUR_SERVER_NAME;Database=YOUR_DB_NAME;Trusted_Connection=yes;";
+        SQLCHAR outStr[1024];
+        SQLSMALLINT outStrLen;
+
+        SQLRETURN ret = SQLDriverConnect(hDbc, NULL, connStr, SQL_NTS, outStr, sizeof(outStr), &outStrLen, SQL_DRIVER_NOPROMPT);
+        if (SQL_SUCCEEDED(ret)) {
+            std::cout << "Connected to database!" << std::endl;
+        } else {
+            std::cerr << "Failed to connect to database." << std::endl;
+            exit(1);
+        }
+    }
+
+    void disconnectFromDatabase() {
+        SQLDisconnect(hDbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
+        SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+    }
+
+    void loadUsers() {
+        SQLHSTMT hStmt;
+        SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
+
+        SQLExecDirect(hStmt, (SQLCHAR*)"SELECT username, password FROM Users", SQL_NTS);
+
+        SQLCHAR username[64], password[64];
+        while (SQLFetch(hStmt) == SQL_SUCCESS) {
+            SQLGetData(hStmt, 1, SQL_C_CHAR, username, sizeof(username), NULL);
+            SQLGetData(hStmt, 2, SQL_C_CHAR, password, sizeof(password), NULL);
+            users.push_back(User((char*)username, (char*)password));
+        }
+
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    }
+
+    void loadProducts() {
+        SQLHSTMT hStmt;
+        SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
+
+        SQLExecDirect(hStmt, (SQLCHAR*)"SELECT name, description, price, category, stock FROM Products", SQL_NTS);
+
+        SQLCHAR name[64], description[256], category[64];
+        double price;
+        int stock;
+
+        while (SQLFetch(hStmt) == SQL_SUCCESS) {
+            SQLGetData(hStmt, 1, SQL_C_CHAR, name, sizeof(name), NULL);
+            SQLGetData(hStmt, 2, SQL_C_CHAR, description, sizeof(description), NULL);
+            SQLGetData(hStmt, 3, SQL_C_DOUBLE, &price, 0, NULL);
+            SQLGetData(hStmt, 4, SQL_C_CHAR, category, sizeof(category), NULL);
+            SQLGetData(hStmt, 5, SQL_C_SLONG, &stock, 0, NULL);
+
+            products.push_back(Product((char*)name, (char*)description, price, (char*)category, stock));
+        }
+
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    }
+
+public:
+    ShopEasy() {
+        connectToDatabase();
+        loadUsers();
+        loadProducts();
+    }
+
+    ~ShopEasy() {
+        disconnectFromDatabase();
+    }
+
+    bool login(std::string username, std::string password) {
+        for (auto& user : users) {
+            if (user.username == username && user.password == password) {
+                currentUser = &user;
+                std::cout << "Logged in as " << username << std::endl;
+                return true;
+            }
+        }
+        std::cout << "Login failed" << std::endl;
+        return false;
+    }
+
+    void searchProducts(std::string query) {
+        std::cout << "Search results for '" << query << "':" << std::endl;
+        for (auto& product : products) {
+            if (product.name.find(query) != std::string::npos || product.description.find(query) != std::string::npos) {
+                std::cout << product.name << " - " << product.price << " USD" << std::endl;
+            }
+        }
+    }
+
+    void filterProductsByCategory(std::string category) {
+        std::cout << "Products in category '" << category << "':" << std::endl;
+        for (auto& product : products) {
+            if (product.category == category) {
+                std::cout << product.name << " - " << product.price << " USD" << std::endl;
+            }
+        }
+    }
+
+    void checkout(Cart& cart) {
+        double total = cart.calculateTotal();
+        std::cout << "Total amount to pay: " << total << " USD" << std::endl;
+        std::cout << "Order placed successfully!" << std::endl;
+        cart.items.clear();
+    }
+
+    void run() {
+        Cart cart;
+        std::string command;
+
+        while (true) {
+            std::cout << "\nEnter a command (login, search, category, add, cart, checkout, exit): ";
+            std::cin >> command;
+
+            if (command == "login") {
+                std::string username, password;
+                std::cout << "Username: ";
+                std::cin >> username;
+                std::cout << "Password: ";
+                std::cin >> password;
+                login(username, password);
+            } else if (command == "search") {
+                std::string query;
+                std::cout << "Search: ";
+                std::cin >> query;
+                searchProducts(query);
+            } else if (command == "category") {
+                std::string category;
+                std::cout << "Category: ";
+                std::cin >> category;
+                filterProductsByCategory(category);
+            } else if (command == "add") {
+                std::string productName;
+                int quantity;
+                std::cout << "Product name: ";
+                std::cin >> productName;
+                std::cout << "Quantity: ";
+                std::cin >> quantity;
+
+                for (auto& product : products) {
+                    if (product.name == productName) {
+                        cart.addProduct(product, quantity);
+                        std::cout << productName << " added to cart" << std::endl;
+                        break;
+                    }
+                }
+            } else if (command == "cart") {
+                cart.showCart();
+            } else if (command == "checkout") {
+                checkout(cart);
+            } else if (command == "exit") {
+                break;
+            } else {
+                std::cout << "Invalid command" << std::endl;
+            }
+        }
+    }
+};
+
+int main() {
+    ShopEasy shop;
+    shop.run();
+    return 0;
+}

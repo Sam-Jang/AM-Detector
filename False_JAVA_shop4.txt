@@ -1,0 +1,329 @@
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+class Customer {
+    String username;
+    String password;
+    String address;
+
+    Customer(String username, String password, String address) {
+        this.username = username;
+        this.password = password;
+        this.address = address;
+    }
+}
+
+class ProductCategory {
+    String name;
+    String description;
+
+    ProductCategory(String name, String description) {
+        this.name = name;
+        this.description = description;
+    }
+}
+
+class Item {
+    String name;
+    String description;
+    double price;
+    String category;
+    int stock;
+    List<String> likedBy;
+
+    Item(String name, String description, double price, String category, int stock) {
+        this.name = name;
+        this.description = description;
+        this.price = price;
+        this.category = category;
+        this.stock = stock;
+        this.likedBy = new ArrayList<>();
+    }
+}
+
+class Purchase {
+    Customer buyer;
+    Item product;
+    int quantity;
+
+    Purchase(Customer buyer, Item product, int quantity) {
+        this.buyer = buyer;
+        this.product = product;
+        this.quantity = quantity;
+    }
+}
+
+class PromotionBanner {
+    String title;
+    String image;
+    String url;
+
+    PromotionBanner(String title, String image, String url) {
+        this.title = title;
+        this.image = image;
+        this.url = url;
+    }
+}
+
+class OnlineStore {
+    private List<Customer> customers = new ArrayList<>();
+    private List<ProductCategory> categories = new ArrayList<>();
+    private List<Item> items = new ArrayList<>();
+    private List<PromotionBanner> banners = new ArrayList<>();
+    private List<Purchase> cart = new ArrayList<>();
+    private Customer currentCustomer = null;
+    private String connectionString = "jdbc:mysql://localhost:3306/everythingforsale?user=root&password=yourpassword";
+
+    OnlineStore() {
+        loadCustomers();
+        loadCategories();
+        loadItems();
+        loadBanners();
+    }
+
+    private void loadCustomers() {
+        try (Connection conn = DriverManager.getConnection(connectionString)) {
+            String sql = "SELECT username, password, address FROM customers";
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                customers.add(new Customer(rs.getString(1), rs.getString(2), rs.getString(3)));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadCategories() {
+        try (Connection conn = DriverManager.getConnection(connectionString)) {
+            String sql = "SELECT name, description FROM categories";
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                categories.add(new ProductCategory(rs.getString(1), rs.getString(2)));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadItems() {
+        try (Connection conn = DriverManager.getConnection(connectionString)) {
+            String sql = "SELECT name, description, price, category, stock FROM items";
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                items.add(new Item(rs.getString(1), rs.getString(2), rs.getDouble(3), rs.getString(4), rs.getInt(5)));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadBanners() {
+        try (Connection conn = DriverManager.getConnection(connectionString)) {
+            String sql = "SELECT title, image, url FROM banners";
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                banners.add(new PromotionBanner(rs.getString(1), rs.getString(2), rs.getString(3)));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean login(String username, String password) {
+        for (Customer customer : customers) {
+            if (customer.username.equals(username) && customer.password.equals(password)) {
+                currentCustomer = customer;
+                System.out.println("Logged in as " + username);
+                return true;
+            }
+        }
+        System.out.println("Login failed");
+        return false;
+    }
+
+    public void register(String username, String password, String address) {
+        try (Connection conn = DriverManager.getConnection(connectionString)) {
+            String sql = "INSERT INTO customers (username, password, address) VALUES (?, ?, ?)";
+            PreparedStatement stmt = conn.prepareStatement(sql);
+            stmt.setString(1, username);
+            stmt.setString(2, password);
+            stmt.setString(3, address);
+            stmt.executeUpdate();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        customers.add(new Customer(username, password, address));
+        System.out.println("Customer registered successfully!");
+    }
+
+    public void searchItems(String query) {
+        System.out.println("Search results for '" + query + "':");
+        for (Item item : items) {
+            if (item.name.contains(query) || item.description.contains(query)) {
+                System.out.println(item.name + " - " + item.price + " USD");
+            }
+        }
+    }
+
+    public void filterItemsByCategory(String category) {
+        System.out.println("Items in category '" + category + "':");
+        for (Item item : items) {
+            if (item.category.equals(category)) {
+                System.out.println(item.name + " - " + item.price + " USD");
+            }
+        }
+    }
+
+    public void toggleWishlistItem(String productName) {
+        if (currentCustomer == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+        Item item = null;
+        for (Item i : items) {
+            if (i.name.equals(productName)) {
+                item = i;
+                break;
+            }
+        }
+        if (item != null) {
+            if (item.likedBy.contains(currentCustomer.username)) {
+                item.likedBy.remove(currentCustomer.username);
+                System.out.println("Item removed from wishlist.");
+            } else {
+                item.likedBy.add(currentCustomer.username);
+                System.out.println("Item added to wishlist.");
+            }
+        } else {
+            System.out.println("Item not found.");
+        }
+    }
+
+    public void addToCart(String productName, int quantity) {
+        if (currentCustomer == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+        Item item = null;
+        for (Item i : items) {
+            if (i.name.equals(productName)) {
+                item = i;
+                break;
+            }
+        }
+        if (item != null) {
+            cart.add(new Purchase(currentCustomer, item, quantity));
+            System.out.println(productName + " added to cart.");
+        } else {
+            System.out.println("Item not found.");
+        }
+    }
+
+    public void viewCart() {
+        if (currentCustomer == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+        System.out.println("Your Cart:");
+        for (Purchase purchase : cart) {
+            if (purchase.buyer == currentCustomer) {
+                System.out.println(purchase.product.name + " - " + purchase.quantity + " units - " + (purchase.product.price * purchase.quantity) + " USD");
+            }
+        }
+    }
+
+    public void checkout() {
+        if (currentCustomer == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+        double total = 0;
+        for (Purchase purchase : cart) {
+            if (purchase.buyer == currentCustomer) {
+                total += purchase.product.price * purchase.quantity;
+            }
+        }
+        System.out.println("Total amount to pay: " + total + " USD");
+        System.out.println("Order placed successfully!");
+        cart.removeIf(purchase -> purchase.buyer == currentCustomer);
+    }
+
+    public void run() {
+        Scanner scanner = new Scanner(System.in);
+        String command;
+
+        while (true) {
+            System.out.println("\nEnter a command (register, login, search, category, wishlist, add, cart, checkout, exit): ");
+            command = scanner.nextLine();
+
+            switch (command) {
+                case "register":
+                    System.out.println("Username: ");
+                    String username = scanner.nextLine();
+                    System.out.println("Password: ");
+                    String password = scanner.nextLine();
+                    System.out.println("Address: ");
+                    String address = scanner.nextLine();
+                    register(username, password, address);
+                    break;
+                case "login":
+                    System.out.println("Username: ");
+                    username = scanner.nextLine();
+                    System.out.println("Password: ");
+                    password = scanner.nextLine();
+                    login(username, password);
+                    break;
+                case "search":
+                    System.out.println("Query: ");
+                    String query = scanner.nextLine();
+                    searchItems(query);
+                    break;
+                case "category":
+                    System.out.println("Category: ");
+                    String category = scanner.nextLine();
+                    filterItemsByCategory(category);
+                    break;
+                case "wishlist":
+                    System.out.println("Product Name: ");
+                    String productName = scanner.nextLine();
+                    toggleWishlistItem(productName);
+                    break;
+                case "add":
+                    System.out.println("Product Name: ");
+                    productName = scanner.nextLine();
+                    System.out.println("Quantity: ");
+                    int quantity = Integer.parseInt(scanner.nextLine());
+                    addToCart(productName, quantity);
+                    break;
+                case "cart":
+                    viewCart();
+                    break;
+                case "checkout":
+                    checkout();
+                    break;
+                case "exit":
+                    scanner.close();
+                    return;
+                default:
+                    System.out.println("Invalid command.");
+                    break;
+            }
+        }
+    }
+}
+
+public class EverythingForSale {
+    public static void main(String[] args) {
+        OnlineStore store = new OnlineStore();
+        store.run();
+    }
+}

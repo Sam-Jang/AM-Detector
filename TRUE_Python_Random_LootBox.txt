@@ -1,0 +1,343 @@
+import sqlite3
+import json
+import os
+from pathlib import Path
+from typing import List, Dict
+import random
+
+class Item:
+    def __init__(self):
+        self.id: int = 0
+        self.name: str = ""
+        self.rarity: str = ""
+        self.price: float = 0.0
+        self.base_probability: float = 0.0
+        self.popularity: int = 0
+
+class User:
+    def __init__(self):
+        self.id: int = 0
+        self.username: str = ""
+        self.balance: float = 0.0
+        self.total_spent: int = 0
+        self.purchase_count: int = 0
+
+class Cart:
+    def __init__(self):
+        self.user_id: int = 0
+        self.items: List[CartItem] = []
+
+class CartItem:
+    def __init__(self):
+        self.item_id: int = 0
+        self.quantity: int = 0
+
+class Transaction:
+    def __init__(self):
+        self.id: int = 0
+        self.user_id: int = 0
+        self.item_id: int = 0
+        self.amount: float = 0.0
+        self.timestamp: str = ""
+
+class ProbabilityConfig:
+    def __init__(self):
+        self.rarity_weights: Dict[str, float] = {}
+        self.spending_modifiers: Dict[str, float] = {}
+
+class DatabaseManager:
+    def __init__(self):
+        self.db_path = os.path.join(Path.home(), "game.db")
+        self.connection_string = f"sqlite:///{self.db_path}"
+        self.initialize_database()
+
+    def initialize_database(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Items (
+                    Id INTEGER PRIMARY KEY,
+                    Name TEXT,
+                    Rarity TEXT,
+                    Price REAL,
+                    BaseProbability REAL,
+                    Popularity INTEGER
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Users (
+                    Id INTEGER PRIMARY KEY,
+                    Username TEXT,
+                    Balance REAL,
+                    TotalSpent INTEGER,
+                    PurchaseCount INTEGER
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Carts (
+                    UserId INTEGER,
+                    ItemId INTEGER,
+                    Quantity INTEGER
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Transactions (
+                    Id INTEGER PRIMARY KEY,
+                    UserId INTEGER,
+                    ItemId INTEGER,
+                    Amount REAL,
+                    Timestamp TEXT
+                )
+            """)
+            cursor.execute("""
+                INSERT OR IGNORE INTO Items (Id, Name, Rarity, Price, BaseProbability, Popularity)
+                VALUES
+                    (1, 'Common Sword', 'Common', 10.0, 0.5, 100),
+                    (2, 'Rare Armor', 'Rare', 50.0, 0.3, 50),
+                    (3, 'Epic Staff', 'Epic', 100.0, 0.15, 25),
+                    (4, 'Legendary Crown', 'Legendary', 500.0, 0.05, 10)
+            """)
+            cursor.execute("""
+                INSERT OR IGNORE INTO Users (Id, Username, Balance, TotalSpent, PurchaseCount)
+                VALUES
+                    (1, 'player1', 1000.0, 0, 0),
+                    (2, 'player2', 500.0, 100, 2)
+            """)
+            conn.commit()
+
+    def get_items(self) -> List[Item]:
+        items = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM Items")
+            for row in cursor.fetchall():
+                item = Item()
+                item.id, item.name, item.rarity, item.price, item.base_probability, item.popularity = row
+                items.append(item)
+        return items
+
+    def get_user(self, user_id: int) -> User:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM Users WHERE Id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                user = User()
+                user.id, user.username, user.balance, user.total_spent, user.purchase_count = row
+                return user
+        return None
+
+    def update_user(self, user: User):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE Users SET Balance = ?, TotalSpent = ?, PurchaseCount = ? WHERE Id = ?",
+                (user.balance, user.total_spent, user.purchase_count, user.id)
+            )
+            conn.commit()
+
+    def get_cart(self, user_id: int) -> Cart:
+        cart = Cart()
+        cart.user_id = user_id
+        cart.items = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM Carts WHERE UserId = ?", (user_id,))
+            for row in cursor.fetchall():
+                cart_item = CartItem()
+                cart_item.item_id, cart_item.quantity = row[1], row[2]
+                cart.items.append(cart_item)
+        return cart
+
+    def add_to_cart(self, user_id: int, item_id: int, quantity: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO Carts (UserId, ItemId, Quantity) VALUES (?, ?, ?)",
+                (user_id, item_id, quantity)
+            )
+            conn.commit()
+
+    def clear_cart(self, user_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM Carts WHERE UserId = ?", (user_id,))
+            conn.commit()
+
+    def log_transaction(self, user_id: int, item_id: int, amount: float):
+        from datetime import datetime
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO Transactions (UserId, ItemId, Amount, Timestamp) VALUES (?, ?, ?, ?)",
+                (user_id, item_id, amount, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+
+class ConfigManager:
+    def load_probability_config(self) -> ProbabilityConfig:
+        with open('probability_config.json', 'r') as f:
+            data = json.load(f)
+        config = ProbabilityConfig()
+        config.rarity_weights = data['RarityWeights']
+        config.spending_modifiers = data['SpendingModifiers']
+        return config
+
+class LootBoxManager:
+    def __init__(self, db_manager: DatabaseManager, config_manager: ConfigManager):
+        self.db_manager = db_manager
+        self.config_manager = config_manager
+        self.random = random.Random()
+
+    def draw_item(self, user_id: int) -> Item:
+        user = self.db_manager.get_user(user_id)
+        items = self.db_manager.get_items()
+        config = self.config_manager.load_probability_config()
+
+        total_weight = 0.0
+        weights = []
+
+        for item in items:
+            weight = item.base_probability
+            weight *= config.rarity_weights[item.rarity]
+
+            if user.total_spent > 1000:
+                weight *= config.spending_modifiers["HighSpender"]
+            elif user.total_spent < 100:
+                weight *= config.spending_modifiers["LowSpender"]
+
+            weights.append((item, weight))
+            total_weight += weight
+
+        roll = self.random.random() * total_weight
+        current = 0.0
+
+        for item, weight in weights:
+            current += weight
+            if roll <= current:
+                return item
+
+        return items[-1]
+
+class ItemService:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+
+    def search_items(self, keyword: str, sort_by: str) -> List[Item]:
+        items = self.db_manager.get_items()
+
+        if keyword:
+            items = [item for item in items if keyword.lower() in item.name.lower()]
+
+        if sort_by.lower() == "price":
+            items.sort(key=lambda x: x.price)
+        elif sort_by.lower() == "rarity":
+            items.sort(key=lambda x: self.get_rarity_value(x.rarity))
+        elif sort_by.lower() == "popularity":
+            items.sort(key=lambda x: x.popularity, reverse=True)
+
+        return items
+
+    def get_rarity_value(self, rarity: str) -> int:
+        return {
+            "Common": 1,
+            "Rare": 2,
+            "Epic": 3,
+            "Legendary": 4
+        }.get(rarity, 0)
+
+class CartService:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+
+    def get_cart(self, user_id: int) -> Cart:
+        return self.db_manager.get_cart(user_id)
+
+    def add_to_cart(self, user_id: int, item_id: int, quantity: int):
+        self.db_manager.add_to_cart(user_id, item_id, quantity)
+
+    def checkout(self, user_id: int) -> str:
+        cart = self.db_manager.get_cart(user_id)
+        user = self.db_manager.get_user(user_id)
+        items = self.db_manager.get_items()
+
+        total_cost = 0
+        for cart_item in cart.items:
+            item = next((i for i in items if i.id == cart_item.item_id), None)
+            total_cost += item.price * cart_item.quantity
+
+        if user.balance >= total_cost:
+            user.balance -= total_cost
+            user.total_spent += int(total_cost)
+            user.purchase_count += 1
+            self.db_manager.update_user(user)
+
+            for cart_item in cart.items:
+                item = next((i for i in items if i.id == cart_item.item_id), None)
+                self.db_manager.log_transaction(user_id, cart_item.item_id, item.price * cart_item.quantity)
+
+            self.db_manager.clear_cart(user_id)
+            return "Checkout successful"
+        return "Insufficient balance"
+
+class TransactionService:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+
+    def get_user_transactions(self, user_id: int) -> List[Transaction]:
+        transactions = []
+        with sqlite3.connect(self.db_manager.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM Transactions WHERE UserId = ?", (user_id,))
+            for row in cursor.fetchall():
+                transaction = Transaction()
+                transaction.id, transaction.user_id, transaction.item_id, transaction.amount, transaction.timestamp = row
+                transactions.append(transaction)
+        return transactions
+
+class GameBackend:
+    def __init__(self):
+        self.db_manager = DatabaseManager()
+        self.config_manager = ConfigManager()
+        self.loot_box_manager = LootBoxManager(self.db_manager, self.config_manager)
+        self.item_service = ItemService(self.db_manager)
+        self.cart_service = CartService(self.db_manager)
+        self.transaction_service = TransactionService(self.db_manager)
+
+    def draw_item(self, user_id: int) -> Item:
+        return self.loot_box_manager.draw_item(user_id)
+
+    def search_items(self, keyword: str, sort_by: str) -> List[Item]:
+        return self.item_service.search_items(keyword, sort_by)
+
+    def get_cart(self, user_id: int) -> Cart:
+        return self.cart_service.get_cart(user_id)
+
+    def add_to_cart(self, user_id: int, item_id: int, quantity: int):
+        self.cart_service.add_to_cart(user_id, item_id, quantity)
+
+    def checkout(self, user_id: int) -> str:
+        return self.cart_service.checkout(user_id)
+
+    def get_transactions(self, user_id: int) -> List[Transaction]:
+        return self.transaction_service.get_user_transactions(user_id)
+
+class DrawRequest:
+    def __init__(self):
+        self.user_id: int = 0
+
+class AddToCartRequest:
+    def __init__(self):
+        self.user_id: int = 0
+        self.item_id: int = 0
+        self.quantity: int = 0
+
+class CheckoutRequest:
+    def __init__(self):
+        self.user_id: int = 0
+
+class DrawResponse:
+    def __init__(self):
+        self.item_id: int = 0
+        self.item_name: str = ""
+        self.rarity: str = ""

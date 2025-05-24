@@ -1,0 +1,312 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime, timedelta
+import json
+import os
+from uuid import uuid4
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///ecommerce.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+class Constants:
+    def __init__(self):
+        self.PriceWeight = 0.0
+        self.DeliverySpeedWeight = 0.0
+        self.SellerRatingWeight = 0.0
+        self.PrimeBiasFactor = 0.0
+        self.FeaturedOfferPriceDiff = 0.0
+        self.SecondOfferMinPriceDiff = 0.0
+        self.MinSellerSales = 0
+        self.FraudRiskThreshold = 0.0
+
+class Product(db.Model):
+    __tablename__ = 'Products'
+    ProductId = db.Column(db.Integer, primary_key=True)
+    ASIN = db.Column(db.String)
+    Name = db.Column(db.String)
+    Description = db.Column(db.String)
+    Category = db.Column(db.String)
+    BasePrice = db.Column(db.Float)
+    StockQuantity = db.Column(db.Integer)
+    offers = db.relationship('Offer', backref='product')
+
+class Seller(db.Model):
+    __tablename__ = 'Sellers'
+    SellerId = db.Column(db.Integer, primary_key=True)
+    SellerName = db.Column(db.String)
+    IsPlatformRetail = db.Column(db.Boolean)
+    Rating = db.Column(db.Float)
+    TotalSales = db.Column(db.Integer)
+    IsActive = db.Column(db.Boolean)
+    AccountCreated = db.Column(db.DateTime)
+    offers = db.relationship('Offer', backref='seller')
+
+class Offer(db.Model):
+    __tablename__ = 'Offers'
+    OfferId = db.Column(db.Integer, primary_key=True)
+    ProductId = db.Column(db.Integer, db.ForeignKey('Products.ProductId'))
+    SellerId = db.Column(db.Integer, db.ForeignKey('Sellers.SellerId'))
+    Price = db.Column(db.Float)
+    ShippingCost = db.Column(db.Float)
+    DeliveryDays = db.Column(db.Integer)
+    IsPrimeEligible = db.Column(db.Boolean)
+    StockQuantity = db.Column(db.Integer)
+
+class CartItem(db.Model):
+    __tablename__ = 'CartItems'
+    CartItemId = db.Column(db.Integer, primary_key=True)
+    UserId = db.Column(db.Integer)
+    OfferId = db.Column(db.Integer, db.ForeignKey('Offers.OfferId'))
+    Quantity = db.Column(db.Integer)
+    offer = db.relationship('Offer')
+
+class Order(db.Model):
+    __tablename__ = 'Orders'
+    OrderId = db.Column(db.Integer, primary_key=True)
+    UserId = db.Column(db.Integer)
+    OrderDate = db.Column(db.DateTime)
+    Status = db.Column(db.String)
+    order_items = db.relationship('OrderItem', backref='order')
+
+class OrderItem(db.Model):
+    __tablename__ = 'OrderItems'
+    OrderItemId = db.Column(db.Integer, primary_key=True)
+    OrderId = db.Column(db.Integer, db.ForeignKey('Orders.OrderId'))
+    OfferId = db.Column(db.Integer, db.ForeignKey('Offers.OfferId'))
+    Quantity = db.Column(db.Integer)
+    Price = db.Column(db.Float)
+    ExpectedDeliveryDate = db.Column(db.DateTime)
+    DeliveryDate = db.Column(db.DateTime, nullable=True)
+    Status = db.Column(db.String)
+
+class ECommerceService:
+    def __init__(self):
+        self.constants = self.load_constants()
+
+    def load_constants(self):
+        with open('constants.json', 'r') as f:
+            data = json.load(f)
+        constants = Constants()
+        for key, value in data.items():
+            setattr(constants, key, value)
+        return constants
+
+    def search_products(self, keyword=None, sort_by='relevance', page=1, page_size=20):
+        query = Offer.query.join(Product).join(Seller).filter(Offer.StockQuantity > 0, Seller.IsActive == True)
+        if keyword:
+            query = query.filter(db.or_(Product.Name.contains(keyword), Product.Description.contains(keyword)))
+        
+        if sort_by.lower() == 'priceasc':
+            query = query.order_by((Offer.Price + Offer.ShippingCost).asc())
+        elif sort_by.lower() == 'pricedesc':
+            query = query.order_by((Offer.Price + Offer.ShippingCost).desc())
+        elif sort_by.lower() == 'discount':
+            query = query.order_by(((Product.BasePrice - Offer.Price) / Product.BasePrice).desc())
+        elif sort_by.lower() == 'rating':
+            query = query.order_by(Seller.Rating.desc())
+        else:
+            query = query.order_by(Product.Name.asc())
+
+        offers = query.offset((page - 1) * page_size).limit(page_size).all()
+        return [offer.__dict__ for offer in offers]
+
+    def get_product_offers(self, asin):
+        offers = Offer.query.join(Product).join(Seller).filter(
+            Product.ASIN == asin, Offer.StockQuantity > 0, Seller.IsActive == True).all()
+        if not offers:
+            return None
+        return self.select_featured_and_second_offer(offers)
+
+    def select_featured_and_second_offer(self, offers):
+        eligible_offers = self.filter_eligible_offers(offers)
+        if not eligible_offers:
+            return {'FeaturedOffer': None, 'SecondOffer': None}
+
+        scored_offers = [{'Offer': o, 'Score': self.calculate_offer_score(o)} for o in eligible_offers]
+        featured = max(scored_offers, key=lambda x: x['Score'])['Offer']
+        second_offer = self.select_second_offer(scored_offers, featured)
+
+        return {'FeaturedOffer': featured.__dict__, 'SecondOffer': second_offer.__dict__ if second_offer else None}
+
+    def filter_eligible_offers(self, offers):
+        return [o for o in offers if self.is_genuine_seller(o.seller) and 
+                not self.is_atypical_price(o) and not self.is_disqualified_competitor(o)]
+
+    def is_genuine_seller(self, seller):
+        days_active = (datetime.utcnow() - seller.AccountCreated).total_seconds() / (24 * 3600)
+        return (seller.IsActive and days_active >= 90 and 
+                seller.TotalSales >= self.constants.MinSellerSales and 
+                seller.Rating >= self.constants.FraudRiskThreshold)
+
+    def is_atypical_price(self, offer):
+        avg_price = db.session.query(db.func.avg(Offer.Price)).filter(
+            Offer.ProductId == offer.ProductId).scalar() or offer.Price
+        return abs(offer.Price - avg_price) / avg_price > 0.3
+
+    def is_disqualified_competitor(self, offer):
+        return offer.seller.Rating < 3.0 or offer.StockQuantity < 5
+
+    def calculate_offer_score(self, offer):
+        landed_price = offer.Price + offer.ShippingCost
+        delivery_score = 1.0 / (offer.DeliveryDays + 1)
+        rating_score = offer.seller.Rating / 5.0
+        score = (self.constants.PriceWeight * (1.0 / landed_price) +
+                 self.constants.DeliverySpeedWeight * delivery_score +
+                 self.constants.SellerRatingWeight * rating_score)
+        if offer.seller.IsPlatformRetail:
+            score *= (1.0 + self.constants.PrimeBiasFactor)
+        return score
+
+    def select_second_offer(self, scored_offers, featured):
+        candidates = [x for x in scored_offers if x['Offer'].SellerId != featured.SellerId and 
+                     self.is_sufficiently_differentiated(x['Offer'], featured)]
+        return max(candidates, key=lambda x: x['Score'])['Offer'] if candidates else None
+
+    def is_sufficiently_differentiated(self, candidate, featured):
+        candidate_landed = candidate.Price + candidate.ShippingCost
+        featured_landed = featured.Price + featured.ShippingCost
+        price_diff = abs(candidate_landed - featured_landed)
+        delivery_diff = abs(candidate.DeliveryDays - featured.DeliveryDays)
+        min_price_diff = self.constants.SecondOfferMinPriceDiff + (
+            self.constants.FeaturedOfferPriceDiff * delivery_diff)
+        return price_diff >= min_price_diff or candidate_landed <= featured_landed * 0.9
+
+    def check_prime_eligibility(self, seller_id):
+        seller = Seller.query.get(seller_id)
+        if not seller or not seller.IsActive:
+            return False
+        return self.evaluate_prime_eligibility(seller)
+
+    def evaluate_prime_eligibility(self, seller):
+        recent_orders = db.session.query(OrderItem).join(Offer).filter(
+            Offer.SellerId == seller.SellerId,
+            OrderItem.ExpectedDeliveryDate >= datetime.utcnow() - timedelta(days=30)).all()
+        
+        on_time_delivery_rate = (len([o for o in recent_orders if o.DeliveryDate and 
+                                     o.DeliveryDate <= o.ExpectedDeliveryDate]) / len(recent_orders) 
+                                if recent_orders else 0.0)
+        cancellation_rate = (len([o for o in recent_orders if o.Status == 'Cancelled']) / 
+                           len(recent_orders) if recent_orders else 0.0)
+        
+        return (on_time_delivery_rate >= 0.95 and cancellation_rate <= 0.02 and 
+                seller.Rating >= 4.0 and not self.is_fraud_risk(seller))
+
+    def is_fraud_risk(self, seller):
+        return (seller.Rating < self.constants.FraudRiskThreshold or 
+                seller.TotalSales < self.constants.MinSellerSales / 2)
+
+    def add_to_cart(self, user_id, offer_id, quantity):
+        offer = Offer.query.get(offer_id)
+        if not offer or offer.StockQuantity < quantity:
+            return None
+        cart_item = CartItem.query.filter_by(UserId=user_id, OfferId=offer_id).first()
+        if cart_item:
+            cart_item.Quantity += quantity
+        else:
+            cart_item = CartItem(UserId=user_id, OfferId=offer_id, Quantity=quantity)
+            db.session.add(cart_item)
+        db.session.commit()
+        return cart_item.__dict__
+
+    def get_cart(self, user_id):
+        items = CartItem.query.join(Offer).join(Product).join(Seller).filter(
+            CartItem.UserId == user_id).all()
+        return [item.__dict__ for item in items]
+
+    def update_cart_item(self, cart_item_id, quantity):
+        cart_item = CartItem.query.get(cart_item_id)
+        if not cart_item:
+            return None
+        offer = Offer.query.get(cart_item.OfferId)
+        if offer.StockQuantity < quantity:
+            return None
+        cart_item.Quantity = quantity
+        db.session.commit()
+        return cart_item.__dict__
+
+    def remove_from_cart(self, cart_item_id):
+        cart_item = CartItem.query.get(cart_item_id)
+        if not cart_item:
+            return False
+        db.session.delete(cart_item)
+        db.session.commit()
+        return True
+
+    def checkout(self, user_id):
+        cart_items = CartItem.query.join(Offer).filter(CartItem.UserId == user_id).all()
+        if not cart_items:
+            return None
+        order = Order(
+            UserId=user_id,
+            OrderDate=datetime.utcnow(),
+            Status='Pending',
+            order_items=[
+                OrderItem(
+                    OfferId=c.OfferId,
+                    Quantity=c.Quantity,
+                    Price=c.offer.Price,
+                    ExpectedDeliveryDate=datetime.utcnow() + timedelta(days=c.offer.DeliveryDays)
+                ) for c in cart_items
+            ]
+        )
+        for item in cart_items:
+            offer = Offer.query.get(item.OfferId)
+            offer.StockQuantity -= item.Quantity
+        db.session.add(order)
+        db.session.delete(cart_items)
+        db.session.commit()
+        return order.__dict__
+
+service = ECommerceService()
+
+@app.route('/api/products/search', methods=['GET'])
+def search_products():
+    keyword = request.args.get('keyword')
+    sort_by = request.args.get('sortBy', 'relevance')
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('pageSize', 20))
+    offers = service.search_products(keyword, sort_by, page, page_size)
+    return jsonify(offers)
+
+@app.route('/api/products/<asin>/offers', methods=['GET'])
+def get_product_offers(asin):
+    result = service.get_product_offers(asin)
+    return jsonify(result) if result else ('', 404)
+
+@app.route('/api/sellers/<int:seller_id>/prime-eligibility', methods=['GET'])
+def check_prime_eligibility(seller_id):
+    return jsonify(service.check_prime_eligibility(seller_id))
+
+@app.route('/api/cart/add', methods=['POST'])
+def add_to_cart():
+    data = request.get_json()
+    result = service.add_to_cart(data['userId'], data['offerId'], data['quantity'])
+    return jsonify(result) if result else ('', 400)
+
+@app.route('/api/cart/<int:user_id>', methods=['GET'])
+def get_cart(user_id):
+    return jsonify(service.get_cart(user_id))
+
+@app.route('/api/cart/update', methods=['PUT'])
+def update_cart_item():
+    data = request.get_json()
+    result = service.update_cart_item(data['cartItemId'], data['quantity'])
+    return jsonify(result) if result else ('', 404)
+
+@app.route('/api/cart/remove/<int:cart_item_id>', methods=['DELETE'])
+def remove_from_cart(cart_item_id):
+    success = service.remove_from_cart(cart_item_id)
+    return ('', 204) if success else ('', 404)
+
+@app.route('/api/orders/checkout', methods=['POST'])
+def checkout():
+    data = request.get_json()
+    result = service.checkout(data['userId'])
+    return jsonify(result) if result else ('', 400)
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)

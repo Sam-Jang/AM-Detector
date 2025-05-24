@@ -1,0 +1,119 @@
+#include <iostream>
+#include <cmath>
+#include <map>
+#include <stdexcept>
+#include <boost/math/distributions/normal.hpp>
+
+class GBS_InputError : public std::runtime_error {
+public:
+    explicit GBS_InputError(const std::string& message) : std::runtime_error(message) {}
+};
+
+class _GBS_Limits {
+public:
+    static constexpr double MIN_X = 0.01;
+    static constexpr double MAX_X = 10000;
+    static constexpr double MIN_FS = 0.01;
+    static constexpr double MAX_FS = 10000;
+    static constexpr double MIN_T = 0.01;
+    static constexpr double MAX_T = 10;
+    static constexpr double MIN_b = -1;
+    static constexpr double MAX_b = 1;
+    static constexpr double MIN_r = 0;
+    static constexpr double MAX_r = 1;
+    static constexpr double MIN_V = 0.01;
+    static constexpr double MAX_V = 1;
+};
+
+void _test_option_type(const std::string& option_type) {
+    if (option_type != "c" && option_type != "p") {
+        throw GBS_InputError("Invalid Input option_type (" + option_type + "). Acceptable value are: c, p");
+    }
+}
+
+void _gbs_test_inputs(const std::string& option_type, double fs, double x, double t, double r, double b, double v) {
+    _test_option_type(option_type);
+
+    if (x < _GBS_Limits::MIN_X || x > _GBS_Limits::MAX_X) {
+        throw GBS_InputError("Invalid Input Strike Price (X). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_X) + " to " + std::to_string(_GBS_Limits::MAX_X));
+    }
+
+    if (fs < _GBS_Limits::MIN_FS || fs > _GBS_Limits::MAX_FS) {
+        throw GBS_InputError("Invalid Input Forward/Spot Price (FS). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_FS) + " to " + std::to_string(_GBS_Limits::MAX_FS));
+    }
+
+    if (t < _GBS_Limits::MIN_T || t > _GBS_Limits::MAX_T) {
+        throw GBS_InputError("Invalid Input Time (T). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_T) + " to " + std::to_string(_GBS_Limits::MAX_T));
+    }
+
+    if (b < _GBS_Limits::MIN_b || b > _GBS_Limits::MAX_b) {
+        throw GBS_InputError("Invalid Input Cost of Carry (b). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_b) + " to " + std::to_string(_GBS_Limits::MAX_b));
+    }
+
+    if (r < _GBS_Limits::MIN_r || r > _GBS_Limits::MAX_r) {
+        throw GBS_InputError("Invalid Input Risk Free Rate (r). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_r) + " to " + std::to_string(_GBS_Limits::MAX_r));
+    }
+
+    if (v < _GBS_Limits::MIN_V || v > _GBS_Limits::MAX_V) {
+        throw GBS_InputError("Invalid Input Implied Volatility (V). Acceptable range for inputs is " +
+                             std::to_string(_GBS_Limits::MIN_V) + " to " + std::to_string(_GBS_Limits::MAX_V));
+    }
+}
+
+std::map<std::string, double> _gbs(const std::string& option_type, double fs, double x, double t, double r, double b, double v) {
+    _gbs_test_inputs(option_type, fs, x, t, r, b, v);
+
+    double t_sqrt = std::sqrt(t);
+    double d1 = (std::log(fs / x) + (b + (v * v) / 2) * t) / (v * t_sqrt);
+    double d2 = d1 - v * t_sqrt;
+
+    boost::math::normal_distribution<> norm(0, 1);
+    double value, delta, gamma, theta, vega, rho;
+
+    if (option_type == "c") {
+        value = fs * std::exp((b - r) * t) * boost::math::cdf(norm, d1) - x * std::exp(-r * t) * boost::math::cdf(norm, d2);
+        delta = std::exp((b - r) * t) * boost::math::cdf(norm, d1);
+        gamma = std::exp((b - r) * t) * boost::math::pdf(norm, d1) / (fs * v * t_sqrt);
+        theta = -(fs * v * std::exp((b - r) * t) * boost::math::pdf(norm, d1)) / (2 * t_sqrt) - (b - r) * fs * std::exp((b - r) * t) * boost::math::cdf(norm, d1) - r * x * std::exp(-r * t) * boost::math::cdf(norm, d2);
+        vega = std::exp((b - r) * t) * fs * t_sqrt * boost::math::pdf(norm, d1);
+        rho = x * t * std::exp(-r * t) * boost::math::cdf(norm, d2);
+    } else {
+        value = x * std::exp(-r * t) * boost::math::cdf(norm, -d2) - (fs * std::exp((b - r) * t) * boost::math::cdf(norm, -d1));
+        delta = -std::exp((b - r) * t) * boost::math::cdf(norm, -d1);
+        gamma = std::exp((b - r) * t) * boost::math::pdf(norm, d1) / (fs * v * t_sqrt);
+        theta = -(fs * v * std::exp((b - r) * t) * boost::math::pdf(norm, d1)) / (2 * t_sqrt) + (b - r) * fs * std::exp((b - r) * t) * boost::math::cdf(norm, -d1) + r * x * std::exp(-r * t) * boost::math::cdf(norm, -d2);
+        vega = std::exp((b - r) * t) * fs * t_sqrt * boost::math::pdf(norm, d1);
+        rho = -x * t * std::exp(-r * t) * boost::math::cdf(norm, -d2);
+    }
+
+    std::map<std::string, double> results;
+    results["value"] = value;
+    results["delta"] = delta;
+    results["gamma"] = gamma;
+    results["theta"] = theta;
+    results["vega"] = vega;
+    results["rho"] = rho;
+
+    return results;
+}
+
+int main() {
+    try {
+        std::map<std::string, double> result = _gbs("c", 100, 100, 1, 0.05, 0.02, 0.2);
+        std::cout << "Option Value: " << result["value"] << std::endl;
+        std::cout << "Delta: " << result["delta"] << std::endl;
+        std::cout << "Gamma: " << result["gamma"] << std::endl;
+        std::cout << "Theta: " << result["theta"] << std::endl;
+        std::cout << "Vega: " << result["vega"] << std::endl;
+        std::cout << "Rho: " << result["rho"] << std::endl;
+    } catch (const GBS_InputError& e) {
+        std::cerr << e.what() << std::endl;
+    }
+
+    return 0;
+}

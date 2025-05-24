@@ -1,0 +1,107 @@
+import curses
+import time
+
+grid = [[0 for _ in range(10)] for _ in range(20)]
+tetromino = []
+tetromino_row = 0
+tetromino_col = 4
+
+def spawn_tetromino():
+    global tetromino, tetromino_row, tetromino_col
+    tetromino = [[1, 1, 1, 1]]
+    tetromino_row = 0
+    tetromino_col = 3
+
+def move_tetromino(dx, dy):
+    global tetromino_row, tetromino_col
+    new_row = tetromino_row + dy
+    new_col = tetromino_col + dx
+    if is_valid_move(new_row, new_col):
+        tetromino_row = new_row
+        tetromino_col = new_col
+    elif dy == 1:
+        merge_tetromino()
+        clear_full_rows()
+        spawn_tetromino()
+
+def is_valid_move(row, col):
+    for r in range(len(tetromino)):
+        for c in range(len(tetromino[0])):
+            if tetromino[r][c] == 1:
+                new_row = row + r
+                new_col = col + c
+                if (new_row < 0 or new_row >= len(grid) or
+                    new_col < 0 or new_col >= len(grid[0]) or
+                    grid[new_row][new_col] == 1):
+                    return False
+    return True
+
+def merge_tetromino():
+    for r in range(len(tetromino)):
+        for c in range(len(tetromino[0])):
+            if tetromino[r][c] == 1:
+                grid[tetromino_row + r][tetromino_col + c] = 1
+
+def clear_full_rows():
+    global grid
+    new_grid = [row for row in grid if 0 in row]
+    while len(new_grid) < len(grid):
+        new_grid.insert(0, [0 for _ in range(10)])
+    grid = new_grid
+
+def rotate_tetromino():
+    global tetromino
+    rotated = [[0 for _ in range(len(tetromino))] for _ in range(len(tetromino[0]))]
+    for r in range(len(tetromino)):
+        for c in range(len(tetromino[0])):
+            rotated[c][len(tetromino) - 1 - r] = tetromino[r][c]
+    
+    if is_valid_move(tetromino_row, tetromino_col):
+        tetromino = rotated
+
+def draw_grid(stdscr):
+    stdscr.clear()
+    for r in range(len(grid)):
+        for c in range(len(grid[0])):
+            if grid[r][c] == 1:
+                stdscr.addch(r, c, '#')
+            else:
+                is_tetromino_part = False
+                for tr in range(len(tetromino)):
+                    for tc in range(len(tetromino[0])):
+                        if (tetromino[tr][tc] == 1 and
+                            tetromino_row + tr == r and
+                            tetromino_col + tc == c):
+                            stdscr.addch(r, c, '#')
+                            is_tetromino_part = True
+                            break
+                    if is_tetromino_part:
+                        break
+                if not is_tetromino_part:
+                    stdscr.addch(r, c, '.')
+
+def main(stdscr):
+    curses.curs_set(0) 
+    stdscr.nodelay(1) 
+    stdscr.timeout(500) 
+
+    spawn_tetromino()
+
+    while True:
+        key = stdscr.getch()
+        
+        if key == curses.KEY_LEFT:
+            move_tetromino(-1, 0)
+        elif key == curses.KEY_RIGHT:
+            move_tetromino(1, 0)
+        elif key == curses.KEY_DOWN:
+            move_tetromino(0, 1)
+        elif key == ord(' '):
+            rotate_tetromino()
+
+        move_tetromino(0, 1)
+        draw_grid(stdscr)
+        stdscr.refresh()
+
+if __name__ == "__main__":
+    curses.wrapper(main)

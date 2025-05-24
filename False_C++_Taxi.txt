@@ -1,0 +1,80 @@
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+class Taxi {
+public:
+    std::string taxiId;
+    std::pair<double, double> location;
+    bool available;
+
+    Taxi(const std::string& id, double x, double y) : taxiId(id), location(x, y), available(true) {}
+
+    double distanceToRequest(const std::pair<double, double>& requestLocation) const {
+        return std::sqrt(std::pow(location.first - requestLocation.first, 2) +
+                         std::pow(location.second - requestLocation.second, 2));
+    }
+};
+
+class Request {
+public:
+    std::string requestId;
+    std::pair<double, double> location;
+
+    Request(const std::string& id, double x, double y) : requestId(id), location(x, y) {}
+};
+
+class TaxiDispatchSystem {
+    std::vector<Taxi> taxis;
+    std::vector<Request> requests;
+
+public:
+    void addTaxi(const Taxi& taxi) {
+        taxis.push_back(taxi);
+    }
+
+    void addRequest(const Request& request) {
+        requests.push_back(request);
+        dispatchRequest(request);
+    }
+
+private:
+    void dispatchRequest(const Request& request) {
+        if (taxis.empty()) {
+            std::cout << "No taxis available for request " << request.requestId << std::endl;
+            return;
+        }
+
+        auto availableTaxis = std::vector<Taxi>();
+        for (const auto& taxi : taxis) {
+            if (taxi.available) {
+                availableTaxis.push_back(taxi);
+            }
+        }
+
+        if (availableTaxis.empty()) {
+            std::cout << "No available taxis for request " << request.requestId << std::endl;
+            return;
+        }
+
+        auto closestTaxi = std::min_element(availableTaxis.begin(), availableTaxis.end(),
+            [&request](const Taxi& a, const Taxi& b) {
+                return a.distanceToRequest(request.location) < b.distanceToRequest(request.location);
+            });
+
+        closestTaxi->available = false;
+
+        std::cout << "Request " << request.requestId << " dispatched to Taxi " << closestTaxi->taxiId << std::endl();
+
+        taxis.erase(std::remove_if(taxis.begin(), taxis.end(),
+            [&](const Taxi& taxi) { return taxi.taxiId == closestTaxi->taxiId; }), taxis.end());
+    }
+};
+
+int main() {
+    TaxiDispatchSystem system;
+
+    return 0;
+}

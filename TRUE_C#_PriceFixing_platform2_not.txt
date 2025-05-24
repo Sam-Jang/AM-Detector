@@ -1,0 +1,438 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Text;
+using System.Security.Claims;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.IdentityModel.Tokens;
+using Npgsql;
+using System.Text.Json;
+using System.IO;
+
+namespace ECommerceService
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddDbContext<AppDbContext>(options =>
+                options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+            builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+                .AddJwtBearer(options =>
+                {
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ValidateIssuer = true,
+                        ValidateAudience = true,
+                        ValidateLifetime = true,
+                        ValidateIssuerSigningKey = true,
+                        ValidIssuer = builder.Configuration["Jwt:Issuer"],
+                        ValidAudience = builder.Configuration["Jwt:Audience"],
+                        IssuerSigningKey = new SymmetricSecurityKey(
+                            Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Key"]))
+                    };
+                });
+            builder.Services.AddAuthorization();
+            builder.Services.AddControllers();
+            var app = builder.Build();
+            app.UseAuthentication();
+            app.UseAuthorization();
+            app.MapControllers();
+            app.Run();
+        }
+    }
+
+    public class AppDbContext : DbContext
+    {
+        public DbSet<Product> Products { get; set; }
+        public DbSet<CartItem> CartItems { get; set; }
+        public DbSet<Order> Orders { get; set; }
+        public DbSet<User> Users { get; set; }
+        public DbSet<CompetitorPrice> CompetitorPrices { get; set; }
+
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<Product>().HasKey(p => p.Id);
+            modelBuilder.Entity<CartItem>().HasKey(c => c.Id);
+            modelBuilder.Entity<Order>().HasKey(o => o.Id);
+            modelBuilder.Entity<User>().HasKey(u => u.Id);
+            modelBuilder.Entity<CompetitorPrice>().HasKey(cp => cp.Id);
+        }
+    }
+
+    public class Product
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public decimal Price { get; set; }
+        public decimal Discount { get; set; }
+        public int Stock { get; set; }
+        public string Keywords { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int ProductId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class Order
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public DateTime OrderDate { get; set; }
+        public decimal TotalAmount { get; set; }
+        public string Status { get; set; }
+        public List<OrderItem> Items { get; set; }
+    }
+
+    public class OrderItem
+    {
+        public int Id { get; set; }
+        public int OrderId { get; set; }
+        public int ProductId { get; set; }
+        public int Quantity { get; set; }
+        public decimal Price { get; set; }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public string Email { get; set; }
+    }
+
+    public class CompetitorPrice
+    {
+        public int Id { get; set; }
+        public int ProductId { get; set; }
+        public decimal Price { get; set; }
+        public string Source { get; set; }
+        public DateTime LastUpdated { get; set; }
+    }
+
+    public class PricingConfig
+    {
+        public decimal MinPrice { get; set; }
+        public decimal MaxPrice { get; set; }
+        public decimal AdjustmentFactor { get; set; }
+        public decimal WeightCompetitor { get; set; }
+        public decimal WeightBase { get; set; }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class ProductsController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly PricingConfig _pricingConfig;
+
+        public ProductsController(AppDbContext context)
+        {
+            _context = context;
+            _pricingConfig = LoadPricingConfig();
+        }
+
+        private PricingConfig LoadPricingConfig()
+        {
+            var json = File.ReadAllText("pricing_config.json");
+            return JsonSerializer.Deserialize<PricingConfig>(json);
+        }
+
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<Product>>> GetProducts(
+            string keyword = "", string sortBy = "price_asc", int page = 1, int pageSize = 10)
+        {
+            var query = _context.Products.AsQueryable();
+
+            if (!string.IsNullOrEmpty(keyword))
+            {
+                query = query.Where(p => p.Keywords.Contains(keyword) || p.Name.Contains(keyword));
+            }
+
+            query = sortBy switch
+            {
+                "price_asc" => query.OrderBy(p => p.Price),
+                "price_desc" => query.OrderByDescending(p => p.Price),
+                "discount" => query.OrderByDescending(p => p.Discount),
+                "recommend" => query.OrderByDescending(p => p.Stock / (p.Price + 1)),
+                _ => query.OrderBy(p => p.Id)
+            };
+
+            var total = await query.CountAsync();
+            var products = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return Ok(new { Total = total, Products = products });
+        }
+
+        [HttpGet("{id}")]
+        public async Task<ActionResult<Product>> GetProduct(int id)
+        {
+            var product = await _context.Products.FindAsync(id);
+            if (product == null)
+                return NotFound();
+            return Ok(product);
+        }
+
+        [HttpPost("adjust-prices")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> AdjustPrices()
+        {
+            var products = await _context.Products.ToListAsync();
+            foreach (var product in products)
+            {
+                var compPrices = await _context.CompetitorPrices
+                    .Where(cp => cp.ProductId == product.Id && cp.LastUpdated > DateTime.UtcNow.AddDays(-7))
+                    .Select(cp => cp.Price)
+                    .ToListAsync();
+
+                if (compPrices.Any())
+                {
+                    var avgCompPrice = compPrices.Average();
+                    var basePrice = product.Price;
+                    var newPrice = (_pricingConfig.WeightCompetitor * avgCompPrice +
+                                   _pricingConfig.WeightBase * basePrice) /
+                                  (_pricingConfig.WeightCompetitor + _pricingConfig.WeightBase);
+
+                    newPrice *= _pricingConfig.AdjustmentFactor;
+                    newPrice = Math.Max(_pricingConfig.MinPrice, Math.Min(_pricingConfig.MaxPrice, newPrice));
+
+                    product.Price = Math.Round(newPrice, 2);
+                    _context.Products.Update(product);
+                }
+            }
+
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Prices adjusted successfully" });
+        }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class CartController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public CartController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpGet]
+        [Authorize]
+        public async Task<ActionResult<IEnumerable<CartItem>>> GetCart()
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier).Value);
+            var cartItems = await _context.CartItems
+                .Where(c => c.UserId == userId)
+                .Include(c => c.Product)
+                .ToListAsync();
+            return Ok(cartItems);
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<ActionResult<CartItem>> AddToCart(int productId, int quantity)
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier).Value);
+            var product = await _context.Products.FindAsync(productId);
+            if (product == null)
+                return NotFound("Product not found");
+            if (product.Stock < quantity)
+                return BadRequest("Insufficient stock");
+
+            var cartItem = await _context.CartItems
+                .FirstOrDefaultAsync(c => c.UserId == userId && c.ProductId == productId);
+
+            if (cartItem == null)
+            {
+                cartItem = new CartItem
+                {
+                    UserId = userId,
+                    ProductId = productId,
+                    Quantity = quantity
+                };
+                _context.CartItems.Add(cartItem);
+            }
+            else
+            {
+                cartItem.Quantity += quantity;
+                _context.CartItems.Update(cartItem);
+            }
+
+            product.Stock -= quantity;
+            _context.Products.Update(product);
+            await _context.SaveChangesAsync();
+
+            return Ok(cartItem);
+        }
+
+        [HttpDelete("{id}")]
+        [Authorize]
+        public async Task<IActionResult> RemoveFromCart(int id)
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier).Value);
+            var cartItem = await _context.CartItems
+                .FirstOrDefaultAsync(c => c.Id == id && c.UserId == userId);
+
+            if (cartItem == null)
+                return NotFound();
+
+            var product = await _context.Products.FindAsync(cartItem.ProductId);
+            product.Stock += cartItem.Quantity;
+            _context.Products.Update(product);
+            _context.CartItems.Remove(cartItem);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Message = "Item removed from cart" });
+        }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class OrdersController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public OrdersController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<ActionResult<Order>> CreateOrder()
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier).Value);
+            var cartItems = await _context.CartItems
+                .Where(c => c.UserId == userId)
+                .Include(c => c.Product)
+                .ToListAsync();
+
+            if (!cartItems.Any())
+                return BadRequest("Cart is empty");
+
+            var order = new Order
+            {
+                UserId = userId,
+                OrderDate = DateTime.UtcNow,
+                Status = "Pending",
+                Items = new List<OrderItem>(),
+                TotalAmount = 0
+            };
+
+            foreach (var cartItem in cartItems)
+            {
+                var product = cartItem.Product;
+                var orderItem = new OrderItem
+                {
+                    ProductId = cartItem.ProductId,
+                    Quantity = cartItem.Quantity,
+                    Price = product.Price - product.Discount
+                };
+                order.Items.Add(orderItem);
+                order.TotalAmount += orderItem.Price * orderItem.Quantity;
+            }
+
+            _context.Orders.Add(order);
+            _context.CartItems.RemoveRange(cartItems);
+            await _context.SaveChangesAsync();
+
+            return Ok(order);
+        }
+
+        [HttpGet]
+        [Authorize]
+        public async Task<ActionResult<IEnumerable<Order>>> GetOrders()
+        {
+            var userId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier).Value);
+            var orders = await _context.Orders
+                .Where(o => o.UserId == userId)
+                .Include(o => o.Items)
+                .ToListAsync();
+            return Ok(orders);
+        }
+    }
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class AuthController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly IConfiguration _config;
+
+        public AuthController(AppDbContext context, IConfiguration config)
+        {
+            _context = context;
+            _config = config;
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register(string username, string password, string email)
+        {
+            if (await _context.Users.AnyAsync(u => u.Username == username))
+                return BadRequest("Username already exists");
+
+            var user = new User
+            {
+                Username = username,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(password),
+                Email = email
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "User registered successfully" });
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login(string username, string password)
+        {
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == username);
+
+            if (user == null || !BCrypt.Net.BCrypt.Verify(password, user.PasswordHash))
+                return Unauthorized("Invalid credentials");
+
+            var token = GenerateJwtToken(user);
+            return Ok(new { Token = token });
+        }
+
+        private string GenerateJwtToken(User user)
+        {
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim(ClaimTypes.Name, user.Username),
+                new Claim(ClaimTypes.Role, "User")
+            };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_config["Jwt:Key"]));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+            var token = new JwtSecurityToken(
+                issuer: _config["Jwt:Issuer"],
+                audience: _config["Jwt:Audience"],
+                claims: claims,
+                expires: DateTime.Now.AddDays(1),
+                signingCredentials: creds);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+    }
+}

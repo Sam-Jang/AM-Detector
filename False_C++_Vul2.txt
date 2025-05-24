@@ -1,0 +1,119 @@
+#include "crow_all.h"
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
+crow::SimpleApp app;
+
+std::unordered_map<std::string, std::string> users;
+
+void handle_profile_link(const crow::request& req, crow::response& res) {
+    auto profile_url = req.body_params.get("profile_url");
+    auto profile_name = req.body_params.get("profile_name");
+    std::string object_link = "<a href='" + std::string(profile_url) + "'>" + std::string(profile_name) + "</a>";
+    res.set_header("Content-Type", "text/html");
+    res.write(object_link);
+    res.end();
+}
+
+void handle_unsafe_login(const crow::request& req, crow::response& res) {
+    auto username = req.body_params.get("username");
+    auto password = req.body_params.get("password");
+    if (users.find(username) != users.end() && users[username] == password) {
+        res.redirect("/home");
+    } else {
+        res.write("Invalid credentials");
+        res.end();
+    }
+}
+
+void handle_unsafe_comment(const crow::request& req, crow::response& res) {
+    auto comment = req.body_params.get("comment");
+    std::string comment_display = "<p>" + std::string(comment) + "</p>";
+    res.set_header("Content-Type", "text/html");
+    res.write(comment_display);
+    res.end();
+}
+
+void handle_unsafe_redirect(const crow::request& req, crow::response& res) {
+    auto next_url = req.url_params.get("next");
+    res.redirect(next_url);
+}
+
+void handle_register(const crow::request& req, crow::response& res) {
+    auto userid = req.body_params.get("userid");
+    auto password = req.body_params.get("password");
+    auto confirm_password = req.body_params.get("confirm_password");
+
+    if (password != confirm_password) {
+        res.code = 400;
+        res.write("Passwords do not match");
+    } else {
+        users[userid] = password;
+        res.write("Registration successful");
+    }
+    res.end();
+}
+
+void handle_login(const crow::request& req, crow::response& res) {
+    auto userid = req.body_params.get("userid");
+    auto password = req.body_params.get("password");
+    if (users.find(userid) != users.end() && users[userid] == password) {
+        res.write("Login successful");
+    } else {
+        res.code = 400;
+        res.write("Login failed");
+    }
+    res.end();
+}
+
+void handle_update_password(const crow::request& req, crow::response& res) {
+    auto userid = req.body_params.get("userid");
+    auto new_password = req.body_params.get("new_password");
+    if (users.find(userid) != users.end()) {
+        users[userid] = new_password;
+        res.write("Password updated successfully");
+    } else {
+        res.code = 400;
+        res.write("User not found");
+    }
+    res.end();
+}
+
+void handle_delete_account(const crow::request& req, crow::response& res) {
+    auto userid = req.body_params.get("userid");
+    if (users.find(userid) != users.end()) {
+        users.erase(userid);
+        res.write("Account deleted successfully");
+    } else {
+        res.code = 400;
+        res.write("User not found");
+    }
+    res.end();
+}
+
+void handle_get_user(const crow::request& req, crow::response& res) {
+    auto userid = req.url_params.get("userid");
+    if (users.find(userid) != users.end()) {
+        res.write("User: " + std::string(userid));
+    } else {
+        res.code = 400;
+        res.write("User not found");
+    }
+    res.end();
+}
+
+int main()
+{
+    CROW_ROUTE(app, "/profile_link").methods(crow::HTTPMethod::POST)(handle_profile_link);
+    CROW_ROUTE(app, "/unsafe_login").methods(crow::HTTPMethod::POST)(handle_unsafe_login);
+    CROW_ROUTE(app, "/unsafe_comment").methods(crow::HTTPMethod::POST)(handle_unsafe_comment);
+    CROW_ROUTE(app, "/unsafe_redirect").methods(crow::HTTPMethod::GET)(handle_unsafe_redirect);
+    CROW_ROUTE(app, "/register").methods(crow::HTTPMethod::POST)(handle_register);
+    CROW_ROUTE(app, "/login").methods(crow::HTTPMethod::POST)(handle_login);
+    CROW_ROUTE(app, "/update_password").methods(crow::HTTPMethod::POST)(handle_update_password);
+    CROW_ROUTE(app, "/delete_account").methods(crow::HTTPMethod::POST)(handle_delete_account);
+    CROW_ROUTE(app, "/get_user").methods(crow::HTTPMethod::GET)(handle_get_user);
+
+    app.port(3000).multithreaded().run();
+}

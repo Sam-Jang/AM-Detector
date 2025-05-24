@@ -1,0 +1,104 @@
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.commons.math3.distribution.NormalDistribution;
+
+class GBS_InputError extends RuntimeException {
+    public GBS_InputError(String message) {
+        super(message);
+    }
+}
+
+class _GBS_Limits {
+    static final double MIN_X = 0.01;
+    static final double MAX_X = 10000;
+    static final double MIN_FS = 0.01;
+    static final double MAX_FS = 10000;
+    static final double MIN_T = 0.01;
+    static final double MAX_T = 10;
+    static final double MIN_b = -1;
+    static final double MAX_b = 1;
+    static final double MIN_r = 0;
+    static final double MAX_r = 1;
+    static final double MIN_V = 0.01;
+    static final double MAX_V = 1;
+}
+
+public class GBSCalculator {
+
+    private static void _test_option_type(String option_type) {
+        if (!option_type.equals("c") && !option_type.equals("p")) {
+            throw new GBS_InputError("Invalid Input option_type (" + option_type + "). Acceptable value are: c, p");
+        }
+    }
+
+    private static void _gbs_test_inputs(String option_type, double fs, double x, double t, double r, double b, double v) {
+        _test_option_type(option_type);
+
+        if (x < _GBS_Limits.MIN_X || x > _GBS_Limits.MAX_X) {
+            throw new GBS_InputError("Invalid Input Strike Price (X). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_X + " to " + _GBS_Limits.MAX_X);
+        }
+
+        if (fs < _GBS_Limits.MIN_FS || fs > _GBS_Limits.MAX_FS) {
+            throw new GBS_InputError("Invalid Input Forward/Spot Price (FS). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_FS + " to " + _GBS_Limits.MAX_FS);
+        }
+
+        if (t < _GBS_Limits.MIN_T || t > _GBS_Limits.MAX_T) {
+            throw new GBS_InputError("Invalid Input Time (T). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_T + " to " + _GBS_Limits.MAX_T);
+        }
+
+        if (b < _GBS_Limits.MIN_b || b > _GBS_Limits.MAX_b) {
+            throw new GBS_InputError("Invalid Input Cost of Carry (b). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_b + " to " + _GBS_Limits.MAX_b);
+        }
+
+        if (r < _GBS_Limits.MIN_r || r > _GBS_Limits.MAX_r) {
+            throw new GBS_InputError("Invalid Input Risk Free Rate (r). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_r + " to " + _GBS_Limits.MAX_r);
+        }
+
+        if (v < _GBS_Limits.MIN_V || v > _GBS_Limits.MAX_V) {
+            throw new GBS_InputError("Invalid Input Implied Volatility (V). Acceptable range for inputs is " +
+                    _GBS_Limits.MIN_V + " to " + _GBS_Limits.MAX_V);
+        }
+    }
+
+    public static Map<String, Double> _gbs(String option_type, double fs, double x, double t, double r, double b, double v) {
+        _gbs_test_inputs(option_type, fs, x, t, r, b, v);
+
+        double t_sqrt = Math.sqrt(t);
+        double d1 = (Math.log(fs / x) + (b + (v * v) / 2) * t) / (v * t_sqrt);
+        double d2 = d1 - v * t_sqrt;
+
+        NormalDistribution norm = new NormalDistribution();
+        double value, delta, gamma, theta, vega, rho;
+
+        if (option_type.equals("c")) {
+            value = fs * Math.exp((b - r) * t) * norm.cumulativeProbability(d1) - x * Math.exp(-r * t) * norm.cumulativeProbability(d2);
+            delta = Math.exp((b - r) * t) * norm.cumulativeProbability(d1);
+            gamma = Math.exp((b - r) * t) * norm.density(d1) / (fs * v * t_sqrt);
+            theta = -(fs * v * Math.exp((b - r) * t) * norm.density(d1)) / (2 * t_sqrt) - (b - r) * fs * Math.exp((b - r) * t) * norm.cumulativeProbability(d1) - r * x * Math.exp(-r * t) * norm.cumulativeProbability(d2);
+            vega = Math.exp((b - r) * t) * fs * t_sqrt * norm.density(d1);
+            rho = x * t * Math.exp(-r * t) * norm.cumulativeProbability(d2);
+        } else {
+            value = x * Math.exp(-r * t) * norm.cumulativeProbability(-d2) - (fs * Math.exp((b - r) * t) * norm.cumulativeProbability(-d1));
+            delta = -Math.exp((b - r) * t) * norm.cumulativeProbability(-d1);
+            gamma = Math.exp((b - r) * t) * norm.density(d1) / (fs * v * t_sqrt);
+            theta = -(fs * v * Math.exp((b - r) * t) * norm.density(d1)) / (2 * t_sqrt) + (b - r) * fs * Math.exp((b - r) * t) * norm.cumulativeProbability(-d1) + r * x * Math.exp(-r * t) * norm.cumulativeProbability(-d2);
+            vega = Math.exp((b - r) * t) * fs * t_sqrt * norm.density(d1);
+            rho = -x * t * Math.exp(-r * t) * norm.cumulativeProbability(-d2);
+        }
+
+        Map<String, Double> results = new HashMap<>();
+        results.put("value", value);
+        results.put("delta", delta);
+        results.put("gamma", gamma);
+        results.put("theta", theta);
+        results.put("vega", vega);
+        results.put("rho", rho);
+
+        return results;
+    }
+}

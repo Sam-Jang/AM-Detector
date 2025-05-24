@@ -1,0 +1,313 @@
+from flask import Flask, request, jsonify
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
+import mysql.connector
+import json
+import bcrypt
+from datetime import datetime, timedelta
+import os
+
+app = Flask(__name__)
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
+jwt = JWTManager(app)
+
+with open('weights.json') as f:
+    weights = json.load(f)
+
+def get_db_connection():
+    return mysql.connector.connect(
+        host=os.getenv('DB_HOST', 'localhost'),
+        user=os.getenv('DB_USER', 'root'),
+        password=os.getenv('DB_PASSWORD', ''),
+        database=os.getenv('DB_NAME', 'video_platform')
+    )
+
+class Video:
+    def __init__(self, id, title, description, url, is_platform_owned, views, likes, keywords, upload_date):
+        self.id = id
+        self.title = title
+        self.description = description
+        self.url = url
+        self.is_platform_owned = is_platform_owned
+        self.views = views
+        self.likes = likes
+        self.keywords = keywords
+        self.upload_date = upload_date
+
+class SearchResult:
+    def __init__(self, video_id, title, description, url, score):
+        self.video_id = video_id
+        self.title = title
+        self.description = description
+        self.url = url
+        self.score = score
+
+@app.route('/api/video/search', methods=['GET'])
+def search_videos():
+    query = request.args.get('query', '')
+    sort = request.args.get('sort', 'relevance')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos")
+    videos = [Video(**row) for row in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+
+    results = []
+    for video in videos:
+        score = calculate_video_score(video, query)
+        results.append(SearchResult(
+            video_id=video.id,
+            title=video.title,
+            description=video.description,
+            url=video.url,
+            score=score
+        ))
+
+    if sort.lower() == 'views':
+        results.sort(key=lambda x: get_video_views(x.video_id), reverse=True)
+    elif sort.lower() == 'upload':
+        results.sort(key=lambda x: get_video_upload_date(x.video_id), reverse=True)
+    else:
+        results.sort(key=lambda x: x.score, reverse=True)
+
+    return jsonify([vars(result) for result in results])
+
+def calculate_video_score(video, query):
+    score = 0
+    query_terms = query.lower().split()
+    video_keywords = video.keywords.lower().split(',')
+
+    for term in query_terms:
+        if term in video.title.lower() or term in video.description.lower():
+            score += weights['KeywordWeight']
+        if any(k.strip() == term for k in video_keywords):
+            score += weights['KeywordWeight'] * 1.5
+
+    score += video.views * weights['ViewWeight']
+    score += video.likes * weights['LikeWeight']
+
+    if video.is_platform_owned:
+        score += weights['PlatformBias']
+
+    recency = (datetime.utcnow() - video.upload_date).total_seconds() / (24 * 3600)
+    score += max(0, 30 - recency) * 0.1
+
+    return score
+
+def get_video_views(video_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT views FROM videos WHERE id = %s", (video_id,))
+    views = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+    return views
+
+def get_video_upload_date(video_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT upload_date FROM videos WHERE id = %s", (video_id,))
+    upload_date = cursor.fetchone()[0]
+    cursor.close()
+    conn.close()
+    return upload_date
+
+@app.route('/api/video/<int:id>', methods=['GET'])
+def get_video(id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos WHERE id = %s", (id,))
+    video = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if video:
+        return jsonify(video)
+    return jsonify({'error': 'Video not found'}), 404
+
+@app.route('/api/video', methods=['POST'])
+@jwt_required()
+def upload_video():
+    data = request.get_json()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO videos (title, description, url, is_platform_owned, views, likes, keywords, upload_date) VALUES (%s, %s, %s, %s, 0, 0, %s, %s)",
+        (data['title'], data['description'], data['url'], data['isPlatformOwned'], data['keywords'], datetime.utcnow())
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Video uploaded'})
+
+@app.route('/api/video/like', methods=['POST'])
+@jwt_required()
+def like_video():
+    video_id = request.get_json()['videoId']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE videos SET likes = likes + 1 WHERE id = %s", (video_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Video liked'})
+
+@app.route('/api/video/view', methods=['POST'])
+def record_view():
+    video_id = request.get_json()['videoId']
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE videos SET views = views + 1 WHERE id = %s", (video_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'View recorded'})
+
+@app.route('/api/user/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    password_hash = bcrypt.hashpw(data['passwordHash'].encode('utf-8'), bcrypt.gensalt())
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s)",
+        (data['username'], password_hash, data['email'])
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'User registered'})
+
+@app.route('/api/user/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, username, password_hash FROM users WHERE username = %s", (data['username'],))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if user and bcrypt.checkpw(data['passwordHash'].encode('utf-8'), user['password_hash']):
+        access_token = create_access_token(identity={'userId': user['id'], 'username': user['username']})
+        return jsonify({'token': access_token})
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/api/favorite', methods=['POST'])
+@jwt_required()
+def add_favorite():
+    video_id = request.get_json()['videoId']
+    user_id = get_jwt_identity()['userId']
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO favorites (user_id, video_id) VALUES (%s, %s)", (user_id, video_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Favorite added'})
+
+@app.route('/api/favorite', methods=['GET'])
+@jwt_required()
+def get_favorites():
+    user_id = get_jwt_identity()['userId']
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, user_id, video_id FROM favorites WHERE user_id = %s", (user_id,))
+    favorites = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify(favorites)
+
+@app.route('/api/playlist', methods=['POST'])
+@jwt_required()
+def create_playlist():
+    name = request.get_json()['name']
+    user_id = get_jwt_identity()['userId']
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO playlists (user_id, name) VALUES (%s, %s)", (user_id, name))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Playlist created'})
+
+@app.route('/api/playlist/video', methods=['POST'])
+@jwt_required()
+def add_video_to_playlist():
+    data = request.get_json()
+    user_id = get_jwt_identity()['userId']
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO playlist_videos (playlist_id, video_id) VALUES (%s, %s)", (data['playlistId'], data['videoId']))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Video added to playlist'})
+
+@app.route('/api/playlist', methods=['GET'])
+@jwt_required()
+def get_playlists():
+    user_id = get_jwt_identity()['userId']
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, user_id, name FROM playlists WHERE user_id = %s", (user_id,))
+    playlists = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify(playlists)
+
+@app.route('/api/playlist/<int:id>/videos', methods=['GET'])
+@jwt_required()
+def get_playlist_videos(id):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT v.id, v.title, v.description, v.url, v.is_platform_owned, v.views, v.likes, v.keywords, v.upload_date "
+        "FROM videos v JOIN playlist_videos pv ON v.id = pv.video_id WHERE pv.playlist_id = %s",
+        (id,)
+    )
+    videos = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify(videos)
+
+@app.route('/api/watchhistory', methods=['POST'])
+@jwt_required()
+def add_watch_history():
+    video_id = request.get_json()['videoId']
+    user_id = get_jwt_identity()['userId']
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO watch_history (user_id, video_id, watched_at) VALUES (%s, %s, %s)",
+        (user_id, video_id, datetime.utcnow())
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({'message': 'Watch history added'})
+
+@app.route('/api/watchhistory', methods=['GET'])
+@jwt_required()
+def get_watch_history():
+    user_id = get_jwt_identity()['userId']
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT id, user_id, video_id, watched_at FROM watch_history WHERE user_id = %s ORDER BY watched_at DESC",
+        (user_id,)
+    )
+    history = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return jsonify(history)
+
+if __name__ == '__main__':
+    app.run(debug=True)

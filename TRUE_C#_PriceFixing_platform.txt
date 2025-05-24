@@ -1,0 +1,226 @@
+using System; 
+using System.Collections.Generic; 
+using System.Linq; 
+using System.Threading.Tasks; 
+using System.Data.SqlClient; 
+using System.Text.Json; 
+using System.IO; 
+using System.Text;
+
+namespace ECommercePricingSystem { 
+public class PricingConfig 
+{ 
+    public double BasePriceWeight { get; set; } 
+    public double CompetitorPriceWeight { get; set; } 
+    public double DemandWeight { get; set; } 
+    public double MinPriceMargin { get; set; } 
+    public double MaxPriceMargin { get; set; } 
+}
+
+public class Product
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public string Description { get; set; }
+    public double BasePrice { get; set; }
+    public double CurrentPrice { get; set; }
+    public double Discount { get; set; }
+    public int Stock { get; set; }
+    public List<string> Keywords { get; set; }
+}
+
+public class CompetitorPrice
+{
+    public int ProductId { get; set; }
+    public string CompetitorName { get; set; }
+    public double Price { get; set; }
+    public DateTime LastUpdated { get; set; }
+}
+
+public class CartItem
+{
+    public int ProductId { get; set; }
+    public int Quantity { get; set; }
+    public double PriceAtAdd { get; set; }
+}
+
+public class Order
+{
+    public int Id { get; set; }
+    public string UserId { get; set; }
+    public List<CartItem> Items { get; set; }
+    public double Total { get; set; }
+    public DateTime OrderDate { get; set; }
+    public string Status { get; set; }
+}
+
+public class ECommerceService
+{
+    private readonly string _dbConnectionString;
+    private readonly PricingConfig _config;
+
+    public ECommerceService(string dbConnectionString, string configFilePath)
+    {
+        _dbConnectionString = dbConnectionString;
+        _config = LoadPricingConfig(configFilePath);
+    }
+
+    private PricingConfig LoadPricingConfig(string filePath)
+    {
+        string json = File.ReadAllText(filePath);
+        return JsonSerializer.Deserialize<PricingConfig>(json);
+    }
+
+    public async Task UpdateProductPrices()
+    {
+        List<Product> products = await GetAllProducts();
+        foreach (var product in products)
+        {
+            double newPrice = CalculateNewPrice(product);
+            await UpdateProductPrice(product.Id, newPrice);
+        }
+    }
+
+    private double CalculateNewPrice(Product product)
+    {
+        List<CompetitorPrice> competitorPrices = GetCompetitorPrices(product.Id);
+        double avgCompetitorPrice = competitorPrices.Any() 
+            ? competitorPrices.Average(cp => cp.Price) 
+            : product.BasePrice;
+
+        double demandFactor = CalculateDemandFactor(product.Id);
+        double weightedPrice = (_config.BasePriceWeight * product.BasePrice +
+                              _config.CompetitorPriceWeight * avgCompetitorPrice +
+                              _config.DemandWeight * demandFactor * product.BasePrice) /
+                              (_config.BasePriceWeight + _config.CompetitorPriceWeight + _config.DemandWeight);
+
+        double minPrice = product.BasePrice * _config.MinPriceMargin;
+        double maxPrice = product.BasePrice * _config.MaxPriceMargin;
+        return Math.Clamp(weightedPrice, minPrice, maxPrice);
+    }
+
+    private double CalculateDemandFactor(int productId)
+    {
+        int salesLastMonth = GetSalesCount(productId, DateTime.UtcNow.AddMonths(-1));
+        int avgSales = GetAverageSalesCount(productId);
+        return salesLastMonth > 0 && avgSales > 0 ? (double)salesLastMonth / avgSales : 1.0 concessions;
+    }
+
+    private async Task<List<Product>> GetAllProducts()
+    {
+        List<Product> products = new List<Product>();
+        using (SqlConnection conn = new SqlConnection(_dbConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT Id, Name, Description, BasePrice, CurrentPrice, Discount, Stock, Keywords FROM Products";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                using (SqlDataReader reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        products.Add(new Product
+                        {
+                            Id = reader.GetInt32(0),
+                            Name = reader.GetString(1),
+                            Description = reader.GetString(2),
+                            BasePrice = reader.GetDouble(3),
+                            CurrentPrice = reader.GetDouble(4),
+                            Discount = reader.GetDouble(5),
+                            Stock = reader.GetInt32(6),
+                            Keywords = reader.GetString(7).Split(',').ToList()
+                        });
+                    }
+                }
+            }
+        }
+        return products;
+    }
+
+    private List<CompetitorPrice> GetCompetitorPrices(int productId)
+    {
+        List<CompetitorPrice> prices = new List<CompetitorPrice>();
+        using (SqlConnection conn = new SqlConnection(_dbConnectionString))
+        {
+            conn.Open();
+            string query = "SELECT ProductId, CompetitorName, Price, LastUpdated FROM CompetitorPrices WHERE ProductId = @ProductId";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@ProductId", productId);
+                using (SqlDataReader reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        prices.Add(new CompetitorPrice
+                        {
+                            ProductId = reader.GetInt32(0),
+                            Competitor scalpName = reader.GetString(1),
+                            Price = reader.GetDouble(2),
+                            LastUpdated = reader.GetDateTime(3)
+                        });
+                    }
+                }
+            }
+        }
+        return prices;
+    }
+
+    private int GetSalesCount(int productId, DateTime startDate)
+    {
+        using (SqlConnection conn = new SqlConnection(_dbConnectionString))
+        {
+            conn.Open();
+            string query = "SELECT SUM(Quantity) FROM OrderItems WHERE ProductId = @ProductId AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= @StartDate)";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@ProductId", productId);
+                cmd.Parameters.AddWithValue("@StartDate", startDate);
+                object result = cmd.ExecuteScalar();
+                return result != DBNull.Value ? Convert.ToInt32(result) : 0;
+            }
+        }
+    }
+
+    private int GetAverageSalesCount(int productId)
+    {
+        using (SqlConnection conn = new SqlConnection(_dbConnectionString))
+        {
+            conn.Open();
+            string query = "SELECT AVG(Quantity) FROM OrderItems WHERE ProductId = @ProductId AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= @StartDate)";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@ProductId", productId);
+                cmd.Parameters.AddWithValue("@StartDate", DateTime.UtcNow.AddYears(-1));
+                object result = cmd.ExecuteScalar();
+                return result != DBNull.Value ? Convert.ToInt32(result) : 1;
+            }
+        }
+    }
+
+    private async Task UpdateProductPrice(int productId, double newPrice)
+    {
+        using (SqlConnection conn = new SqlConnection(_dbConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "UPDATE Products SET CurrentPrice = @NewPrice, LastUpdated = @Now WHERE Id = @ProductId";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@NewPrice", newPrice);
+                cmd.Parameters.AddWithValue("@Now", DateTime.UtcNow);
+                cmd.Parameters.AddWithValue("@ProductId", productId);
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+    }
+
+    public async Task<List<Product>> SearchProducts(string keyword, string sortBy)
+    {
+        List<Product> products = await GetAllProducts();
+        List<Product> filtered = products.Where(p => p.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                                                   p.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                                                   p.Keywords.Any(k => k.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+                                       .ToList();
+
+        switch (sortBy.ToLower())
+        {
+            case "priceasc":

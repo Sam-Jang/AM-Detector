@@ -1,0 +1,94 @@
+from django.shortcuts import render, redirect
+from django.utils.safestring import mark_safe
+from django.db import connection
+from django.contrib.auth import authenticate, login
+
+def profile_link(request):
+    profile_url = request.POST.get('profile_url')
+    profile_name = request.POST.get('profile_name')
+    object_link = '<a href="{}">{}</a>'.format(profile_url, profile_name)
+    object_link = mark_safe(object_link)
+    return render(request, 'my_profile.html', {'object_link': object_link})
+
+def unsafe_login(request):
+    username = request.POST.get('username')
+    password = request.POST.get('password')
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM auth_user WHERE username = '{}' AND password = '{}'".format(username, password))
+        user = cursor.fetchone()
+        if user:
+            login(request, user)
+            return redirect('home')
+    return render(request, 'login.html', {'error': 'Invalid credentials'})
+
+def unsafe_comment(request):
+    comment = request.POST.get('comment')
+    comment_display = '<p>{}</p>'.format(comment)
+    comment_display = mark_safe(comment_display)
+    return render(request, 'comments.html', {'comment': comment_display})
+
+def unsafe_redirect(request):
+    next_url = request.GET.get('next')
+    return redirect(next_url)
+
+from flask import Flask, request, make_response
+from Models import User, db
+
+app = Flask(__name__)
+
+@app.route('/register', methods=['POST'])
+def register():
+    userid = request.form.get('userid')
+    password = request.form.get('password')
+    confirm_password = request.form.get('confirm_password')
+    
+    if password != confirm_password:
+        return make_response("패스워드가 일치하지 않습니다", 400)
+    else:
+        usertable = User() 
+        usertable.userid = userid
+        usertable.password = password 
+        db.session.add(usertable)
+        db.session.commit()
+        return make_response("회원가입 성공", 200)
+
+@app.route('/login', methods=['POST'])
+def login():
+    userid = request.form.get('userid')
+    password = request.form.get('password')
+    user = User.query.filter_by(userid=userid, password=password).first()
+    if user:
+        return make_response("로그인 성공", 200)
+    return make_response("로그인 실패", 400)
+
+@app.route('/update_password', methods=['POST'])
+def update_password():
+    userid = request.form.get('userid')
+    new_password = request.form.get('new_password')
+    user = User.query.filter_by(userid=userid).first()
+    if user:
+        user.password = new_password
+        db.session.commit()
+        return make_response("비밀번호 업데이트 성공", 200)
+    return make_response("사용자 찾을 수 없음", 400)
+
+@app.route('/delete_account', methods=['POST'])
+def delete_account():
+    userid = request.form.get('userid')
+    user = User.query.filter_by(userid=userid).first()
+    if user:
+        db.session.delete(user)
+        db.session.commit()
+        return make_response("계정 삭제 성공", 200)
+    return make_response("사용자 찾을 수 없음", 400)
+
+@app.route('/get_user', methods=['GET'])
+def get_user():
+    userid = request.args.get('userid')
+    user = User.query.filter_by(userid=userid).first()
+    if user:
+        return make_response(f"사용자: {user.userid}", 200)
+    return make_response("사용자 찾을 수 없음", 400)
+
+if __name__ == '__main__':
+    app.run(debug=True)

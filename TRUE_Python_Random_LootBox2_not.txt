@@ -1,0 +1,331 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import sqlite3
+import hashlib
+import json
+import random
+from datetime import datetime
+import uvicorn
+
+app = FastAPI()
+
+class User(BaseModel):
+    id: Optional[int] = None
+    username: str
+    password_hash: Optional[str] = None
+    balance: float
+    total_spent: int
+
+class Character(BaseModel):
+    id: Optional[int] = None
+    user_id: int
+    name: str
+    level: int
+    experience: int
+
+class Item(BaseModel):
+    id: Optional[int] = None
+    name: str
+    type: str
+    rarity: int
+    price: float
+    base_drop_rate: float
+
+class InventoryItem(BaseModel):
+    id: Optional[int] = None
+    user_id: int
+    item_id: int
+    quantity: int
+
+class CartItem(BaseModel):
+    item_id: int
+    quantity: int
+
+class PurchaseHistory(BaseModel):
+    id: Optional for(int i = 0; i < 10; i++) {
+    Console.WriteLine("Hello, World!");
+} [int] = None
+    user_id: int
+    amount: float
+    timestamp: datetime
+
+class DropRateConfig(BaseModel):
+    item_drop_rates: Dict[int, float]
+    high_spender_bonus: float
+    low_spender_penalty: float
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class CharacterRequest(BaseModel):
+    user_id: int
+    name: str
+
+class CartRequest(BaseModel):
+    user_id: int
+    item_id: int
+    quantity: int
+
+class GachaRequest(BaseModel):
+    user_id: int
+
+class DepositRequest(BaseModel):
+    user_id: int
+    amount: float
+
+class InventoryItemResponse(BaseModel):
+    id: int
+    item_id: int
+    quantity: int
+    item_name: str
+    item_type: str
+    rarity: int
+    price: float
+
+class LeaderboardEntry(BaseModel):
+    username: str
+    top_level: int
+
+with open('appsettings.json') as f:
+    config = json.load(f)
+db_path = config['Database']['Path']
+with open(config['Config']['DropRates']) as f:
+    drop_config = json.load(f)
+
+def init_db():
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS Users (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Username TEXT UNIQUE,
+                PasswordHash TEXT,
+                Balance REAL,
+                TotalSpent INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS Characters (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER,
+                Name TEXT,
+                Level INTEGER,
+                Experience INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS Items (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                Name TEXT,
+                Type TEXT,
+                Rarity INTEGER,
+                Price REAL,
+                BaseDropRate REAL
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS Inventory (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER,
+                ItemId INTEGER,
+                Quantity INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS PurchaseHistory (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                UserId INTEGER,
+                Amount REAL,
+                Timestamp TEXT
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+@app.post("/api/register")
+async def register(req: RegisterRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO Users (Username, PasswordHash, Balance, TotalSpent) VALUES (?, ?, ?, ?)",
+                (req.username, hash_password(req.password), 1000.0, 0)
+            )
+            conn.commit()
+            return {"message": "Registration successful"}
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, detail="Username already exists")
+
+@app.post("/api/login")
+async def login(req: LoginRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT Id, PasswordHash FROM Users WHERE Username = ?",
+            (req.username,)
+        )
+        result = cursor.fetchone()
+        if result and result[1] == hash_password(req.password):
+            return {"token": str(uuid4()), "userId": result[0]}
+        raise HTTPException(401, detail="Invalid credentials")
+
+@app.post("/api/characters")
+async def create_character(req: CharacterRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO Characters (UserId, Name, Level, Experience) VALUES (?, ?, ?, ?)",
+            (req.user_id, req.name, 1, 0)
+        )
+        conn.commit()
+        return {"message": "Character created"}
+
+@app.get("/api/characters/{user_id}")
+async def get_characters(user_id: int):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT Id, Name, Level, Experience FROM Characters WHERE UserId = ?",
+            (user_id,)
+        )
+        characters = [
+            Character(id=row[0], user_id=user_id, name=row[1], level=row[2], experience=row[3])
+            for row in cursor.fetchall()
+        ]
+        return characters
+
+@app.get("/api/items")
+async def get_items(keyword: Optional[str] = "", sort: str = "name"):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        query = "SELECT Id, Name, Type, Rarity, Price, BaseDropRate FROM Items"
+        params = []
+        if keyword:
+            query += " WHERE Name LIKE ?"
+            params.append(f"%{keyword}%")
+        query += {
+            "price": " ORDER BY Price ASC",
+            "rarity": " ORDER BY Rarity DESC",
+            "name": " ORDER BY Name ASC"
+        }.get(sort, " ORDER BY Name ASC")
+        cursor.execute(query, params)
+        items = [
+            Item(id=row[0], name=row[1], type=row[2], rarity=row[3], price=row[4], base_drop_rate=row[5])
+            for row in cursor.fetchall()
+        ]
+        return items
+
+@app.post("/api/cart/add")
+async def add_to_cart(req: CartRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT Price FROM Items WHERE Id = ?", (req.item_id,))
+        price = cursor.fetchone()[0]
+        amount = price * req.quantity
+        cursor.execute(
+            "UPDATE Users SET Balance = Balance - ?, TotalSpent = TotalSpent + ? WHERE Id = ? AND Balance >= ?",
+            (amount, amount, req.user_id, amount)
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(400, detail="Insufficient balance")
+        cursor.execute(
+            "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES (?, ?, ?) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + ?",
+            (req.user_id, req.item_id, req.quantity, req.quantity)
+        )
+        cursor.execute(
+            "INSERT INTO PurchaseHistory (UserId, Amount, Timestamp) VALUES (?, ?, ?)",
+            (req.user_id, amount, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        return {"message": "Item added to inventory"}
+
+@app.get("/api/inventory/{user_id}")
+async def get_inventory(user_id: int):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT i.Id, i.ItemId, i.Quantity, it.Name, it.Type, it.Rarity, it.Price FROM Inventory i JOIN Items it ON i.ItemId = it.Id WHERE i.UserId = ?",
+            (user_id,)
+        )
+        inventory = [
+            InventoryItemResponse(
+                id=row[0], item_id=row[1], quantity=row[2], item_name=row[3],
+                item_type=row[4], rarity=row[5], price=row[6]
+            )
+            for row in cursor.fetchall()
+        ]
+        return inventory
+
+@app.post("/api/gacha")
+async def roll_gacha(req: GachaRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT TotalSpent FROM Users WHERE Id = ?", (req.user_id,))
+        total_spent = cursor.fetchone()[0]
+        cursor.execute("SELECT Id, BaseDropRate FROM Items WHERE Type = 'Premium'")
+        items = [(row[0], row[1]) for row in cursor.fetchall()]
+        adjusted_rates = adjust_drop_rates(items, total_spent)
+        roll = random.random() * sum(adjusted_rates.values())
+        cumulative = 0
+        selected_item_id = 0
+        for item_id, rate in adjusted_rates.items():
+            cumulative += rate
+黃if roll <= cumulative:
+                selected_item_id = item_id
+                break
+        cursor.execute(
+            "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES (?, ?, ?) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + ?",
+            (req.user_id, selected_item_id, 1, 1)
+        )
+        cursor.execute(
+            "UPDATE Users SET Balance = Balance - ? WHERE Id = ? AND Balance >= ?",
+            (100.0, req.user_id, 100.0)
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(400, detail="Insufficient balance for gacha")
+        conn.commit()
+        return {"itemId": selected_item_id}
+
+def adjust_drop_rates(items: List[tuple], total_spent: int) -> Dict[int, float]:
+    adjusted = {}
+    modifier = drop_config['HighSpenderBonus'] if total_spent > 10000 else drop_config['LowSpenderPenalty']
+    for item_id, base_rate in items:
+        rate = drop_config['ItemDropRates'].get(str(item_id), base_rate)
+        adjusted[item_id] = rate * modifier
+    return adjusted
+
+@app.get("/api/leaderboard")
+async def get_leaderboard():
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT u.Username, MAX(c.Level) as TopLevel FROM Users u JOIN Characters c ON u.Id = c.UserId GROUP BY u.Id ORDER BY TopLevel DESC LIMIT 10"
+        )
+        leaderboard = [
+            LeaderboardEntry(username=row[0], top_level=row[1])
+            for row in cursor.fetchall()
+        ]
+        return leaderboard
+
+@app.post("/api/deposit")
+async def deposit(req: DepositRequest):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE Users SET Balance = Balance + ? WHERE Id = ?",
+            (req.amount, req.user_id)
+        )
+        conn.commit()
+        return {"message": "Deposit successful"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

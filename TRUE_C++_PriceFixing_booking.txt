@@ -1,0 +1,748 @@
+#include <cpprest/http_listener.h>
+#include <cpprest/json.h>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <bcrypt/bcrypt.h>
+#include <memory>
+#include <vector>
+#include <string>
+#include <map>
+#include <ctime>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <random>
+
+using namespace web;
+using namespace web::http;
+using namespace web::http::experimental::listener;
+
+struct PricingConfig {
+    double weightMarketTrend;
+    double weightOccupancy;
+    double weightPeerRent;
+    double autoAcceptThresholdDaily;
+    double autoAcceptThresholdWeekly;
+    double minRentMultiplier;
+    double maxRentMultiplier;
+};
+
+struct User {
+    int userId;
+    std::string username;
+    std::string passwordHash;
+    std::string role;
+    std::string email;
+};
+
+struct Property {
+    int propertyId;
+    std::string name;
+    std::string address;
+    std::string submarket;
+    int bedrooms;
+    double squareFootage;
+    double currentRent;
+    double occupancyRate;
+    int availableUnits;
+    std::string amenities;
+};
+
+struct Lease {
+    int leaseId;
+    int propertyId;
+    double effectiveRent;
+    int termMonths;
+    std::time_t startDate;
+    double discount;
+};
+
+struct Booking {
+    int bookingId;
+    int userId;
+    int propertyId;
+    std::time_t bookingDate;
+    std::string status;
+};
+
+struct PeerProperty {
+    int peerId;
+    int propertyId;
+    std::string peerSubmarket;
+    double peerRent;
+    double peerOccupancy;
+    int peerBedrooms;
+};
+
+struct PriceRecommendation {
+    int propertyId;
+    double recommendedRent;
+    double baseRent;
+    bool isAutoAccepted;
+    std::map<int, double> leaseExpirationAdjustments;
+    double marketTrendFactor;
+    double occupancyFactor;
+    double peerRentFactor;
+};
+
+class RentalDatabase {
+private:
+    std::unique_ptr<sql::Connection> con;
+    PricingConfig config;
+
+public:
+    RentalDatabase() {
+        sql::mysql::MySQL_Driver* driver = sql::mysql::get_mysql_driver_instance();
+        con.reset(driver->connect("tcp://127.0.0.1:3306", "root", "password"));
+        con->setSchema("rental_management");
+
+        std::ifstream file("pricing_config.json");
+        json::value json = json::value::parse(file);
+        config.weightMarketTrend = json.at(U("weightMarketTrend")).as_double();
+        config.weightOccupancy = json.at(U("weightOccupancy")).as_double();
+        config.weightPeerRent = json.at(U("weightPeerRent")).as_double();
+        config.autoAcceptThresholdDaily = json.at(U("autoAcceptThresholdDaily")).as_double();
+        config.autoAcceptThresholdWeekly = json.at(U("autoAcceptThresholdWeekly")).as_double();
+        config.minRentMultiplier = json.at(U("minRentMultiplier")).as_double();
+        config.maxRentMultiplier = json.at(U("maxRentMultiplier")).as_double();
+    }
+
+    bool registerUser(const json::value& body, json::value& response) {
+        std::string username = body.at(U("username")).as_string();
+        std::string password = body.at(U("password")).as_string();
+        std::string email = body.at(U("email")).as_string();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT COUNT(*) FROM Users WHERE username = ?"));
+        pstmt->setString(1, username);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        res->next();
+        if (res->getInt(1) > 0) return false;
+
+        std::string hash = bcrypt::generateHash(password);
+        pstmt.reset(con->prepareStatement("INSERT INTO Users (username, passwordHash, role, email) VALUES (?, ?, 'Landlord', ?)"));
+        pstmt->setString(1, username);
+        pstmt->setString(2, hash);
+        pstmt->setString(3, email);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT userId, username FROM Users WHERE username = ?"));
+        pstmt->setString(1, username);
+        res.reset(pstmt->executeQuery());
+        res->next();
+        response[U("userId")] = json::value::number(res->getInt("userId"));
+        response[U("username")] = json::value::string(res->getString("username"));
+        return true;
+    }
+
+    bool loginUser(const json::value& body, json::value& response) {
+        std::string username = body.at(U("username")).as_string();
+        std::string password = body.at(U("password")).as_string();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT userId, username, passwordHash, role FROM Users WHERE username = ?"));
+        pstmt->setString(1, username);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (!res->next()) return false;
+
+        if (!bcrypt::validatePassword(password, res->getString("passwordHash"))) return false;
+
+        response[U("userId")] = json::value::number(res->getInt("userId"));
+        response[U("username")] = json::value::string(res->getString("username"));
+        response[U("role")] = json::value::string(res->getString("role"));
+        return true;
+    }
+
+    void getProperties(const uri::components& query, json::value& response) {
+        std::string submarket = query.has_query_parameter(U("submarket")) ? query.get_query_parameter(U("submarket")).as_string() : "";
+        int bedrooms = query.has_query_parameter(U("bedrooms")) ? std::stoi(query.get_query_parameter(U("bedrooms")).as_string()) : -1;
+        std::string sortBy = query.has_query_parameter(U("sortBy")) ? query.get_query_parameter(U("sortBy")).as_string() : "price";
+        std::string sortOrder = query.has_query_parameter(U("sortOrder")) ? query.get_query_parameter(U("sortOrder")).as_string() : "asc";
+        int page = query.has_query_parameter(U("page")) ? std::stoi(query.get_query_parameter(U("page")).as_string()) : 1;
+        int pageSize = query.has_query_parameter(U("pageSize")) ? std::stoi(query.get_query_parameter(U("pageSize")).as_string()) : 10;
+
+        std::stringstream sql;
+        sql << "SELECT * FROM Properties";
+        if (!submarket.empty() || bedrooms >= 0) {
+            sql << " WHERE ";
+            if (!submarket.empty()) sql << "submarket = ? ";
+            if (bedrooms >= 0) sql << (!submarket.empty() ? "AND " : "") << "bedrooms = ?";
+        }
+        sql << " ORDER BY ";
+        if (sortBy == "price") sql << "currentRent";
+        else if (sortBy == "occupancy") sql << "occupancyRate";
+        else if (sortBy == "bedrooms") sql << "bedrooms";
+        else sql << "currentRent";
+        sql << (sortOrder == "asc" ? " ASC" : " DESC");
+        sql << " LIMIT ? OFFSET ?";
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement(sql.str()));
+        int paramIndex = 1;
+        if (!submarket.empty()) pstmt->setString(paramIndex++, submarket);
+        if (bedrooms >= 0) pstmt->setInt(paramIndex++, bedrooms);
+        pstmt->setInt(paramIndex++, pageSize);
+        pstmt->setInt(paramIndex, (page - 1) * pageSize);
+
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        json::value properties = json::value::array();
+        int index = 0;
+        while (res->next()) {
+            properties[index][U("propertyId")] = json::value::number(res->getInt("propertyId"));
+            properties[index][U("name")] = json::value::string(res->getString("name"));
+            properties[index][U("address")] = json::value::string(res->getString("address"));
+            properties[index][U("submarket")] = json::value::string(res->getString("submarket"));
+            properties[index][U("bedrooms")] = json::value::number(res->getInt("bedrooms"));
+            properties[index][U("squareFootage")] = json::value::number(res->getDouble("squareFootage"));
+            properties[index][U("currentRent")] = json::value::number(res->getDouble("currentRent"));
+            properties[index][U("occupancyRate")] = json::value::number(res->getDouble("occupancyRate"));
+            properties[index][U("availableUnits")] = json::value::number(res->getInt("availableUnits"));
+            properties[index][U("amenities")] = json::value::string(res->getString("amenities"));
+            index++;
+        }
+
+        pstmt.reset(con->prepareStatement("SELECT COUNT(*) FROM Properties" + (submarket.empty() && bedrooms < 0 ? "" : " WHERE " + (submarket.empty() ? "" : "submarket = ? ") + (bedrooms < 0 ? "" : (submarket.empty() ? "" : "AND ") + "bedrooms = ?"))));
+        paramIndex = 1;
+        if (!submarket.empty()) pstmt->setString(paramIndex++, submarket);
+        if (bedrooms >= 0) pstmt->setInt(paramIndex, bedrooms);
+        res.reset(pstmt->executeQuery());
+        res->next();
+        int total = res->getInt(1);
+
+        response[U("total")] = json::value::number(total);
+        response[U("properties")] = properties;
+    }
+
+    bool addProperty(const json::value& body, json::value& response) {
+        Property prop;
+        prop.name = body.at(U("name")).as_string();
+        prop.address = body.at(U("address")).as_string();
+        prop.submarket = body.at(U("submarket")).as_string();
+        prop.bedrooms = body.at(U("bedrooms")).as_integer();
+        prop.squareFootage = body.at(U("squareFootage")).as_double();
+        prop.currentRent = body.at(U("currentRent")).as_double();
+        prop.occupancyRate = body.at(U("occupancyRate")).as_double();
+        prop.availableUnits = body.at(U("availableUnits")).as_integer();
+        prop.amenities = body.at(U("amenities")).as_string();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement(
+            "INSERT INTO Properties (name, address, submarket, bedrooms, squareFootage, currentRent, occupancyRate, availableUnits, amenities) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        pstmt->setString(1, prop.name);
+        pstmt->setString(2, prop.address);
+        pstmt->setString(3, prop.submarket);
+        pstmt->setInt(4, prop.bedrooms);
+        pstmt->setDouble(5, prop.squareFootage);
+        pstmt->setDouble(6, prop.currentRent);
+        pstmt->setDouble(7, prop.occupancyRate);
+        pstmt->setInt(8, prop.availableUnits);
+        pstmt->setString(9, prop.amenities);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT LAST_INSERT_ID()"));
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        res->next();
+        prop.propertyId = res->getInt(1);
+
+        response[U("propertyId")] = json::value::number(prop.propertyId);
+        response[U("name")] = json::value::string(prop.name);
+        response[U("address")] = json::value::string(prop.address);
+        response[U("submarket")] = json::value::string(prop.submarket);
+        response[U("bedrooms")] = json::value::number(prop.bedrooms);
+        response[U("squareFootage")] = json::value::number(prop.squareFootage);
+        response[U("currentRent")] = json::value::number(prop.currentRent);
+        response[U("occupancyRate")] = json::value::number(prop.occupancyRate);
+        response[U("availableUnits")] = json::value::number(prop.availableUnits);
+        response[U("amenities")] = json::value::string(prop.amenities);
+        return true;
+    }
+
+    bool getPriceRecommendation(int propertyId, json::value& response) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT * FROM Properties WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (!res->next()) return false;
+
+        Property prop;
+        prop.propertyId = res->getInt("propertyId");
+        prop.currentRent = res->getDouble("currentRent");
+        prop.occupancyRate = res->getDouble("occupancyRate");
+        prop.submarket = res->getString("submarket");
+
+        PriceRecommendation rec = generatePriceRecommendation(prop);
+        response[U("propertyId")] = json::value::number(rec.propertyId);
+        response[U(" recommendedRent")] = json::value::number(rec.recommendedRent);
+        response[U("baseRent")] = json::value::number(rec.baseRent);
+        response[U("isAutoAccepted")] = json::value::boolean(rec.isAutoAccepted);
+        json::value leaseAdjustments = json::value::object();
+        for (const auto& adj : rec.leaseExpirationAdjustments) {
+            leaseAdjustments[std::to_string(adj.first)] = json::value::number(adj.second);
+        }
+        response[U("leaseExpirationAdjustments")] = leaseAdjustments;
+        response[U("marketTrendFactor")] = json::value::number(rec.marketTrendFactor);
+        response[U("occupancyFactor")] = json::value::number(rec.occupancyFactor);
+        response[U("peerRentFactor")] = json::value::number(rec.peerRentFactor);
+        return true;
+    }
+
+private:
+    PriceRecommendation generatePriceRecommendation(const Property& property) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT * FROM PeerProperties WHERE propertyId = ?"));
+        pstmt->setInt(1, property.propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        std::vector<PeerProperty> peers;
+        while (res->next()) {
+            PeerProperty peer;
+            peer.peerId = res->getInt("peerId");
+            peer.propertyId = res->getInt("propertyId");
+            peer.peerSubmarket = res->getString("peerSubmarket");
+            peer.peerRent = res->getDouble("peerRent");
+            peer.peerOccupancy = res->getDouble("peerOccupancy");
+            peer.peerBedrooms = res->getInt("peerBedrooms");
+            peers.push_back(peer);
+        }
+
+        double marketTrend = calculateMarketTrend(peers, property.submarket);
+        double occupancyAdjustment = calculateOccupancyAdjustment(property);
+        double peerRentAdjustment = calculatePeerRentAdjustment(peers, property);
+
+        double baseRent = property.currentRent;
+        double recommendedRent = baseRent * (
+            config.weightMarketTrend * marketTrend +
+            config.weightOccupancy * occupancyAdjustment +
+            config.weightPeerRent * peerRentAdjustment
+        );
+
+        recommendedRent = std::max(
+            baseRent * config.minRentMultiplier,
+            std::min(recommendedRent, baseRent * config.maxRentMultiplier)
+        );
+
+        bool isAutoAccepted = checkAutoAccept(baseRent, recommendedRent);
+        auto leaseExpirations = manageLeaseExpirations(property);
+
+        PriceRecommendation rec;
+        rec.propertyId = property.propertyId;
+        rec.recommendedRent = std::round(recommendedRent * 100) / 100;
+        rec.baseRent = baseRent;
+        rec.isAutoAccepted = isAutoAccepted;
+        rec.leaseExpirationAdjustments = leaseExpirations;
+        rec.marketTrendFactor = marketTrend;
+        rec.occupancyFactor = occupancyAdjustment;
+        rec.peerRentFactor = peerRentAdjustment;
+        return rec;
+    }
+
+    double calculateMarketTrend(const std::vector<PeerProperty>& peers, const std::string& submarket) {
+        if (peers.empty()) return 1.0;
+
+        double totalPeerRent = 0;
+        int count = 0;
+        for (const auto& peer : peers) {
+            std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT AVG(currentRent) FROM Properties WHERE submarket = ?"));
+            pstmt->setString(1, peer.peerSubmarket);
+            std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+            if (res->next() && !res->isNull(1)) {
+                totalPeerRent += peer.peerRent / res->getDouble(1);
+                count++;
+            }
+        }
+        double avgPeerRentChange = count > 0 ? totalPeerRent / count : 1.0;
+        return avgPeerRentChange > 1.0 ? 1.02 : avgPeerRentChange < 1.0 ? 0.98 : 1.0;
+    }
+
+    double calculateOccupancyAdjustment(const Property& property) {
+        double targetOccupancy = 0.95;
+        return property.occupancyRate < targetOccupancy ? 0.95 : property.occupancyRate > targetOccupancy ? 1.05 : 1.0;
+    }
+
+    double calculatePeerRentAdjustment(const std::vector<PeerProperty>& peers, const Property& property) {
+        if (peers.empty()) return 1.0;
+        double avgPeerRent = 0;
+        for (const auto& peer : peers) avgPeerRent += peer.peerRent;
+        avgPeerRent /= peers.size();
+        double rentRatio = avgPeerRent / property.currentRent;
+        return rentRatio > 1.0 ? 1.03 : rentRatio < 1.0 ? 0.97 : 1.0;
+    }
+
+    bool checkAutoAccept(double baseRent, double recommendedRent) {
+        double dailyChange = std::abs((recommendedRent - baseRent) / baseRent);
+        double weeklyChange = dailyChange * 7;
+        return dailyChange <= config.autoAcceptThresholdDaily && weeklyChange <= config.autoAcceptThresholdWeekly;
+    }
+
+    std::map<int, double> manageLeaseExpirations(const Property& property) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT startDate, termMonths FROM Leases WHERE propertyId = ?"));
+        pstmt->setInt(1, property.propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        std::map<int, int> futureSupply;
+        while (res->next()) {
+            std::time_t start = res->getInt64("startDate");
+            int term = res->getInt("termMonths");
+            std::tm* tm = std::localtime(&start);
+            tm->tm_mon += term;
+            std::mktime(tm);
+            futureSupply[tm->tm_mon + 1]++;
+        }
+
+        std::map<int, double> expirations;
+        for (int month = 1; month <= 12; month++) {
+            int supply = futureSupply.count(month) ? futureSupply[month] : 0;
+            double adjustment = supply > 5 ? 1.05 : supply < 2 ? 0.95 : 1.0;
+            expirations[month] = adjustment;
+        }
+        return expirations;
+    }
+
+public:
+    bool addBooking(const json::value& body, json::value& response) {
+        int userId = body.at(U("userId")).as_integer();
+        int propertyId = body.at(U("propertyId")).as_integer();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT availableUnits FROM Properties WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (!res->next() || res->getInt("availableUnits") <= 0) return false;
+
+        pstmt.reset(con->prepareStatement("UPDATE Properties SET availableUnits = availableUnits - 1 WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("INSERT INTO Bookings (userId, propertyId, bookingDate, status) VALUES (?, ?, ?, 'Pending')"));
+        pstmt->setInt(1, userId);
+        pstmt->setInt(2, propertyId);
+        pstmt->setInt64(3, std::time(nullptr));
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT LAST_INSERT_ID()"));
+        res.reset(pstmt->executeQuery());
+        res->next();
+        int bookingId = res->getInt(1);
+
+        response[U("bookingId")] = json::value::number(bookingId);
+        response[U("userId")] = json::value::number(userId);
+        response[U("propertyId")] = json::value::number(propertyId);
+        response[U("bookingDate")] = json::value::number(std::time(nullptr));
+        response[U("status")] = json::value::string(U("Pending"));
+        return true;
+    }
+
+    void getUserBookings(int userId, json::value& response) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement(
+            "SELECT b.*, p.* FROM Bookings b JOIN Properties p ON b.propertyId = p.propertyId WHERE b.userId = ?"));
+        pstmt->setInt(1, userId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        json::value bookings = json::value::array();
+        int index = 0;
+        while (res->next()) {
+            bookings[index][U("bookingId")] = json::value::number(res->getInt("bookingId"));
+            bookings[index][U("userId")] = json::value::number(res->getInt("userId"));
+            bookings[index][U("propertyId")] = json::value::number(res->getInt("propertyId"));
+            bookings[index][U("bookingDate")] = json::value::number(res->getInt64("bookingDate"));
+            bookings[index][U("status")] = json::value::string(res->getString("status"));
+            bookings[index][U("property")][U("propertyId")] = json::value::number(res->getInt("propertyId"));
+            bookings[index][U("property")][U("name")] = json::value::string(res->getString("name"));
+            bookings[index][U("property")][U("address")] = json::value::string(res->getString("address"));
+            bookings[index][U("property")][U("submarket")] = json::value::string(res->getString("submarket"));
+            bookings[index][U("property")][U("bedrooms")] = json::value::number(res->getInt("bedrooms"));
+            bookings[index][U("property")][U("squareFootage")] = json::value::number(res->getDouble("squareFootage"));
+            bookings[index][U("property")][U("currentRent")] = json::value::number(res->getDouble("currentRent"));
+            bookings[index][U("property")][U("occupancyRate")] = json::value::number(res->getDouble("occupancyRate"));
+            bookings[index][U("property")][U("availableUnits")] = json::value::number(res->getInt("availableUnits"));
+            bookings[index][U("property")][U("amenities")] = json::value::string(res->getString("amenities"));
+            index++;
+        }
+        response = bookings;
+    }
+
+    bool confirmBooking(int bookingId, json::value& response) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT * FROM Bookings WHERE bookingId = ?"));
+        pstmt->setInt(1, bookingId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (!res->next()) return false;
+
+        pstmt.reset(con->prepareStatement("UPDATE Bookings SET status = 'Confirmed' WHERE bookingId = ?"));
+        pstmt->setInt(1, bookingId);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT * FROM Bookings WHERE bookingId = ?"));
+        pstmt->setInt(1, bookingId);
+        res.reset(pstmt->executeQuery());
+        res->next();
+        response[U("bookingId")] = json::value::number(res->getInt("bookingId"));
+        response[U("userId")] = json::value::number(res->getInt("userId"));
+        response[U("propertyId")] = json::value::number(res->getInt("propertyId"));
+        response[U("bookingDate")] = json::value::number(res->getInt64("bookingDate"));
+        response[U("status")] = json::value::string(res->getString("status"));
+        return true;
+    }
+
+    bool cancelBooking(int bookingId) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT propertyId FROM Bookings WHERE bookingId = ?"));
+        pstmt->setInt(1, bookingId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (!res->next()) return false;
+        int propertyId = res->getInt("propertyId");
+
+        pstmt.reset(con->prepareStatement("UPDATE Properties SET availableUnits = availableUnits + 1 WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("DELETE FROM Bookings WHERE bookingId = ?"));
+        pstmt->setInt(1, bookingId);
+        pstmt->execute();
+        return true;
+    }
+
+    bool addLease(const json::value& body, json::value& response) {
+        Lease lease;
+        lease.propertyId = body.at(U("propertyId")).as_integer();
+        lease.effectiveRent = body.at(U("effectiveRent")).as_double();
+        lease.termMonths = body.at(U("termMonths")).as_integer();
+        lease.startDate = body.at(U("startDate")).as_integer();
+        lease.discount = body.at(U("discount")).as_double();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement(
+            "INSERT INTO Leases (propertyId, effectiveRent, termMonths, startDate, discount) VALUES (?, ?, ?, ?, ?)"));
+        pstmt->setInt(1, lease.propertyId);
+        pstmt->setDouble(2, lease.effectiveRent);
+        pstmt->setInt(3, lease.termMonths);
+        pstmt->setInt64(4, lease.startDate);
+        pstmt->setDouble(5, lease.discount);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT LAST_INSERT_ID()"));
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        res->next();
+        lease.leaseId = res->getInt(1);
+
+        response[U("leaseId")] = json::value::number(lease.leaseId);
+        response[U("propertyId")] = json::value::number(lease.propertyId);
+        response[U("effectiveRent")] = json::value::number(lease.effectiveRent);
+        response[U("termMonths")] = json::value::number(lease.termMonths);
+        response[U("startDate")] = json::value::number(lease.startDate);
+        response[U("discount")] = json::value::number(lease.discount);
+        return true;
+    }
+
+    void getPropertyLeases(int propertyId, json::value& response) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT * FROM Leases WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        json::value leases = json::value::array();
+        int index = 0;
+        while (res->next()) {
+            leases[index][U("leaseId")] = json::value::number(res->getInt("leaseId"));
+            leases[index][U("propertyId")] = json::value::number(res->getInt("propertyId"));
+            leases[index][U("effectiveRent")] = json::value::number(res->getDouble("effectiveRent"));
+            leases[index][U("termMonths")] = json::value::number(res->getInt("termMonths"));
+            leases[index][U("startDate")] = json::value::number(res->getInt64("startDate"));
+            leases[index][U("discount")] = json::value::number(res->getDouble("discount"));
+            index++;
+        }
+        response = leases;
+    }
+
+    bool addPeerProperty(const json::value& body, json::value& response) {
+        PeerProperty peer;
+        peer.propertyId = body.at(U("propertyId")).as_integer();
+        peer.peerSubmarket = body.at(U("peerSubmarket")).as_string();
+        peer.peerRent = body.at(U("peerRent")).as_double();
+        peer.peerOccupancy = body seis.at(U("peerOccupancy")).as_double();
+        peer.peerBedrooms = body.at(U("peerBedrooms")).as_integer();
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement(
+            "INSERT INTO PeerProperties (propertyId, peerSubmarket, peerRent, peerOccupancy, peerBedrooms) VALUES (?, ?, ?, ?, ?)"));
+        pstmt->setInt(1, peer.propertyId);
+        pstmt->setString(2, peer.peerSubmarket);
+        pstmt->setDouble(3, peer.peerRent);
+        pstmt->setDouble(4, peer.peerOccupancy);
+        pstmt->setInt(5, peer.peerBedrooms);
+        pstmt->execute();
+
+        pstmt.reset(con->prepareStatement("SELECT LAST_INSERT_ID()"));
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        res->next();
+        peer.peerId = res->getInt(1);
+
+        response[U("peerId")] = json::value::number(peer.peerId);
+        response[U("propertyId")] = json::value::number(peer.propertyId);
+        response[U("peerSubmarket")] = json::value::string(peer.peerSubmarket);
+        response[U("peerRent")] = json::value::number(peer.peerRent);
+        response[U("peerOccupancy")] = json::value::number(peer.peerOccupancy);
+        response[U("peerBedrooms")] = json::value::number(peer.peerBedrooms);
+        return true;
+    }
+
+    void getPeerProperties(int propertyId, json::value& response) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(con->prepareStatement("SELECT * FROM PeerProperties WHERE propertyId = ?"));
+        pstmt->setInt(1, propertyId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        json::value peers = json::value::array();
+        int index = 0;
+        while (res->next()) {
+            peers[index][U("peerId")] = json::value::number(res->getInt("peerId"));
+            peers[index][U("propertyId")] = json::value::number(res->getInt("propertyId"));
+            peers[index][U("peerSubmarket")] = json::value::string(res->getString("peerSubmarket"));
+            peers[index][U("peerRent")] = json::value::number(res->getDouble("peerRent"));
+            peers[index][U("peerOccupancy")] = json::value::number(res->getDouble("peerOccupancy"));
+            peers[index][U("peerBedrooms")] = json::value::number(res->getInt("peerBedrooms"));
+            index++;
+        }
+        response = peers;
+    }
+};
+
+int main() {
+    RentalDatabase db;
+    http_listener authListener(U("http://localhost:8080/api/auth"));
+    http_listener propertiesListener(U("http://localhost:8080/api/properties"));
+    http_listener bookingsListener(U("http://localhost:8080/api/bookings"));
+    http_listener leasesListener(U("http://localhost:8080/api/leases"));
+    http_listener peerPropertiesListener(U("http://localhost:8080/api/peerproperties"));
+
+    authListener.support(methods::POST, [&db](http_request request) {
+        if (request.relative_uri().path() == U("/register")) {
+            request.extract_json().then([&db, request](json::value body) {
+                json::value response;
+                if (db.registerUser(body, response)) {
+                    request.reply(status_codes::OK, response);
+                } else {
+                    request.reply(status_codes::BadRequest, U("Username already exists"));
+                }
+            });
+        } else if (request.relative_uri().path() == U("/login")) {
+            request.extract_json().then([&db, request](json::value body) {
+                json::value response;
+                if (db.loginUser(body, response)) {
+                    request.reply(status_codes::OK, response);
+                } else {
+                    request.reply(status_codes::Unauthorized, U("Invalid credentials"));
+                }
+            });
+        }
+    });
+
+    propertiesListener.support(methods::GET, [&db](http_request request) {
+        if (request.relative_uri().path().find(U("/recommendations/")) != std::string::npos) {
+            int propertyId = std::stoi(request.relative_uri().path().substr(16));
+            json::value response;
+            if (db.getPriceRecommendation(propertyId, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::NotFound, U("Property not found"));
+            }
+        } else {
+            json::value response;
+            db.getProperties(request.relative_uri().query_components(), response);
+            request.reply(status_codes::OK, response);
+        }
+    });
+
+    propertiesListener.support(methods::POST, [&db](http_request request) {
+        request.extract_json().then([&db, request](json::value body) {
+            json::value response;
+            if (db.addProperty(body, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::BadRequest);
+            }
+        });
+    });
+
+    bookingsListener.support(methods::POST, [&db](http_request request) {
+        request.extract_json().then([&db, request](json::value body) {
+            json::value response;
+            if (db.addBooking(body, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::BadRequest, U("Property not available"));
+            }
+        });
+    });
+
+    bookingsListener.support(methods::GET, [&db](http_request request) {
+        if (request.relative_uri().path().find(U("/user/")) != std::string::npos) {
+            int userId = std::stoi(request.relative_uri().path().substr(6));
+            json::value response;
+            db.getUserBookings(userId, response);
+            request.reply(status_codes::OK, response);
+        }
+    });
+
+    bookingsListener.support(methods::PUT, [&db](http_request request) {
+        if (request.relative_uri().path().find(U("/confirm")) != std::string::npos) {
+            int bookingId = std::stoi(request.relative_uri().path().substr(1, request.relative_uri().path().find(U("/confirm")) - 1));
+            json::value response;
+            if (db.confirmBooking(bookingId, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::NotFound, U("Booking not found"));
+            }
+        }
+    });
+
+    bookingsListener.support(methods::DEL, [&db](http_request request) {
+        int bookingId = std::stoi(request.relative_uri().path().substr(1));
+        if (db.cancelBooking(bookingId)) {
+            request.reply(status_codes::OK);
+        } else {
+            request.reply(status_codes::NotFound, U("Booking not found"));
+        }
+    });
+
+    leasesListener.support(methods::POST, [&db](http_request request) {
+        request.extract_json().then([&db, request](json::value body) {
+            json::value response;
+            if (db.addLease(body, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::BadRequest);
+            }
+        });
+    });
+
+    leasesListener.support(methods::GET, [&db](http_request request) {
+        if (request.relative_uri().path().find(U("/property/")) != std::string::npos) {
+            int propertyId = std::stoi(request.relative_uri().path().substr(10));
+            json::value response;
+            db.getPropertyLeases(propertyId, response);
+            request.reply(status_codes::OK, response);
+        }
+    });
+
+    peerPropertiesListener.support(methods::POST, [&db](http_request request) {
+        request.extract_json().then([&db, request](json::value body) {
+            json::value response;
+            if (db.addPeerProperty(body, response)) {
+                request.reply(status_codes::OK, response);
+            } else {
+                request.reply(status_codes::BadRequest);
+            }
+        });
+    });
+
+    peerPropertiesListener.support(methods::GET, [&db](http_request request) {
+        if (request.relative_uri().path().find(U("/property/")) != std::string::npos) {
+            int propertyId = std::stoi(request.relative_uri().path().substr(10));
+            json::value response;
+            db.getPeerProperties(propertyId, response);
+            request.reply(status_codes::OK, response);
+        }
+    });
+
+    authListener.open().wait();
+    propertiesListener.open().wait();
+    bookingsListener.open().wait();
+    leasesListener.open().wait();
+    peerPropertiesListener.open().wait();
+
+    std::cout << "Server running on http://localhost:8080\n";
+    std::cin.get();
+
+    authListener.close().wait();
+    propertiesListener.close().wait();
+    bookingsListener.close().wait();
+    leasesListener.close().wait();
+    peerPropertiesListener.close().wait();
+
+    return 0;
+}

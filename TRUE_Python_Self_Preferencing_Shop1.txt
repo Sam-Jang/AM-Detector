@@ -1,0 +1,227 @@
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import mysql.connector
+import json
+from fastapi.responses import JSONResponse
+import os
+
+app = FastAPI()
+
+class Product(BaseModel):
+    id: int
+    name: str
+    price: float
+    discount: float
+    category: str
+    is_preferred_platform: bool
+    stock: int
+    description: str
+
+class CartItem(BaseModel):
+    user_id: int
+    product_id: int
+    quantity: int
+
+class SearchWeights(BaseModel):
+    price_weight: float
+    discount_weight: float
+    platform_weight: float
+    relevance_weight: float
+
+class SearchRequest(BaseModel):
+    keyword: str
+    sort_by: Optional[str] = None
+    category: Optional[str] = None
+    page: int = 1
+    page_size: int = 20
+
+class CartRequest(BaseModel):
+    user_id: int
+    product_id: int
+    quantity: int
+
+def load_search_weights():
+    json_path = "config/weights.json"
+    if not os.path.exists(json_path):
+        return SearchWeights(
+            price_weight=0.3,
+            discount_weight=0.3,
+            platform_weight=0.3,
+            relevance_weight=0.1
+        )
+    with open(json_path, 'r') as f:
+        return SearchWeights(**json.load(f))
+
+def get_db_connection():
+    return mysql.connector.connect(
+        host="localhost",
+        database="shop_mall",
+        user="root",
+        password="securepass"
+    )
+
+weights = load_search_weights()
+
+@app.get("/api/products", response_model=List[Product])
+async def get_products(req: SearchRequest = None):
+    req = req or SearchRequest(keyword="")
+    products = []
+    query = "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE 1=1"
+    params = {}
+    
+    if req.keyword:
+        query += " AND (name LIKE %s OR description LIKE %s)"
+        params["keyword"] = f"%{req.keyword}%"
+    if req.category:
+        query += " AND category = %s"
+        params["category"] = req.category
+    
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, tuple(params.values()) * (2 if req.keyword else 1))
+        products = [Product(**row) for row in cursor]
+        cursor.close()
+    finally:
+        conn.close()
+    
+    ranked_products = rank_products(products, req)
+    paged_products = ranked_products[(req.page - 1) * req.page_size:req.page * req.page_size]
+    return paged_products
+
+def rank_products(products: List[Product], req: SearchRequest) -> List[Product]:
+    if not req.sort_by:
+        return apply_manipulated_ranking(products, req.keyword)
+    
+    sort_by = req.sort_by.lower()
+    if sort_by == "price_asc":
+        return sorted(products, key=lambda p: p.price)
+    elif sort_by == "price_desc":
+        return sorted(products, key=lambda p: p.price, reverse=True)
+    elif sort_by == "discount":
+        return sorted(products, key=lambda p: p.discount, reverse=True)
+    elif sort_by == "recommend":
+        return apply_manipulated_ranking(products, req.keyword)
+    return products
+
+def apply_manipulated_ranking(products: List[Product], keyword: str) -> List[Product]:
+    scored_products = [(p, calculate_product_score(p, keyword)) for p in products]
+    return [p[0] for p in sorted(scored_products, key=lambda x: x[1], reverse=True)]
+
+def calculate_product_score(p: Product, keyword: str) -> float:
+    price_score = normalize_price(p.price, products)
+    discount_score = p.discount / max(p.price, 1)
+    platform_score = 1.0 if p.is_preferred_platform else 0.0
+    relevance_score = calculate_relevance(p, keyword)
+    
+    return (weights.price_weight * price_score +
+            weights.discount_weight * discount_score +
+            weights.platform_weight * platform_score +
+            weights.relevance_weight * relevance_score)
+
+def normalize_price(price: float, products: List[Product]) -> float:
+    if not products:
+        return 0
+    max_price = max(p.price for p in products)
+    min_price = min(p.price for p in products)
+    if max_price == min_price:
+        return 0.5
+    return (max_price - price) / (max_price - min_price)
+
+def calculate_relevance(p: Product, keyword: str) -> float:
+    if not keyword:
+        return 0
+    words = keyword.lower().split()
+    matches = sum(1 for word in words if word in p.name.lower() or word in p.description.lower())
+    return matches / max(len(words), 1)
+
+@app.post("/api/cart/add")
+async def add_to_cart(req: CartRequest):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT stock FROM products WHERE id = %s", (req.product_id,))
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Product not found")
+        stock = result[0]
+        
+        if stock < req.quantity:
+            raise HTTPException(status_code=400, detail="Insufficient stock")
+        
+        query = """
+            INSERT INTO cart (user_id, product_id, quantity)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE quantity = quantity + %s
+        """
+        cursor.execute(query, (req.user_id, req.product_id, req.quantity, req.quantity))
+        conn.commit()
+        cursor.close()
+        return {"message": "Item added to cart"}
+    finally:
+        conn.close()
+
+@app.get("/api/cart/{user_id}", response_model=List[CartItem])
+async def get_cart(user_id: int):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT c.user_id, c.product_id, c.quantity
+            FROM cart c
+            JOIN products p ON c.product_id = p.id
+            WHERE c.user_id = %s
+        """
+        cursor.execute(query, (user_id,))
+        cart_items = [CartItem(**row) for row in cursor]
+        cursor.close()
+        return cart_items
+    finally:
+        conn.close()
+
+@app.delete("/api/cart/remove")
+async def remove_from_cart(req: CartRequest):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        query = "DELETE FROM cart WHERE user_id = %s AND product_id = %s"
+        cursor.execute(query, (req.user_id, req.product_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Item not found in cart")
+        conn.commit()
+        cursor.close()
+        return {"message": "Item removed from cart"}
+    finally:
+        conn.close()
+
+@app.get("/api/categories", response_model=List[str])
+async def get_categories():
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT category FROM products")
+        categories = [row[0] for row in cursor]
+        cursor.close()
+        return categories
+    finally:
+        conn.close()
+
+@app.get("/api/product/{id}", response_model=Product)
+async def get_product_details(id: int):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        query = "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE id = %s"
+        cursor.execute(query, (id,))
+        product = cursor.fetchone()
+        cursor.close()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return Product(**product)
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

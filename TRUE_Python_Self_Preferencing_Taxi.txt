@@ -1,0 +1,374 @@
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from pydantic import BaseModel
+from typing import List, Optional
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+import json
+import math
+import os
+
+app = FastAPI()
+Base = declarative_base()
+engine = create_engine(os.getenv("DATABASE_URL", "sqlite:///taxi.db"))
+SessionLocal = sessionmaker(bind=engine)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True)
+    password_hash = Column(String)
+    email = Column(String)
+    phone = Column(String)
+    role = Column(String)
+
+class Driver(Base):
+    __tablename__ = "drivers"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    is_affiliated = Column(Boolean)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    is_available = Column(Boolean)
+    acceptance_rate = Column(Float)
+    rating = Column(Float)
+
+class Ride(Base):
+    __tablename__ = "rides"
+    id = Column(Integer, primary_key=True)
+    rider_id = Column(Integer, ForeignKey("users.id"))
+    driver_id = Column(Integer, ForeignKey("drivers.id"), nullable=True)
+    start_lat = Column(Float)
+    start_lon = Column(Float)
+    end_lat = Column(Float)
+    end_lon = Column(Float)
+    status = Column(String)
+    request_time = Column(DateTime)
+    accept_time = Column(DateTime, nullable=True)
+    complete_time = Column(DateTime, nullable=True)
+    distance = Column(Float)
+    estimated_fare = Column(Float)
+    rider = relationship("User")
+    driver = relationship("Driver")
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    ride_id = Column(Integer, ForeignKey("rides.id"))
+    amount = Column(Float)
+    status = Column(String)
+    payment_time = Column(DateTime)
+    ride = relationship("Ride")
+
+class RideHistory(Base):
+    __tablename__ = "ride_histories"
+    id = Column(Integer, primary_key=True)
+    rider_id = Column(Integer, ForeignKey("users.id"))
+    driver_id = Column(Integer, ForeignKey("drivers.id"))
+    distance = Column(Float)
+    fare = Column(Float)
+    ride_date = Column(DateTime)
+    rating = Column(Float)
+    rider = relationship("User")
+    driver = relationship("Driver")
+
+Base.metadata.create_all(engine)
+
+class MatchingConfig:
+    def __init__(self):
+        with open(os.getenv("CONFIG_PATH", "config.json")) as f:
+            data = json.load(f)
+            self.max_radius_km = data["MaxRadiusKm"]
+            self.affiliation_weight = data["AffiliationWeight"]
+            self.distance_weight = data["DistanceWeight"]
+            self.acceptance_rate_weight = data["AcceptanceRateWeight"]
+            self.min_distance_km = data["MinDistanceKm"]
+            self.base_fare = data["BaseFare"]
+            self.per_km_fare = data["PerKmFare"]
+            self.night_surcharge = data["NightSurcharge"]
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    email: str
+    phone: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class DriverRegister(BaseModel):
+    name: str
+    is_affiliated: bool
+    latitude: float
+    longitude: float
+
+class LocationUpdate(BaseModel):
+    driver_id: int
+    latitude: float
+    longitude: float
+    is_available: bool
+
+class RideRequest(BaseModel):
+    start_lat: float
+    start_lon: float
+    end_lat: float
+    end_lon: float
+
+class RideComplete(BaseModel):
+    ride_id: int
+
+class RideCancel(BaseModel):
+    ride_id: int
+
+class PaymentProcess(BaseModel):
+    payment_id: int
+
+class RideRating(BaseModel):
+    ride_history_id: int
+    rating: float
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        return user
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat / 2) * math.sin(dLat / 2) + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon / 2) * math.sin(dLon / 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+class RideMatchingService:
+    def __init__(self):
+        self.config = MatchingConfig()
+
+    def calculate_driver_score(self, driver: Driver, distance: float) -> float:
+        affiliation_score = self.config.affiliation_weight if driver.is_affiliated else 0
+        distance_score = (self.config.max_radius_km - distance) / self.config.max_radius_km * self.config.distance_weight
+        acceptance_score = driver.acceptance_rate * self.config.acceptance_rate_weight
+        return affiliation_score + distance_score + acceptance_score
+
+    async def match_driver(self, ride: Ride, db: Session) -> Optional[Driver]:
+        drivers = db.query(Driver).filter(Driver.is_available == True).all()
+        scored_drivers = []
+        for driver in drivers:
+            distance = calculate_distance(ride.start_lat, ride.start_lon, driver.latitude, driver.longitude)
+            if distance > self.config.max_radius_km:
+                continue
+            if distance < self.config.min_distance_km and driver.is_affiliated:
+                continue
+            score = self.calculate_driver_score(driver, distance)
+            scored_drivers.append((driver, score))
+        return max(scored_drivers, key=lambda x: x[1])[0] if scored_drivers else None
+
+class PaymentService:
+    def __init__(self):
+        self.config = MatchingConfig()
+
+    def calculate_fare(self, ride: Ride) -> float:
+        base_fare = self.config.base_fare
+        distance_fare = ride.distance * self.config.per_km_fare
+        night_surcharge = self.config.night_surcharge if 0 <= ride.request_time.hour < 4 else 0
+        return base_fare + distance_fare + night_surcharge
+
+@app.post("/users/register")
+async def register_user(user: UserRegister, db: Session = Depends(get_db)):
+    db_user = User(
+        username=user.username,
+        password_hash=get_password_hash(user.password),
+        email=user.email,
+        phone=user.phone,
+        role="Rider"
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return {"message": "User registered"}
+
+@app.post("/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    access_token = create_access_token(data={"sub": str(user.id), "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/drivers/register")
+async def register_driver(driver: DriverRegister, db: Session = Depends(get_db)):
+    db_driver = Driver(
+        name=driver.name,
+        is_affiliated=driver.is_affiliated,
+        latitude=driver.latitude,
+        longitude=driver.longitude,
+        is_available=True,
+        acceptance_rate=0.0,
+        rating=0.0
+    )
+    db.add(db_driver)
+    db.commit()
+    db.refresh(db_driver)
+    return {"message": "Driver registered"}
+
+@app.post("/drivers/update-location")
+async def update_location(location: LocationUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    driver = db.query(Driver).filter(Driver.id == location.driver_id).first()
+    if not driver:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Driver not found")
+    driver.latitude = location.latitude
+    driver.longitude = location.longitude
+    driver.is_available = location.is_available
+    db.commit()
+    return {"message": "Location updated"}
+
+@app.post("/rides/request")
+async def request_ride(ride_request: RideRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "Rider":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    matching_service = RideMatchingService()
+    payment_service = PaymentService()
+    ride = Ride(
+        rider_id=current_user.id,
+        start_lat=ride_request.start_lat,
+        start_lon=ride_request.start_lon,
+        end_lat=ride_request.end_lat,
+        end_lon=ride_request.end_lon,
+        status="Requested",
+        request_time=datetime.utcnow(),
+        distance=calculate_distance(ride_request.start_lat, ride_request.start_lon, ride_request.end_lat, ride_request.end_lon)
+    )
+    ride.estimated_fare = payment_service.calculate_fare(ride)
+    db.add(ride)
+    db.commit()
+    db.refresh(ride)
+    driver = await matching_service.match_driver(ride, db)
+    if not driver:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No drivers available")
+    ride.driver_id = driver.id
+    ride.status = "Assigned"
+    ride.accept_time = datetime.utcnow()
+    driver.is_available = False
+    db.commit()
+    return {"ride_id": ride.id, "driver_id": driver.id}
+
+@app.post("/rides/complete")
+async def complete_ride(ride_complete: RideComplete, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "Driver":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    ride = db.query(Ride).filter(Ride.id == ride_complete.ride_id).first()
+    if not ride:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ride not found")
+    ride.status = "Completed"
+    ride.complete_time = datetime.utcnow()
+    driver = db.query(Driver).filter(Driver.id == ride.driver_id).first()
+    driver.is_available = True
+    total_rides = db.query(Ride).filter(Ride.driver_id == driver.id).count()
+    accepted_rides = db.query(Ride).filter(Ride.driver_id == driver.id, Ride.status != "Cancelled").count()
+    driver.acceptance_rate = accepted_rides / total_rides if total_rides > 0 else 0.0
+    payment_service = PaymentService()
+    payment = Payment(
+        ride_id=ride.id,
+        amount=payment_service.calculate_fare(ride),
+        status="Pending",
+        payment_time=datetime.utcnow()
+    )
+    db.add(payment)
+    history = RideHistory(
+        rider_id=ride.rider_id,
+        driver_id=ride.driver_id,
+        distance=ride.distance,
+        fare=payment.amount,
+        ride_date=datetime.utcnow(),
+        rating=0.0
+    )
+    db.add(history)
+    db.commit()
+    return {"message": "Ride completed", "payment_id": payment.id}
+
+@app.post("/rides/cancel")
+async def cancel_ride(ride_cancel: RideCancel, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ride = db.query(Ride).filter(Ride.id == ride_cancel.ride_id).first()
+    if not ride:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ride not found")
+    ride.status = "Cancelled"
+    if ride.driver_id:
+        driver = db.query(Driver).filter(Driver.id == ride.driver_id).first()
+        driver.is_available = True
+    db.commit()
+    return {"message": "Ride cancelled"}
+
+@app.post("/payments/process")
+async def process_payment(payment_process: PaymentProcess, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "Rider":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    payment = db.query(Payment).filter(Payment.id == payment_process.payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    payment.status = "Completed"
+    payment.payment_time = datetime.utcnow()
+    db.commit()
+    return {"message": "Payment processed"}
+
+@app.get("/history/rider")
+async def get_rider_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    history = db.query(RideHistory).filter(RideHistory.rider_id == current_user.id).all()
+    return [{"id": rh.id, "driver_name": rh.driver.name, "distance": rh.distance, "fare": rh.fare, "ride_date": rh.ride_date, "rating": rh.rating} for rh in history]
+
+@app.get("/history/driver")
+async def get_driver_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "Driver":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    history = db.query(RideHistory).filter(RideHistory.driver_id == current_user.id).all()
+    return [{"id": rh.id, "rider_username": rh.rider.username, "distance": rh.distance, "fare": rh.fare, "ride_date": rh.ride_date, "rating": rh.rating} for rh in history]
+
+@app.post("/history/rate")
+async def rate_ride(rating: RideRating, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role != "Rider":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    history = db.query(RideHistory).filter(RideHistory.id == rating.ride_history_id).first()
+    if not history:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ride history not found")
+    history.rating = rating.rating
+    driver = db.query(Driver).filter(Driver.id == history.driver_id).first()
+    driver_ratings = db.query(RideHistory).filter(RideHistory.driver_id == driver.id, RideHistory.rating > 0).all()
+    driver.rating = sum(rh.rating for rh in driver_ratings) / len(driver_ratings) if driver_ratings else 0.0
+    db.commit()
+    return {"message": "Rating submitted"}

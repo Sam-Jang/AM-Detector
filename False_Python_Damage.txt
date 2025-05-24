@@ -1,0 +1,47 @@
+import mysql.connector
+
+def get_monster_data(connection, monster_id):
+    cursor = connection.cursor()
+    query = "SELECT Health, Defense FROM Monsters WHERE Id = %s"
+    cursor.execute(query, (monster_id,))
+    result = cursor.fetchone()
+    if result:
+        return result
+    else:
+        raise Exception("Monster not found")
+
+def get_user_data(connection, user_id):
+    cursor = connection.cursor()
+    query = "SELECT AttackPower, ArmorPenetration FROM Users WHERE Id = %s"
+    cursor.execute(query, (user_id,))
+    result = cursor.fetchone()
+    if result:
+        return result
+    else:
+        raise Exception("User not found")
+
+def calculate_damage(attack_power, armor_penetration, monster_defense):
+    effective_defense = max(monster_defense - armor_penetration, 0)
+    damage = max(attack_power - effective_defense, 0)
+    return damage
+
+def main():
+    connection_config = {
+        'host': 'localhost',
+        'database': 'rpg_db',
+        'user': 'root',
+        'password': 'yourpassword'
+    }
+    connection = mysql.connector.connect(**connection_config)
+
+    monster = get_monster_data(connection, monster_id)
+    user = get_user_data(connection, user_id)
+
+    damage = calculate_damage(user[0], user[1], monster[1])
+    print(f"Calculated Damage: {damage}")
+    print(f"Monster's Remaining Health: {max(monster[0] - damage, 0)}")
+
+    connection.close()
+
+if __name__ == "__main__":
+    main()

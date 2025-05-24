@@ -1,0 +1,376 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+
+class Customer
+{
+    public string Username { get; set; }
+    public string Password { get; set; }
+    public string Address { get; set; }
+
+    public Customer(string username, string password, string address)
+    {
+        Username = username;
+        Password = password;
+        Address = address;
+    }
+}
+
+class ProductCategory
+{
+    public string Name { get; set; }
+    public string Description { get; set; }
+
+    public ProductCategory(string name, string description)
+    {
+        Name = name;
+        Description = description;
+    }
+}
+
+class Item
+{
+    public string Name { get; set; }
+    public string Description { get; set; }
+    public double Price { get; set; }
+    public string Category { get; set; }
+    public int Stock { get; set; }
+    public List<string> LikedBy { get; set; }
+
+    public Item(string name, string description, double price, string category, int stock)
+    {
+        Name = name;
+        Description = description;
+        Price = price;
+        Category = category;
+        Stock = stock;
+        LikedBy = new List<string>();
+    }
+}
+
+class Purchase
+{
+    public Customer Buyer { get; set; }
+    public Item Product { get; set; }
+    public int Quantity { get; set; }
+
+    public Purchase(Customer buyer, Item product, int quantity)
+    {
+        Buyer = buyer;
+        Product = product;
+        Quantity = quantity;
+    }
+}
+
+class PromotionBanner
+{
+    public string Title { get; set; }
+    public string Image { get; set; }
+    public string Url { get; set; }
+
+    public PromotionBanner(string title, string image, string url)
+    {
+        Title = title;
+        Image = image;
+        Url = url;
+    }
+}
+
+class OnlineStore
+{
+    private List<Customer> customers = new List<Customer>();
+    private List<ProductCategory> categories = new List<ProductCategory>();
+    private List<Item> items = new List<Item>();
+    private List<PromotionBanner> banners = new List<PromotionBanner>();
+    private List<Purchase> cart = new List<Purchase>();
+    private Customer currentCustomer = null;
+    private string connectionString = "Data Source=localhost;Initial Catalog=everythingforsale;User ID=root;Password=yourpassword";
+
+    public OnlineStore()
+    {
+        LoadCustomers();
+        LoadCategories();
+        LoadItems();
+        LoadBanners();
+    }
+
+    private void LoadCustomers()
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string sql = "SELECT username, password, address FROM customers";
+            using (SqlCommand cmd = new SqlCommand(sql, conn))
+            {
+                SqlDataReader reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    customers.Add(new Customer(reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+                }
+            }
+        }
+    }
+
+    private void LoadCategories()
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string sql = "SELECT name, description FROM categories";
+            using (SqlCommand cmd = new SqlCommand(sql, conn))
+            {
+                SqlDataReader reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    categories.Add(new ProductCategory(reader.GetString(0), reader.GetString(1)));
+                }
+            }
+        }
+    }
+
+    private void LoadItems()
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string sql = "SELECT name, description, price, category, stock FROM items";
+            using (SqlCommand cmd = new SqlCommand(sql, conn))
+            {
+                SqlDataReader reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    items.Add(new Item(reader.GetString(0), reader.GetString(1), reader.GetDouble(2), reader.GetString(3), reader.GetInt32(4)));
+                }
+            }
+        }
+    }
+
+    private void LoadBanners()
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string sql = "SELECT title, image, url FROM banners";
+            using (SqlCommand cmd = new SqlCommand(sql, conn))
+            {
+                SqlDataReader reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    banners.Add(new PromotionBanner(reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+                }
+            }
+        }
+    }
+
+    public bool Login(string username, string password)
+    {
+        foreach (Customer customer in customers)
+        {
+            if (customer.Username == username && customer.Password == password)
+            {
+                currentCustomer = customer;
+                Console.WriteLine("Logged in as " + username);
+                return true;
+            }
+        }
+        Console.WriteLine("Login failed");
+        return false;
+    }
+
+    public void Register(string username, string password, string address)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string sql = "INSERT INTO customers (username, password, address) VALUES (@username, @password, @address)";
+            using (SqlCommand cmd = new SqlCommand(sql, conn))
+            {
+                cmd.Parameters.AddWithValue("@username", username);
+                cmd.Parameters.AddWithValue("@password", password);
+                cmd.Parameters.AddWithValue("@address", address);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        customers.Add(new Customer(username, password, address));
+        Console.WriteLine("Customer registered successfully!");
+    }
+
+    public void SearchItems(string query)
+    {
+        Console.WriteLine("Search results for '" + query + "':");
+        foreach (Item item in items)
+        {
+            if (item.Name.Contains(query) || item.Description.Contains(query))
+            {
+                Console.WriteLine(item.Name + " - " + item.Price + " USD");
+            }
+        }
+    }
+
+    public void FilterItemsByCategory(string category)
+    {
+        Console.WriteLine("Items in category '" + category + "':");
+        foreach (Item item in items)
+        {
+            if (item.Category == category)
+            {
+                Console.WriteLine(item.Name + " - " + item.Price + " USD");
+            }
+        }
+    }
+
+    public void ToggleWishlistItem(string productName)
+    {
+        if (currentCustomer == null)
+        {
+            Console.WriteLine("Please login first.");
+            return;
+        }
+        Item item = items.Find(i => i.Name == productName);
+        if (item != null)
+        {
+            if (item.LikedBy.Contains(currentCustomer.Username))
+            {
+                item.LikedBy.Remove(currentCustomer.Username);
+                Console.WriteLine("Item removed from wishlist.");
+            }
+            else
+            {
+                item.LikedBy.Add(currentCustomer.Username);
+                Console.WriteLine("Item added to wishlist.");
+            }
+        }
+        else
+        {
+            Console.WriteLine("Item not found.");
+        }
+    }
+
+    public void AddToCart(string productName, int quantity)
+    {
+        if (currentCustomer == null)
+        {
+            Console.WriteLine("Please login first.");
+            return;
+        }
+        Item item = items.Find(i => i.Name == productName);
+        if (item != null)
+        {
+            cart.Add(new Purchase(currentCustomer, item, quantity));
+            Console.WriteLine(productName + " added to cart.");
+        }
+        else
+        {
+            Console.WriteLine("Item not found.");
+        }
+    }
+
+    public void ViewCart()
+    {
+        if (currentCustomer == null)
+        {
+            Console.WriteLine("Please login first.");
+            return;
+        }
+        Console.WriteLine("Your Cart:");
+        foreach (Purchase purchase in cart)
+        {
+            if (purchase.Buyer == currentCustomer)
+            {
+                Console.WriteLine(purchase.Product.Name + " - " + purchase.Quantity + " units - " + (purchase.Product.Price * purchase.Quantity) + " USD");
+            }
+        }
+    }
+
+    public void Checkout()
+    {
+        if (currentCustomer == null)
+        {
+            Console.WriteLine("Please login first.");
+            return;
+        }
+        double total = 0;
+        foreach (Purchase purchase in cart)
+        {
+            if (purchase.Buyer == currentCustomer)
+            {
+                total += purchase.Product.Price * purchase.Quantity;
+            }
+        }
+        Console.WriteLine("Total amount to pay: " + total + " USD");
+        Console.WriteLine("Order placed successfully!");
+        cart.RemoveAll(purchase => purchase.Buyer == currentCustomer);
+    }
+
+    public void Run()
+    {
+        string command;
+        do
+        {
+            Console.WriteLine("\nEnter a command (register, login, search, category, wishlist, add, cart, checkout, exit): ");
+            command = Console.ReadLine();
+
+            switch (command)
+            {
+                case "register":
+                    Console.WriteLine("Username: ");
+                    string username = Console.ReadLine();
+                    Console.WriteLine("Password: ");
+                    string password = Console.ReadLine();
+                    Console.WriteLine("Address: ");
+                    string address = Console.ReadLine();
+                    Register(username, password, address);
+                    break;
+                case "login":
+                    Console.WriteLine("Username: ");
+                    username = Console.ReadLine();
+                    Console.WriteLine("Password: ");
+                    password = Console.ReadLine();
+                    Login(username, password);
+                    break;
+                case "search":
+                    Console.WriteLine("Query: ");
+                    string query = Console.ReadLine();
+                    SearchItems(query);
+                    break;
+                case "category":
+                    Console.WriteLine("Category: ");
+                    string category = Console.ReadLine();
+                    FilterItemsByCategory(category);
+                    break;
+                case "wishlist":
+                    Console.WriteLine("Product Name: ");
+                    string productName = Console.ReadLine();
+                    ToggleWishlistItem(productName);
+                    break;
+                case "add":
+                    Console.WriteLine("Product Name: ");
+                    productName = Console.ReadLine();
+                    Console.WriteLine("Quantity: ");
+                    int quantity = int.Parse(Console.ReadLine());
+                    AddToCart(productName, quantity);
+                    break;
+                case "cart":
+                    ViewCart();
+                    break;
+                case "checkout":
+                    Checkout();
+                    break;
+                case "exit":
+                    break;
+                default:
+                    Console.WriteLine("Invalid command.");
+                    break;
+            }
+        } while (command != "exit");
+    }
+}
+
+class EverythingForSale
+{
+    public static void Main(string[] args)
+    {
+        OnlineStore store = new OnlineStore();
+        store.Run();
+    }
+}

@@ -1,0 +1,483 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <map>
+#include <random>
+#include <chrono>
+#include <fstream>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/resultset.h>
+#include <nlohmann/json.hpp>
+#include <openssl/sha.h>
+
+using json = nlohmann::json;
+
+struct GameConfig {
+    std::map<std::string, double> itemPrices;
+    std::map<std::string, int> itemPointReqs;
+    double baseProb;
+    int maxAttempts;
+};
+
+struct User {
+    int id;
+    std::string username;
+    std::string passwordHash;
+    int currency;
+};
+
+struct Item {
+    int id;
+    std::string name;
+    double price;
+    bool isProb;
+};
+
+struct Inventory {
+    int userId;
+    int itemId;
+    int quantity;
+};
+
+struct Transaction {
+    int id;
+    int userId;
+    int itemId;
+    std::string time;
+    double amount;
+};
+
+struct ProbAttempt {
+    int userId;
+    int itemId;
+    int points;
+    int attempts;
+};
+
+class GameServer {
+    std::string dbConnStr = "tcp://localhost:3306";
+    std::string dbUser = "game_user";
+    std::string dbPass = "secure_pwd";
+    std::string dbName = "game_db";
+    std::string configPath = "game_config.json";
+    GameConfig config;
+    sql::mysql::MySQL_Driver* driver;
+    std::unique_ptr<sql::Connection> conn;
+
+    std::string hashPassword(const std::string& password) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_CTX sha256;
+        SHA256_Init(&sha256);
+        SHA256_Update(&sha256, password.c_str(), password.length());
+        SHA256_Final(hash, &sha256);
+        std::stringstream ss;
+        for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i)
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        return ss.str();
+    }
+
+    void initDb() {
+        conn = std::unique_ptr<sql::Connection>(driver->connect(dbConnStr, dbUser, dbPass));
+        conn->setSchema(dbName);
+        std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+        stmt->execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id INT AUTO_INCREMENT PRIMARY KEY,"
+            "username VARCHAR(50) UNIQUE,"
+            "password_hash VARCHAR(256),"
+            "currency INT DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS items ("
+            "id INT AUTO_INCREMENT PRIMARY KEY,"
+            "name VARCHAR(100),"
+            "price DOUBLE,"
+            "is_prob BOOLEAN);"
+            "CREATE TABLE IF NOT EXISTS inventory ("
+            "user_id INT,"
+            "item_id INT,"
+            "quantity INT,"
+            "PRIMARY KEY (user_id, item_id),"
+            "FOREIGN KEY (user_id) REFERENCES users(id),"
+            "FOREIGN KEY (item_id) REFERENCES items(id));"
+            "CREATE TABLE IF NOT EXISTS transactions ("
+            "id INT AUTO_INCREMENT PRIMARY KEY,"
+            "user_id INT,"
+            "item_id INT,"
+            "time DATETIME,"
+            "amount DOUBLE,"
+            "FOREIGN KEY (user_id) REFERENCES users(id),"
+            "FOREIGN KEY (item_id) REFERENCES items(id));"
+            "CREATE TABLE IF NOT EXISTS prob_attempts ("
+            "user_id INT,"
+            "item_id INT,"
+            "points INT DEFAULT 0,"
+            "attempts INT DEFAULT 0,"
+            "PRIMARY KEY (user_id, item_id),"
+            "FOREIGN KEY (user_id) REFERENCES users(id),"
+            "FOREIGN KEY (item_id) REFERENCES items(id));"
+        );
+    }
+
+    User loginUser() {
+        std::string username, password;
+        std::cout << "Username: ";
+        std::getline(std::cin, username);
+        std::cout << "Password: ";
+        std::getline(std::cin, password);
+        std::string pwdHash = hashPassword(password);
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT id, username, currency FROM users WHERE username = ? AND password_hash = ?"));
+        pstmt->setString(1, username);
+        pstmt->setString(2, pwdHash);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+
+        if (res->next()) {
+            User user;
+            user.id = res->getInt("id");
+            user.username = res->getString("username");
+            user.currency = res->getInt("currency");
+            std::cout << "Logged in as " << user.username << ". Currency: " << user.currency << "\n";
+            return user;
+        }
+        std::cout << "Invalid credentials.\n";
+        return User{0, "", "", 0};
+    }
+
+    void registerUser() {
+        std::string username, password;
+        std::cout << "Username: ";
+        std::getline(std::cin, username);
+        std::cout << "Password: ";
+        std::getline(std::cin, password);
+        std::string pwdHash = hashPassword(password);
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "INSERT INTO users (username, password_hash, currency) VALUES (?, ?, 1000)"));
+        pstmt->setString(1, username);
+        pstmt->setString(2, pwdHash);
+        pstmt->executeUpdate();
+        std::cout << "User registered.\n";
+    }
+
+    std::vector<Item> getItems() {
+        std::vector<Item> items;
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT id, name, price, is_prob FROM items"));
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        while (res->next()) {
+            Item item;
+            item.id = res->getInt("id");
+            item.name = res->getString("name");
+            item.price = res->getDouble("price");
+            item.isProb = res->getBoolean("is_prob");
+            items.push_back(item);
+        }
+        return items;
+    }
+
+    void purchaseItem(const User& user, const Item& item) {
+        conn->setAutoCommit(false);
+        try {
+            std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+                "UPDATE users SET currency = currency - ? WHERE id = ?"));
+            pstmt->setDouble(1, item.price);
+            pstmt->setInt(2, user.id);
+            pstmt->executeUpdate();
+
+            pstmt = std::unique_ptr<sql::PreparedStatement>(conn->prepareStatement(
+                "INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, 1) "
+                "ON DUPLICATE KEY UPDATE quantity = quantity + 1"));
+            pstmt->setInt(1, user.id);
+            pstmt->setInt(2, item.id);
+            pstmt->executeUpdate();
+
+            pstmt = std::unique_ptr<sql::PreparedStatement>(conn->prepareStatement(
+                "INSERT INTO transactions (user_id, item_id, time, amount) VALUES (?, ?, NOW(), ?)"));
+            pstmt->setInt(1, user.id);
+            pstmt->setInt(2, item.id);
+            pstmt->setDouble(3, item.price);
+            pstmt->executeUpdate();
+
+            conn->commit();
+            std::cout << "Purchased " << item.name << ".\n";
+        } catch (sql::SQLException& e) {
+            conn->rollback();
+            std::cout << "Purchase failed.\n";
+        }
+        conn->setAutoCommit(true);
+    }
+
+    void shopMenu() {
+        User user = loginUser();
+        if (user.id == 0) return;
+
+        auto items = getItems();
+        std::cout << "Shop Items:\n";
+        for (const auto& item : items)
+            std::cout << "ID: " << item.id << ", Name: " << item.name << ", Price: " << item.price
+                      << ", Probabilistic: " << (item.isProb ? "true" : "false") << "\n";
+
+        std::cout << "Enter item ID to purchase: ";
+        std::string input;
+        std::getline(std::cin, input);
+        int itemId;
+        try {
+            itemId = std::stoi(input);
+        } catch (...) {
+            std::cout << "Invalid item ID.\n";
+            return;
+        }
+
+        auto it = std::find_if(items.begin(), items.end(), [itemId](const Item& i) { return i.id == itemId; });
+        if (it == items.end()) {
+            std::cout << "Invalid item ID.\n";
+            return;
+        }
+
+        if (user.currency < it->price) {
+            std::cout << "Insufficient currency.\n";
+            return;
+        }
+
+        purchaseItem(user, *it);
+    }
+
+    void viewInventory() {
+        User user = loginUser();
+        if (user.id == 0) return;
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = ?"));
+        pstmt->setInt(1, user.id);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        std::cout << "Inventory:\n";
+        while (res->next())
+            std::cout << "Item: " << res->getString("name") << ", Quantity: " << res->getInt("quantity") << "\n";
+    }
+
+    void searchItems() {
+        std::string keyword;
+        std::cout << "Search keyword: ";
+        std::getline(std::cin, keyword);
+        std::cout << "Sort by: 1: Price Asc, 2: Price Desc, 3: Name Asc, 4: Name Desc\n";
+        std::string sortChoice;
+        std::getline(std::cin, sortChoice);
+
+        std::string sortSql;
+        if (sortChoice == "1") sortSql = "ORDER BY price ASC";
+        else if (sortChoice == "2") sortSql = "ORDER BY price DESC";
+        else if (sortChoice == "3") sortSql = "ORDER BY name ASC";
+        else if (sortChoice == "4") sortSql = "ORDER BY name DESC";
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT id, name, price, is_prob FROM items WHERE name LIKE ? " + sortSql));
+        pstmt->setString(1, "%" + keyword + "%");
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        std::cout << "Search Results:\n";
+        while (res->next())
+            std::cout << "ID: " << res->getInt("id") << ", Name: " << res->getString("name")
+                      << ", Price: " << res->getDouble("price")
+                      << ", Probabilistic: " << (res->getBoolean("is_prob") ? "true" : "false") << "\n";
+    }
+
+    void viewHistory() {
+        User user = loginUser();
+        if (user.id == 0) return;
+
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT i.name, t.time, t.amount FROM transactions t JOIN items i ON t.item_id = i.id "
+            "WHERE t.user_id = ? ORDER BY t.time DESC"));
+        pstmt->setInt(1, user.id);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        std::cout << "Transaction History:\n";
+        while (res->next())
+            std::cout << "Item: " << res->getString("name") << ", Time: " << res->getString("time")
+                      << ", Amount: " << res->getDouble("amount") << "\n";
+    }
+
+    std::vector<Inventory> getInventoryItems(int userId) {
+        std::vector<Inventory> items;
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT inv.item_id, i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id "
+            "WHERE inv.user_id = ?"));
+        pstmt->setInt(1, userId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        while (res->next()) {
+            Inventory inv;
+            inv.itemId = res->getInt("item_id");
+            inv.quantity = res->getInt("quantity");
+            items.push_back(inv);
+        }
+        return items;
+    }
+
+    Item getItemDetails(int itemId) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT id, name, price, is_prob FROM items WHERE id = ?"));
+        pstmt->setInt(1, itemId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (res->next()) {
+            Item item;
+            item.id = res->getInt("id");
+            item.name = res->getString("name");
+            item.price = res->getDouble("price");
+            item.isProb = res->getBoolean("is_prob");
+            return item;
+        }
+        return Item{0, "", 0.0, false};
+    }
+
+    void processRegularItem(const User& user, const Item& item) {
+        conn->setAutoCommit(false);
+        try {
+            std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+                "UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ? AND quantity > 0"));
+            pstmt->setInt(1, user.id);
+            pstmt->setInt(2, item.id);
+            int rows = pstmt->executeUpdate();
+            if (rows == 0) {
+                std::cout << "Failed to use item.\n";
+                conn->rollback();
+                return;
+            }
+            conn->commit();
+            std::cout << "Used " << item.name << ". Effect applied.\n";
+        } catch (sql::SQLException& e) {
+            conn->rollback();
+            std::cout << "Failed to use item.\n";
+        }
+        conn->setAutoCommit(true);
+    }
+
+    ProbAttempt getOrCreateAttempt(int userId, int itemId) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "SELECT points, attempts FROM prob_attempts WHERE user_id = ? AND item_id = ?"));
+        pstmt->setInt(1, userId);
+        pstmt->setInt(2, itemId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        if (res->next()) {
+            return ProbAttempt{userId, itemId, res->getInt("points"), res->getInt("attempts")};
+        }
+        return ProbAttempt{userId, itemId, 0, 0};
+    }
+
+    void processProbItem(const User& user, const Item& item) {
+        auto attempt = getOrCreateAttempt(user.id, item.id);
+        attempt.attempts++;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(1, 10);
+        attempt.points += dis(gen);
+
+        int reqPoints = config.itemPointReqs.count(item.name) ? config.itemPointReqs[item.name] : 50;
+        bool success = attempt.points >= reqPoints;
+
+        if (!success && attempt.attempts >= config.maxAttempts) {
+            std::uniform_real_distribution<> probDis(0.0, 1.0);
+            success = probDis(gen) < config.baseProb;
+        }
+
+        conn->setAutoCommit(false);
+        try {
+            std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+                "UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ? AND quantity > 0"));
+            pstmt->setInt(1, user.id);
+            pstmt->setInt(2, item.id);
+            int rows = pstmt->executeUpdate();
+            if (rows == 0) {
+                std::cout << "Failed to use item.\n";
+                conn->rollback();
+                return;
+            }
+
+            pstmt = std::unique_ptr<sql::PreparedStatement>(conn->prepareStatement(
+                "INSERT INTO prob_attempts (user_id, item_id, points, attempts) VALUES (?, ?, ?, ?) "
+                "ON DUPLICATE KEY UPDATE points = ?, attempts = ?"));
+            pstmt->setInt(1, user.id);
+            pstmt->setInt(2, item.id);
+            pstmt->setInt(3, attempt.points);
+            pstmt->setInt(4, attempt.attempts);
+            pstmt->setInt(5, attempt.points);
+            pstmt->setInt(6, attempt.attempts);
+            pstmt->executeUpdate();
+
+            conn->commit();
+            std::cout << (success ? "Success! " + item.name + " unlocked reward.\n" : "Failed to unlock reward.\n");
+        } catch (sql::SQLException& e) {
+            conn->rollback();
+            std::cout << "Failed to use item.\n";
+        }
+        conn->setAutoCommit(true);
+    }
+
+    void useItem() {
+        User user = loginUser();
+        if (user.id == 0) return;
+
+        auto invItems = getInventoryItems(user.id);
+        std::cout << "Your Items:\n";
+        for (const auto& item : invItems) {
+            auto itemDetails = getItemDetails(item.itemId);
+            std::cout << "ID: " << item.itemId << ", Name: " << itemDetails.name << ", Quantity: " << item.quantity << "\n";
+        }
+
+        std::cout << "Enter item ID to use: ";
+        std::string input;
+        std::getline(std::cin, input);
+        int itemId;
+        try {
+            itemId = std::stoi(input);
+        } catch (...) {
+            std::cout << "Invalid item ID.\n";
+            return;
+        }
+
+        auto it = std::find_if(invItems.begin(), invItems.end(), [itemId](const Inventory& i) { return i.itemId == itemId; });
+        if (it == invItems.end() || it->quantity == 0) {
+            std::cout << "Invalid item or insufficient quantity.\n";
+            return;
+        }
+
+        auto itemDetails = getItemDetails(itemId);
+        if (itemDetails.isProb)
+            processProbItem(user, itemDetails);
+        else
+            processRegularItem(user, itemDetails);
+    }
+
+public:
+    GameServer() {
+        std::ifstream file(configPath);
+        json j;
+        file >> j;
+        config.itemPrices = j["ItemPrices"].get<std::map<std::string, double>>();
+        config.itemPointReqs = j["ItemPointReqs"].get<std::map<std::string, int>>();
+        config.baseProb = j["BaseProb"];
+        config.maxAttempts = j["MaxAttempts"];
+        driver = sql::mysql::get_mysql_driver_instance();
+        initDb();
+    }
+
+    void run() {
+        while (true) {
+            std::cout << "1: Register, 2: Login, 3: Shop, 4: Inventory, 5: Search, 6: History, 7: Use Item\n";
+            std::string choice;
+            std::getline(std::cin, choice);
+            if (choice == "1") registerUser();
+            else if (choice == "2") loginUser();
+            else if (choice == "3") shopMenu();
+            else if (choice == "4") viewInventory();
+            else if (choice == "5") searchItems();
+            else if (choice == "6") viewHistory();
+            else if (choice == "7") useItem();
+        }
+    }
+};
+
+int main() {
+    GameServer server;
+    server.run();
+    return 0;
+}

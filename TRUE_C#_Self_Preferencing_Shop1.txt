@@ -1,0 +1,443 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using MySql.Data.MySqlClient;
+using System.Text.Json;
+using System.IO;
+using System.ComponentModel.DataAnnotations;
+
+namespace ShoppingMall
+{
+    public class Product
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public decimal Price { get; set; }
+        public decimal Discount { get; set; }
+        public string Category { get; set; }
+        public bool IsPreferredPlatform { get; set; }
+        public int Stock { get; set; }
+        public string Description { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int UserId { get; set; }
+        public int ProductId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class SearchWeights
+    {
+        public double PriceWeight { get; set; }
+        public double DiscountWeight { get; set; }
+        public double PlatformWeight { get; set; }
+        public double RelevanceWeight { get; set; }
+    }
+
+    public class SearchRequest
+    {
+        [Required]
+        public string Keyword { get; set; }
+        public string SortBy { get; set; }
+        public string Category { get; set; }
+        public int Page { get; set; } = 1;
+        public int PageSize { get; set; } = 20;
+    }
+
+    public class CartRequest
+    {
+        [Required]
+        public int UserId { get; set; }
+        [Required]
+        public int ProductId { get; set; }
+        [Required]
+        public int Quantity { get; set; }
+    }
+
+    [ApiController]
+    [Route("api")]
+    public class ShoppingController : ControllerBase
+    {
+        private readonly ILogger<ShoppingController> _logger;
+        private readonly string _connString;
+        private readonly SearchWeights _weights;
+
+        public ShoppingController(ILogger<ShoppingController> logger)
+        {
+            _logger = logger;
+            _connString = "Server=localhost;Database=shop_mall;Uid=root;Pwd=securepass;";
+            _weights = LoadSearchWeights();
+        }
+
+        private SearchWeights LoadSearchWeights()
+        {
+            string jsonPath = "config/weights.json";
+            if (!System.IO.File.Exists(jsonPath))
+            {
+                return new SearchWeights
+                {
+                    PriceWeight = 0.3,
+                    DiscountWeight = 0.3,
+                    PlatformWeight = 0.3,
+                    RelevanceWeight = 0.1
+                };
+            }
+            string json = System.IO.File.ReadAllText(jsonPath);
+            return JsonSerializer.Deserialize<SearchWeights>(json);
+        }
+
+        private MySqlConnection GetDbConnection()
+        {
+            return new MySqlConnection(_connString);
+        }
+
+        [HttpGet("products")]
+        public async Task<IActionResult> GetProducts([FromQuery] SearchRequest req)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            List<Product> products = new List<Product>();
+            string query = BuildProductQuery(req);
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                using (var cmd = new MySqlCommand(query, conn))
+                {
+                    AddQueryParameters(cmd, req);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            products.Add(new Product
+                            {
+                                Id = reader.GetInt32("id"),
+                                Name = reader.GetString("name"),
+                                Price = reader.GetDecimal("price"),
+                                Discount = reader.GetDecimal("discount"),
+                                Category = reader.GetString("category"),
+                                IsPreferredPlatform = reader.GetBoolean("is_preferred"),
+                                Stock = reader.GetInt32("stock"),
+                                Description = reader.GetString("description")
+                            });
+                        }
+                    }
+                }
+            }
+
+            var rankedProducts = RankProducts(products, req);
+            var pagedProducts = rankedProducts
+                .Skip((req.Page - 1) * req.PageSize)
+                .Take(req.PageSize)
+                .ToList();
+
+            return Ok(pagedProducts);
+        }
+
+        private string BuildProductQuery(SearchRequest req)
+        {
+            string query = "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE 1=1";
+            if (!string.IsNullOrEmpty(req.Keyword))
+            {
+                query += " AND (name LIKE @keyword OR description LIKE @keyword)";
+            }
+            if (!string.IsNullOrEmpty(req.Category))
+            {
+                query += " AND category = @category";
+            }
+            return query;
+        }
+
+        private void AddQueryParameters(MySqlCommand cmd, SearchRequest req)
+        {
+            if (!string.IsNullOrEmpty(req.Keyword))
+            {
+                cmd.Parameters.AddWithValue("@keyword", $"%{req.Keyword}%");
+            }
+            if (!string.IsNullOrEmpty(req.Category))
+            {
+                cmd.Parameters.AddWithValue("@category", req.Category);
+            }
+        }
+
+        private List<Product> RankProducts(List<Product> products, SearchRequest req)
+        {
+            if (string.IsNullOrEmpty(req.SortBy))
+            {
+                return ApplyManipulatedRanking(products, req.Keyword);
+            }
+
+            switch (req.SortBy.ToLower())
+            {
+                case "price_asc":
+                    return products.OrderBy(p => p.Price).ToList();
+                case "price_desc":
+                    return products.OrderByDescending(p => p.Price).ToList();
+                case "discount":
+                    return products.OrderByDescending(p => p.Discount).ToList();
+                case "recommend":
+                    return ApplyManipulatedRanking(products, req.Keyword);
+                default:
+                    return products;
+            }
+        }
+
+        private List<Product> ApplyManipulatedRanking(List<Product> products, string keyword)
+        {
+            var scoredProducts = products.Select(p => new
+            {
+                Product = p,
+                Score = CalculateProductScore(p, keyword)
+            }).OrderByDescending(x => x.Score).Select(x => x.Product).ToList();
+            return scoredProducts;
+        }
+
+        private double CalculateProductScore(Product p, string keyword)
+        {
+            double priceScore = NormalizePrice(p.Price, products: new List<Product> { p });
+            double discountScore = p.Discount / Math.Max(p.Price, 1);
+            double platformScore = p.IsPreferredPlatform ? 1.0 : 0.0;
+            double relevanceScore = CalculateRelevance(p, keyword);
+
+            return (_weights.PriceWeight * priceScore) +
+                   (_weights.DiscountWeight * discountScore) +
+                   (_weights.PlatformWeight * platformScore) +
+                   (_weights.RelevanceWeight * relevanceScore);
+        }
+
+        private double NormalizePrice(decimal price, List<Product> products)
+        {
+            if (!products.Any()) return 0;
+            decimal maxPrice = products.Max(p => p.Price);
+            decimal minPrice = products.Min(p => p.Price);
+            if (maxPrice == minPrice) return 0.5;
+            return (double)((maxPrice - price) / (maxPrice - minPrice));
+        }
+
+        private double CalculateRelevance(Product p, string keyword)
+        {
+            if (string.IsNullOrEmpty(keyword)) return 0;
+            int matches = 0;
+            string[] words = keyword.ToLower().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var word in words)
+            {
+                if (p.Name.ToLower().Contains(word) || p.Description.ToLower().Contains(word))
+                {
+                    matches++;
+                }
+            }
+            return (double)matches / Math.Max(words.Length, 1);
+        }
+
+        [HttpPost("cart/add")]
+        public async Task<IActionResult> AddToCart([FromBody] CartRequest req)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                string checkStockQuery = "SELECT stock FROM products WHERE id = @pid";
+                int stock = 0;
+                using (var cmd = new MySqlCommand(checkStockQuery, conn))
+                {
+                    cmd.Parameters.AddWithValue("@pid", req.ProductId);
+                    var result = await cmd.ExecuteScalarAsync();
+                    if (result == null)
+                    {
+                        return NotFound("Product not found");
+                    }
+                    stock = Convert.ToInt32(result);
+                }
+
+                if (stock < req.Quantity)
+                {
+                    return BadRequest("Insufficient stock");
+                }
+
+                string upsertQuery = @"
+                    INSERT INTO cart (user_id, product_id, quantity)
+                    VALUES (@uid, @pid, @qty)
+                    ON DUPLICATE KEY UPDATE quantity = quantity + @qty";
+                using (var cmd = new MySqlCommand(upsertQuery, conn))
+                {
+                    cmd.Parameters.AddWithValue("@uid", req.UserId);
+                    cmd.Parameters.AddWithValue("@pid", req.ProductId);
+                    cmd.Parameters.AddWithValue("@qty", req.Quantity);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+
+            return Ok("Item added to cart");
+        }
+
+        [HttpGet("cart/{userId}")]
+        public async Task<IActionResult> GetCart(int userId)
+        {
+            List<CartItem> cartItems = new List<CartItem>();
+            string query = @"
+                SELECT c.user_id, c.product_id, c.quantity
+                FROM cart c
+                JOIN products p ON c.product_id = p.id
+                WHERE c.user_id = @uid";
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                using (var cmd = new MySqlCommand(query, conn))
+                {
+                    cmd.Parameters.AddWithValue("@uid", userId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            cartItems.Add(new CartItem
+                            {
+                                UserId = reader.GetInt32("user_id"),
+                                ProductId = reader.GetInt32("product_id"),
+                                Quantity = reader.GetInt32("quantity")
+                            });
+                        }
+                    }
+                }
+            }
+
+            return Ok(cartItems);
+        }
+
+        [HttpDelete("cart/remove")]
+        public async Task<IActionResult> RemoveFromCart([FromBody] CartRequest req)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                string query = "DELETE FROM cart WHERE user_id = @uid AND product_id = @pid";
+                using (var cmd = new MySqlCommand(query, conn))
+                {
+                    cmd.Parameters.AddWithValue("@uid", req.UserId);
+                    cmd.Parameters.AddWithValue("@pid", req.ProductId);
+                    int rowsAffected = await cmd.ExecuteNonQueryAsync();
+                    if (rowsAffected == 0)
+                    {
+                        return NotFound("Item not found in cart");
+                    }
+                }
+            }
+
+            return Ok("Item removed from cart");
+        }
+
+        [HttpGet("categories")]
+        public async Task<IActionResult> GetCategories()
+        {
+            List<string> categories = new List<string>();
+            string query = "SELECT DISTINCT category FROM products";
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                using (var cmd = new MySqlCommand(query, conn))
+                {
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            categories.Add(reader.GetString("category"));
+                        }
+                    }
+                }
+            }
+
+            return Ok(categories);
+        }
+
+        [HttpGet("product/{id}")]
+        public async Task<IActionResult> GetProductDetails(int id)
+        {
+            Product product = null;
+            string query = "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE id = @id";
+            using (var conn = GetDbConnection())
+            {
+                await conn.OpenAsync();
+                using (var cmd = new MySqlCommand(query, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", id);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        if (await reader.ReadAsync())
+                        {
+                            product = new Product
+                            {
+                                Id = reader.GetInt32("id"),
+                                Name = reader.GetString("name"),
+                                Price = reader.GetDecimal("price"),
+                                Discount = reader.GetDecimal("discount"),
+                                Category = reader.GetString("category"),
+                                IsPreferredPlatform = reader.GetBoolean("is_preferred"),
+                                Stock = reader.GetInt32("stock"),
+                                Description = reader.GetString("description")
+                            };
+                        }
+                    }
+                }
+            }
+
+            if (product == null)
+            {
+                return NotFound("Product not found");
+            }
+
+            return Ok(product);
+        }
+    }
+
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            CreateHostBuilder(args).Build().Run();
+        }
+
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+            Host.CreateDefaultBuilder(args)
+                .ConfigureWebHostDefaults(webBuilder =>
+                {
+                    webBuilder.UseStartup<Startup>();
+                });
+    }
+
+    public class Startup
+    {
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.AddControllers();
+            services.AddLogging();
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllers();
+            });
+        }
+    }
+}

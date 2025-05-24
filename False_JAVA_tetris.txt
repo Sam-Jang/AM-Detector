@@ -1,0 +1,139 @@
+import java.util.Scanner;
+import java.util.Timer;
+import java.util.TimerTask;
+
+public class Tetris {
+    static int[][] grid = new int[20][10];
+    static int[][] tetromino;
+    static int tetrominoRow = 0;
+    static int tetrominoCol = 4;
+
+    public static void main(String[] args) {
+        spawnTetromino();
+        Timer timer = new Timer();
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                moveTetromino(0, 1);
+                drawGrid();
+            }
+        }, 0, 500);
+
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            String input = scanner.nextLine();
+            switch (input) {
+                case "a":
+                    moveTetromino(-1, 0);
+                    break;
+                case "d": 
+                    moveTetromino(1, 0);
+                    break;
+                case "s": 
+                    moveTetromino(0, 1);
+                    break;
+                case " ":
+                    rotateTetromino();
+                    break;
+            }
+            drawGrid();
+        }
+    }
+
+    public static void spawnTetromino() {
+        tetromino = new int[][] {{1, 1, 1, 1}};
+        tetrominoRow = 0;
+        tetrominoCol = 3;
+    }
+
+    public static void moveTetromino(int dx, int dy) {
+        int newRow = tetrominoRow + dy;
+        int newCol = tetrominoCol + dx;
+        if (isValidMove(newRow, newCol)) {
+            tetrominoRow = newRow;
+            tetrominoCol = newCol;
+        } else if (dy == 1) {
+            mergeTetromino();
+            clearFullRows();
+            spawnTetromino();
+        }
+    }
+
+    public static boolean isValidMove(int row, int col) {
+        for (int r = 0; r < tetromino.length; r++) {
+            for (int c = 0; c < tetromino[0].length; c++) {
+                if (tetromino[r][c] == 1) {
+                    int newRow = row + r;
+                    int newCol = col + c;
+                    if (newRow < 0 || newRow >= grid.length || newCol < 0 || newCol >= grid[0].length || grid[newRow][newCol] == 1) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    public static void mergeTetromino() {
+        for (int r = 0; r < tetromino.length; r++) {
+            for (int c = 0; c < tetromino[0].length; c++) {
+                if (tetromino[r][c] == 1) {
+                    grid[tetrominoRow + r][tetrominoCol + c] = 1;
+                }
+            }
+        }
+    }
+
+    public static void clearFullRows() {
+        int[][] newGrid = new int[20][10];
+        int newRow = 19;
+        for (int r = 19; r >= 0; r--) {
+            boolean fullRow = true;
+            for (int c = 0; c < 10; c++) {
+                if (grid[r][c] == 0) {
+                    fullRow = false;
+                    break;
+                }
+            }
+            if (!fullRow) {
+                newGrid[newRow--] = grid[r];
+            }
+        }
+        grid = newGrid;
+    }
+
+    public static void rotateTetromino() {
+        int[][] rotated = new int[tetromino[0].length][tetromino.length];
+        for (int r = 0; r < tetromino.length; r++) {
+            for (int c = 0; c < tetromino[0].length; c++) {
+                rotated[c][tetromino.length - 1 - r] = tetromino[r][c];
+            }
+        }
+
+        if (isValidMove(tetrominoRow, tetrominoCol)) {
+            tetromino = rotated;
+        }
+    }
+
+    public static void drawGrid() {
+        for (int r = 0; r < grid.length; r++) {
+            for (int c = 0; c < grid[0].length; c++) {
+                boolean isTetrominoPart = false;
+                for (int tr = 0; tr < tetromino.length; tr++) {
+                    for (int tc = 0; tc < tetromino[0].length; tc++) {
+                        if (tetromino[tr][tc] == 1 && tetrominoRow + tr == r && tetrominoCol + tc == c) {
+                            isTetrominoPart = true;
+                        }
+                    }
+                }
+                if (grid[r][c] == 1 || isTetrominoPart) {
+                    System.out.print("#");
+                } else {
+                    System.out.print(".");
+                }
+            }
+            System.out.println();
+        }
+        System.out.println();
+    }
+}

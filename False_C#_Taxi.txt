@@ -1,0 +1,68 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class Taxi {
+    public string TaxiId { get; }
+    public (double X, double Y) Location { get; }
+    public bool Available { get; set; }
+
+    public Taxi(string taxiId, double x, double y) {
+        TaxiId = taxiId;
+        Location = (x, y);
+        Available = true;
+    }
+
+    public double DistanceToRequest((double X, double Y) requestLocation) {
+        return Math.Sqrt(Math.Pow(Location.X - requestLocation.X, 2) + Math.Pow(Location.Y - requestLocation.Y, 2));
+    }
+}
+
+class Request {
+    public string RequestId { get; }
+    public (double X, double Y) Location { get; }
+
+    public Request(string requestId, double x, double y) {
+        RequestId = requestId;
+        Location = (x, y);
+    }
+}
+
+class TaxiDispatchSystem {
+    private List<Taxi> taxis = new List<Taxi>();
+    private List<Request> requests = new List<Request>();
+
+    public void AddTaxi(Taxi taxi) {
+        taxis.Add(taxi);
+    }
+
+    public void AddRequest(Request request) {
+        requests.Add(request);
+        DispatchRequest(request);
+    }
+
+    private void DispatchRequest(Request request) {
+        if (!taxis.Any()) {
+            Console.WriteLine($"No taxis available for request {request.RequestId}");
+            return;
+        }
+
+        var availableTaxis = taxis.Where(t => t.Available)
+                                  .OrderBy(t => t.DistanceToRequest(request.Location))
+                                  .ToList();
+
+        if (!availableTaxis.Any()) {
+            Console.WriteLine($"No available taxis for request {request.RequestId}");
+            return;
+        }
+
+        var closestTaxi = availableTaxis.First();
+        closestTaxi.Available = false;
+
+        Console.WriteLine($"Request {request.RequestId} dispatched to Taxi {closestTaxi.TaxiId}");
+    }
+
+    public static void Main() {
+        var system = new TaxiDispatchSystem();
+    }
+}

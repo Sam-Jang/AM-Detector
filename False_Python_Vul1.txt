@@ -1,0 +1,79 @@
+from flask import Flask, request, redirect, url_for, render_template, send_from_directory
+import os
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = '/usr/app/temp'
+comments = []
+
+@app.route('/')
+def index():
+    return '''
+        <h1>Welcome to the XSS Vulnerable Site</h1>
+        <a href="/vuln/form1">Form 1</a><br>
+        <a href="/vuln/form2">Form 2</a><br>
+        <a href="/vuln/form3/Hello">Form 3</a><br>
+        <a href="/vuln/form4">Form 4</a><br>
+        <a href="/vuln/form5">Form 5</a>
+    '''
+
+@app.route('/vuln/form1')
+def form1():
+    name = request.args.get('name', 'Guest')
+    return f'<h1>Hello, {name}</h1><a href="/">Go Back</a>'
+
+@app.route('/vuln/form2', methods=['GET', 'POST'])
+def form2():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        comment = request.form.get('comment')
+        comments.append((username, comment))
+        return redirect(url_for('comments'))
+    return '''
+        <h1>Leave a Comment</h1>
+        <form method="POST" action="/vuln/form2">
+            <input type="text" name="username" placeholder="Your Name" />
+            <textarea name="comment" placeholder="Your Comment"></textarea>
+            <button type="submit">Submit</button>
+        </form>
+        <a href="/">Go Back</a>
+    '''
+
+@app.route('/vuln/form3/<message>')
+def form3(message):
+    return f'<h1>Message: {message}</h1><a href="/">Go Back</a>'
+
+@app.route('/vuln/form4')
+def form4():
+    user_agent = request.headers.get('User-Agent')
+    return f'<h1>Your User Agent: {user_agent}</h1><a href="/">Go Back</a>'
+
+@app.route('/vuln/form5')
+def form5():
+    return '''
+        <h1>Script Injection</h1>
+        <script>alert("XSS");</script>
+    '''
+
+@app.route('/vuln/comments')
+def comments_page():
+    comments_html = ''.join([f'<p><strong>{u}:</strong> {c}</p>' for u, c in comments])
+    return f'''
+        <h1>Comments</h1>
+        {comments_html}
+        <a href="/vuln/form2">Post Another Comment</a>
+        <a href="/">Go Back</a>
+    '''
+
+@app.route('/vuln/upload', methods=['POST'])
+def upload_file():
+    if 'products' not in request.files:
+        return 'No files were uploaded.', 400
+    file = request.files['products']
+    if file.filename == '':
+        return 'No selected file.', 400
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(file_path)
+    return 'Upload success'
+
+if __name__ == '__main__':
+    app.run(port=3000)

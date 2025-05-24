@@ -1,0 +1,398 @@
+package com.rentalplatform;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+
+import java.io.File;
+import java.io.IOException;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+
+// Main Application
+@SpringBootApplication
+public class RentalPlatformApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RentalPlatformApplication.class, args);
+    }
+}
+
+// Configuration
+@Configuration
+@EnableWebMvc
+class AppConfig {
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public PricingConfig pricingConfig() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.readValue(new File("pricing_config.json"), PricingConfig.class);
+    }
+}
+
+// Models
+@Entity
+@Table(name = "properties")
+class Property {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private String name;
+    private String location;
+    private Double basePrice;
+    private Double currentPrice;
+    private Double occupancyRate;
+    private String lessor;
+
+    // Getters and Setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getLocation() { return location; }
+    public void setLocation(String location) { this.location = location; }
+    public Double getBasePrice() { return basePrice; }
+    public void setBasePrice(Double basePrice) { this.basePrice = basePrice; }
+    public Double getCurrentPrice() { return currentPrice; }
+    public void setCurrentPrice(Double currentPrice) { this.currentPrice = currentPrice; }
+    public Double getOccupancyRate() { return occupancyRate; }
+    public void setOccupancyRate(Double occupancyRate) { this.occupancyRate = occupancyRate; }
+    public String getLessor() { return lessor; }
+    public void setLessor(String lessor) { this.lessor = lessor; }
+}
+
+@Entity
+@Table(name = "users")
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private String username;
+    private String passwordHash;
+    private String role;
+
+    // Getters and Setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+    public String getRole() { return role; }
+    public void setRole(String role) { this.role = role; }
+}
+
+@Entity
+@Table(name = "bookings")
+class Booking {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer id;
+    private Integer userId;
+    private Integer propertyId;
+    private LocalDate startDate;
+    private LocalDate endDate;
+    private Double totalPrice;
+
+    // Getters and Setters
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Integer getPropertyId() { return propertyId; }
+    public void setPropertyId(Integer propertyId) { this.propertyId = propertyId; }
+    public LocalDate getStartDate() { return startDate; }
+    public void setStartDate(LocalDate startDate) { this.startDate = startDate; }
+    public LocalDate getEndDate() { return endDate; }
+    public void setEndDate(LocalDate endDate) { this.endDate = endDate; }
+    public Double getTotalPrice() { return totalPrice; }
+    public void setTotalPrice(Double totalPrice) { this.totalPrice = totalPrice; }
+}
+
+class PricingConfig {
+    private Double locationWeight;
+    private Double demandWeight;
+    private Double competitorWeight;
+    private Double basePrice;
+    private Double concessionFactor;
+
+    // Getters and Setters
+    public Double getLocationWeight() { return locationWeight; }
+    public void setLocationWeight(Double locationWeight) { this.locationWeight = locationWeight; }
+    public Double getDemandWeight() { return demandWeight; }
+    public void setDemandWeight(Double demandWeight) { this.demandWeight = demandWeight; }
+    public Double getCompetitorWeight() { return competitorWeight; }
+    public void setCompetitorWeight(Double competitorWeight) { this.competitorWeight = competitorWeight; }
+    public Double getBasePrice() { return basePrice; }
+    public void setBasePrice(Double basePrice) { this.basePrice = basePrice; }
+    public Double getConcessionFactor() { return concessionFactor; }
+    public void setConcessionFactor(Double concessionFactor) { this.concessionFactor = concessionFactor; }
+}
+
+// Repositories
+interface PropertyRepository extends JpaRepository<Property, Integer> {
+    List<Property> findByNameContainingIgnoreCaseOrLocationContainingIgnoreCase(String name, String location);
+}
+
+interface UserRepository extends JpaRepository<User, Integer> {
+    User findByUsername(String username);
+}
+
+interface BookingRepository extends JpaRepository<Booking, Integer> {
+    List<Booking> findByUserId(Integer userId);
+}
+
+// Services
+@Service
+class PricingService {
+    @Autowired
+    private PropertyRepository propertyRepository;
+    @Autowired
+    private PricingConfig config;
+
+    public Double calculatePrice(Integer propertyId) {
+        Property property = propertyRepository.findById(propertyId).orElse(null);
+        if (property == null) return 0.0;
+
+        List<Property> properties = propertyRepository.findAll();
+        List<Double> competitorPrices = properties.stream()
+                .filter(p -> p.getLocation().equals(property.getLocation()) && !p.getId().equals(property.getId()))
+                .map(Property::getCurrentPrice)
+                .collect(Collectors.toList());
+
+        Double avgCompetitorPrice = competitorPrices.isEmpty() ? property.getBasePrice() : competitorPrices.stream().mapToDouble(Double::doubleValue).average().orElse(property.getBasePrice());
+        Double demandFactor = property.getOccupancyRate() > 0.8 ? 1.2 : property.getOccupancyRate() > 0.5 ? 1.0 : 0.9;
+        Double locationFactor = property.getLocation().contains("Downtown") ? 1.3 : 1.0;
+
+        Double recommendedPrice = config.getBasePrice() +
+                (avgCompetitorPrice * config.getCompetitorWeight()) +
+                (property.getBasePrice() * config.getLocationWeight() * locationFactor) +
+                (property.getBasePrice() * config.getDemandWeight() * demandFactor);
+
+        Double concession = recommendedPrice * config.getConcessionFactor();
+        return Math.round((recommendedPrice - concession) * 100.0) / 100.0;
+    }
+
+    public void updateAllPrices() {
+        List<Property> properties = propertyRepository.findAll();
+        for (Property prop : properties) {
+            Double newPrice = calculatePrice(prop.getId());
+            prop.setCurrentPrice(newPrice);
+            propertyRepository.save(prop);
+        }
+    }
+}
+
+@Service
+class UserService {
+    @Autowired
+    private UserRepository userRepository;
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    public User authenticate(String username, String password) {
+        User user = userRepository.findByUsername(username);
+        if (user != null && passwordEncoder.matches(password, user.getPasswordHash())) {
+            return user;
+        }
+        return null;
+    }
+
+    public boolean register(String username, String password, String role) {
+        if (userRepository.findByUsername(username) != null) {
+            return false;
+        }
+        User user = new User();
+        user.setUsername(username);
+        user.setPasswordHash(passwordEncoder.encode(password));
+        user.setRole(role);
+        userRepository.save(user);
+        return true;
+    }
+}
+
+@Service
+class BookingService {
+    @Autowired
+    private PropertyRepository propertyRepository;
+    @Autowired
+    private BookingRepository bookingRepository;
+
+    public boolean createBooking(Integer userId, Integer propertyId, LocalDate startDate, LocalDate endDate) {
+        Property property = propertyRepository.findById(propertyId).orElse(null);
+        if (property == null) return false;
+
+        long days = java.time.temporal.ChronoUnit.DAYS.between(startDate, endDate);
+        if (days <= 0) return false;
+
+        Double totalPrice = property.getCurrentPrice() * days;
+        Booking booking = new Booking();
+        booking.setUserId(userId);
+        booking.setPropertyId(propertyId);
+        booking.setStartDate(startDate);
+        booking.setEndDate(endDate);
+        booking.setTotalPrice(totalPrice);
+        bookingRepository.save(booking);
+        return true;
+    }
+
+    public List<Booking> getUserBookings(Integer userId) {
+        return bookingRepository.findByUserId(userId);
+    }
+}
+
+// Controllers
+@RestController
+@RequestMapping("/api/property")
+class PropertyController {
+    @Autowired
+    private PropertyRepository propertyRepository;
+    @Autowired
+    private PricingService pricingService;
+
+    @GetMapping
+    public List<Property> getProperties(@RequestParam(defaultValue = "price") String sort,
+                                        @RequestParam(defaultValue = "") String keyword) {
+        List<Property> properties = !keyword.isEmpty()
+                ? propertyRepository.findByNameContainingIgnoreCaseOrLocationContainingIgnoreCase(keyword, keyword)
+                : propertyRepository.findAll();
+
+        return switch (sort) {
+            case "price" -> properties.stream().sorted((p1, p2) -> Double.compare(p1.getCurrentPrice(), p2.getCurrentPrice())).collect(Collectors.toList());
+            case "discount" -> properties.stream().sorted((p1, p2) -> Double.compare(p2.getBasePrice() - p2.getCurrentPrice(), p1.getBasePrice() - p1.getCurrentPrice())).collect(Collectors.toList());
+            case "recommended" -> properties.stream().sorted((p1, p2) -> Double.compare(p2.getOccupancyRate(), p1.getOccupancyRate())).collect(Collectors.toList());
+            default -> properties;
+        };
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Property> getProperty(@PathVariable Integer id) {
+        return propertyRepository.findById(id)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/update-prices")
+    public ResponseEntity<Void> updatePrices() {
+        pricingService.updateAllPrices();
+        return ResponseEntity.ok().build();
+    }
+}
+
+@RestController
+@RequestMapping("/api/user")
+class UserController {
+    @Autowired
+    private UserService userService;
+
+    @PostMapping("/login")
+    public ResponseEntity<UserResponse> login(@RequestBody LoginRequest request) {
+        User user = userService.authenticate(request.getUsername(), request.getPassword());
+        if (user == null) {
+            return ResponseEntity.status(401).build();
+        }
+        return ResponseEntity.ok(new UserResponse(user.getId(), user.getUsername(), user.getRole()));
+    }
+
+    @PostMapping("/register")
+    public ResponseEntity<Void> register(@RequestBody RegisterRequest request) {
+        boolean success = userService.register(request.getUsername(), request.getPassword(), request.getRole());
+        return success ? ResponseEntity.ok().build() : ResponseEntity.badRequest().build();
+    }
+}
+
+@RestController
+@RequestMapping("/api/booking")
+class BookingController {
+    @Autowired
+    private BookingService bookingService;
+
+    @PostMapping
+    public ResponseEntity<Void> createBooking(@RequestBody BookingRequest request) {
+        boolean success = bookingService.createBooking(
+                request.getUserId(),
+                request.getPropertyId(),
+                request.getStartDate(),
+                request.getEndDate()
+        );
+        return success ? ResponseEntity.ok().build() : ResponseEntity.badRequest().build();
+    }
+
+    @GetMapping("/user/{userId}")
+    public List<Booking> getUserBookings(@PathVariable Integer userId) {
+        return bookingService.getUserBookings(userId);
+    }
+}
+
+// DTOs
+class LoginRequest {
+    private String username;
+    private String password;
+
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+}
+
+class RegisterRequest {
+    private String username;
+    private String password;
+    private String role;
+
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+    public String getRole() { return role; }
+    public void setRole(String role) { this.role = role; }
+}
+
+class BookingRequest {
+    private Integer userId;
+    private Integer propertyId;
+    private LocalDate startDate;
+    private LocalDate endDate;
+
+    public Integer getUserId() { return userId; }
+    public void setUserId(Integer userId) { this.userId = userId; }
+    public Integer getPropertyId() { return propertyId; }
+    public void setPropertyId(Integer propertyId) { this.propertyId = propertyId; }
+    public LocalDate getStartDate() { return startDate; }
+    public void setStartDate(LocalDate startDate) { this.startDate = startDate; }
+    public LocalDate getEndDate() { return endDate; }
+    public void setEndDate(LocalDate endDate) { this.endDate = endDate; }
+}
+
+class UserResponse {
+    private Integer id;
+    private String username;
+    private String role;
+
+    public UserResponse(Integer id, String username, String role) {
+        this.id = id;
+        this.username = username;
+        this.role = role;
+    }
+
+    public Integer getId() { return id; }
+    public void setId(Integer id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getRole() { return role; }
+    public void setRole(String role) { this.role = role; }
+}

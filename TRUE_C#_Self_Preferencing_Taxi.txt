@@ -1,0 +1,699 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Text.Json;
+using System.IO;
+using System.Security.Claims;
+using System.Text;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Configuration;
+
+namespace TaxiMatchingApp
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            CreateHostBuilder(args).Build().Run();
+        }
+
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+            Host.CreateDefaultBuilder(args)
+                .ConfigureWebHostDefaults(webBuilder =>
+                {
+                    webBuilder.UseStartup<Startup>();
+                });
+    }
+
+    public class Startup
+    {
+        public IConfiguration Configuration { get; }
+
+        public Startup(IConfiguration configuration)
+        {
+            Configuration = configuration;
+        }
+
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.AddDbContext<AppDbContext>(options =>
+                options.UseSqlServer(Configuration.GetConnectionString("DefaultConnection")));
+
+            services.AddControllers();
+            services.AddAuthentication(options =>
+            {
+                options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+            }).AddJwtBearer(options =>
+            {
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateIssuer = true,
+                    ValidateAudience = true,
+                    ValidateLifetime = true,
+                    ValidateIssuerSigningKey = true,
+                    ValidIssuer = Configuration["Jwt:Issuer"],
+                    ValidAudience = Configuration["Jwt:Audience"],
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Configuration["Jwt:Key"]))
+                };
+            });
+
+            services.AddAuthorization();
+            services.AddSingleton<ConfigService>();
+            services.AddSingleton<RideMatchingService>();
+            services.AddSingleton<PaymentService>();
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+            app.UseAuthentication();
+            app.UseAuthorization();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllers();
+            });
+        }
+    }
+
+    public class AppDbContext : DbContext
+    {
+        public DbSet<User> Users { get; set; }
+        public DbSet<Driver> Drivers { get; set; }
+        public DbSet<Ride> Rides { get; set; }
+        public DbSet<Payment> Payments { get; set; }
+        public DbSet<RideHistory> RideHistories { get; set; }
+
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<User>().HasKey(u => u.Id);
+            modelBuilder.Entity<Driver>().HasKey(d => d.Id);
+            modelBuilder.Entity<Ride>().HasKey(r => r.Id);
+            modelBuilder.Entity<Payment>().HasKey(p => p.Id);
+            modelBuilder.Entity<RideHistory>().HasKey(rh => rh.Id);
+
+            modelBuilder.Entity<Ride>()
+                .HasOne(r => r.Rider)
+                .WithMany()
+                .HasForeignKey(r => r.RiderId);
+
+            modelBuilder.Entity<Ride>()
+                .HasOne(r => r.Driver)
+                .WithMany()
+                .HasForeignKey(r => r.DriverId);
+
+            modelBuilder.Entity<Payment>()
+                .HasOne(p => p.Ride)
+                .WithMany()
+                .HasForeignKey(p => p.RideId);
+
+            modelBuilder.Entity<RideHistory>()
+                .HasOne(rh => rh.Rider)
+                .WithMany()
+                .HasForeignKey(rh => rh.RiderId);
+
+            modelBuilder.Entity<RideHistory>()
+                .HasOne(rh => rh.Driver)
+                .WithMany()
+                .HasForeignKey(rh => rh.DriverId);
+        }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public string Email { get; set; }
+        public string Phone { get; set; }
+        public string Role { get; set; }
+    }
+
+    public class Driver
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public bool IsAffiliated { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+        public bool IsAvailable { get; set; }
+        public double AcceptanceRate { get; set; }
+        public double Rating { get; set; }
+    }
+
+    public class Ride
+    {
+        public int Id { get; set; }
+        public int RiderId { get; set; }
+        public User Rider { get; set; }
+        public int? DriverId { get; set; }
+        public Driver Driver { get; set; }
+        public double StartLat { get; set; }
+        public double StartLon { get; set; }
+        public double EndLat { get; set; }
+        public double EndLon { get; set; }
+        public string Status { get; set; }
+        public DateTime RequestTime { get; set; }
+        public DateTime? AcceptTime { get; set; }
+        public DateTime? CompleteTime { get; set; }
+        public double Distance { get; set; }
+        public double EstimatedFare { get; set; }
+    }
+
+    public class Payment
+    {
+        public int Id { get; set; }
+        public int RideId { get; set; }
+        public Ride Ride { get; set; }
+        public double Amount { get; set; }
+        public string Status { get; set; }
+        public DateTime PaymentTime { get; set; }
+    }
+
+    public class RideHistory
+    {
+        public int Id { get; set; }
+        public int RiderId { get; set; }
+        public User Rider { get; set; }
+        public int DriverId { get; set; }
+        public Driver Driver { get; set; }
+        public double Distance { get; set; }
+        public double Fare { get; set; }
+        public DateTime RideDate { get; set; }
+        public double Rating { get; set; }
+    }
+
+    public class ConfigService
+    {
+        private readonly MatchingConfig _config;
+
+        public ConfigService(IConfiguration configuration)
+        {
+            var configPath = configuration["ConfigPath"] ?? "config.json";
+            var json = File.ReadAllText(configPath);
+            _config = JsonSerializer.Deserialize<MatchingConfig>(json);
+        }
+
+        public MatchingConfig GetConfig() => _config;
+    }
+
+    public class MatchingConfig
+    {
+        public double MaxRadiusKm { get; set; }
+        public double AffiliationWeight { get; set; }
+        public double DistanceWeight { get; set; }
+        public double AcceptanceRateWeight { get; set; }
+        public double MinDistanceKm { get; set; }
+        public double BaseFare { get; set; }
+        public double PerKmFare { get; set; }
+        public double NightSurcharge { get; set; }
+    }
+
+    public class RideMatchingService
+    {
+        private readonly ConfigService _configService;
+        private readonly AppDbContext _context;
+
+        public RideMatchingService(ConfigService configService, AppDbContext context)
+        {
+            _configService = configService;
+            _context = context;
+        }
+
+        public async Task<Driver> MatchDriver(Ride ride)
+        {
+            var config = _configService.GetConfig();
+            var drivers = await _context.Drivers
+                .Where(d => d.IsAvailable)
+                .ToListAsync();
+
+            var scoredDrivers = new List<(Driver Driver, double Score)>();
+
+            foreach (var driver in drivers)
+            {
+                var distance = CalculateDistance(
+                    ride.StartLat, ride.StartLon,
+                    driver.Latitude, driver.Longitude);
+
+                if (distance > config.MaxRadiusKm) continue;
+                if (distance < config.MinDistanceKm && driver.IsAffiliated) continue;
+
+                var score = CalculateDriverScore(driver, distance, config);
+                scoredDrivers.Add((driver, score));
+            }
+
+            var bestDriver = scoredDrivers
+                .OrderByDescending(ds => ds.Score)
+                .FirstOrDefault().Driver;
+
+            return bestDriver;
+        }
+
+        private double CalculateDistance(double lat1, double lon1, double lat2, double lon2)
+        {
+            const double R = 6371;
+            var dLat = ToRadians(lat2 - lat1);
+            var dLon = ToRadians(lon2 - lon1);
+            var a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2) +
+                    Math.Cos(ToRadians(lat1)) * Math.Cos(ToRadians(lat2)) *
+                    Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
+            var c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+            return R * c;
+        }
+
+        private double ToRadians(double deg) => deg * Math.PI / 180;
+
+        private double CalculateDriverScore(Driver driver, double distance, MatchingConfig config)
+        {
+            var affiliationScore = driver.IsAffiliated ? config.AffiliationWeight : 0;
+            var distanceScore = (config.MaxRadiusKm - distance) / config.MaxRadiusKm * config.DistanceWeight;
+            var acceptanceScore = driver.AcceptanceRate * config.AcceptanceRateWeight;
+
+            return affiliationScore + distanceScore + acceptanceScore;
+        }
+    }
+
+    public class PaymentService
+    {
+        private readonly ConfigService _configService;
+
+        public PaymentService(ConfigService configService)
+        {
+            _configService = configService;
+        }
+
+        public double CalculateFare(Ride ride)
+        {
+            var config = _configService.GetConfig();
+            var baseFare = config.BaseFare;
+            var distanceFare = ride.Distance * config.PerKmFare;
+            var nightSurcharge = IsNightTime(ride.RequestTime) ? config.NightSurcharge : 0;
+
+            return baseFare + distanceFare + nightSurcharge;
+        }
+
+        private bool IsNightTime(DateTime time)
+        {
+            return time.Hour >= 0 && time.Hour < 4;
+        }
+    }
+
+    [Route("api/users")]
+    [ApiController]
+    public class UserController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly IConfiguration _configuration;
+
+        public UserController(AppDbContext context, IConfiguration configuration)
+        {
+            _context = context;
+            _configuration = configuration;
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register(UserRegisterDto dto)
+        {
+            var user = new User
+            {
+                Username = dto.Username,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
+                Email = dto.Email,
+                Phone = dto.Phone,
+                Role = "Rider"
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "User registered" });
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login(UserLoginDto dto)
+        {
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == dto.Username);
+
+            if (user == null || !BCrypt.Net.BCrypt.Verify(dto.Password, user.PasswordHash))
+            {
+                return Unauthorized(new { Message = "Invalid credentials" });
+            }
+
+            var token = GenerateJwtToken(user);
+            return Ok(new { Token = token });
+        }
+
+        private string GenerateJwtToken(User user)
+        {
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+                new Claim(ClaimTypes.Name, user.Username),
+                new Claim(ClaimTypes.Role, user.Role)
+            };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: _configuration["Jwt:Issuer"],
+                audience: _configuration["Jwt:Audience"],
+                claims: claims,
+                expires: DateTime.Now.AddHours(1),
+                signingCredentials: creds);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+    }
+
+    [Route("api/drivers")]
+    [ApiController]
+    public class DriverController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public DriverController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> RegisterDriver(DriverRegisterDto dto)
+        {
+            var driver = new Driver
+            {
+                Name = dto.Name,
+                IsAffiliated = dto.IsAffiliated,
+                Latitude = dto.Latitude,
+                Longitude = dto.Longitude,
+                IsAvailable = true,
+                AcceptanceRate = 0.0,
+                Rating = 0.0
+            };
+
+            _context.Drivers.Add(driver);
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Driver registered" });
+        }
+
+        [Authorize]
+        [HttpPost("update-location")]
+        public async Task<IActionResult> UpdateLocation(LocationUpdateDto dto)
+        {
+            var driver = await _context.Drivers.FindAsync(dto.DriverId);
+            if (driver == null) return NotFound();
+
+            driver.Latitude = dto.Latitude;
+            driver.Longitude = dto.Longitude;
+            driver.IsAvailable = dto.IsAvailable;
+
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Location updated" });
+        }
+    }
+
+    [Route("api/rides")]
+    [ApiController]
+    public class RideController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+        private readonly RideMatchingService _matchingService;
+        private readonly PaymentService _paymentService;
+
+        public RideController(AppDbContext context, RideMatchingService matchingService, PaymentService paymentService)
+        {
+            _context = context;
+            _matchingService = matchingService;
+            _paymentService = paymentService;
+        }
+
+        [Authorize(Roles = "Rider")]
+        [HttpPost("request")]
+        public async Task<IActionResult> RequestRide(RideRequestDto dto)
+        {
+            var riderId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+            var ride = new Ride
+            {
+                RiderId = riderId,
+                StartLat = dto.StartLat,
+                StartLon = dto.StartLon,
+                EndLat = dto.EndLat,
+                EndLon = dto.EndLon,
+                Status = "Requested",
+                RequestTime = DateTime.UtcNow,
+                Distance = _matchingService.CalculateDistance(dto.StartLat, dto.StartLon, dto.EndLat, dto.EndLon)
+            };
+
+            ride.EstimatedFare = _paymentService.CalculateFare(ride);
+            _context.Rides.Add(ride);
+            await _context.SaveChangesAsync();
+
+            var driver = await _matchingService.MatchDriver(ride);
+            if (driver == null) return BadRequest(new { Message = "No drivers available" });
+
+            ride.DriverId = driver.Id;
+            ride.Status = "Assigned";
+            ride.AcceptTime = DateTime.UtcNow;
+            driver.IsAvailable = false;
+
+            await _context.SaveChangesAsync();
+            return Ok(new { RideId = ride.Id, DriverId = driver.Id });
+        }
+
+        [Authorize(Roles = "Driver")]
+        [HttpPost("complete")]
+        public async Task<IActionResult> CompleteRide(RideCompleteDto dto)
+        {
+            var ride = await _context.Rides.FindAsync(dto.RideId);
+            if (ride == null) return NotFound();
+
+            ride.Status = "Completed";
+            ride.CompleteTime = DateTime.UtcNow;
+
+            var driver = await _context.Drivers.FindAsync(ride.DriverId);
+            driver.IsAvailable = true;
+            driver.AcceptanceRate = CalculateNewAcceptanceRate(driver);
+
+            var payment = new Payment
+            {
+                RideId = ride.Id,
+                Amount = _paymentService.CalculateFare(ride),
+                Status = "Pending",
+                PaymentTime = DateTime.UtcNow
+            };
+
+            _context.Payments.Add(payment);
+
+            var history = new RideHistory
+            {
+                RiderId = ride.RiderId,
+                DriverId = ride.DriverId,
+                Distance = ride.Distance,
+                Fare = payment.Amount,
+                RideDate = DateTime.UtcNow,
+                Rating = 0.0
+            };
+
+            _context.RideHistories.Add(history);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Message = "Ride completed", PaymentId = payment.Id });
+        }
+
+        [Authorize]
+        [HttpPost("cancel")]
+        public async Task<IActionResult> CancelRide(RideCancelDto dto)
+        {
+            var ride = await _context.Rides.FindAsync(dto.RideId);
+            if (ride == null) return NotFound();
+
+            ride.Status = "Cancelled";
+            if (ride.DriverId.HasValue)
+            {
+                var driver = await _context.Drivers.FindAsync(ride.DriverId);
+                driver.IsAvailable = true;
+            }
+
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Ride cancelled" });
+        }
+
+        private double CalculateNewAcceptanceRate(Driver driver)
+        {
+            var totalRides = _context.Rides.Count(r => r.DriverId == driver.Id);
+            var acceptedRides = _context.Rides.Count(r => r.DriverId == driver.Id && r.Status != "Cancelled");
+            return totalRides > 0 ? (double)acceptedRides / totalRides : 0.0;
+        }
+    }
+
+    [Route("api/payments")]
+    [ApiController]
+    public class PaymentController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public PaymentController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [Authorize(Roles = "Rider")]
+        [HttpPost("process")]
+        public async Task<IActionResult> ProcessPayment(PaymentProcessDto dto)
+        {
+            var payment = await _context.Payments.FindAsync(dto.PaymentId);
+            if (payment == null) return NotFound();
+
+            payment.Status = "Completed";
+            payment.PaymentTime = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Payment processed" });
+        }
+    }
+
+    [Route("api/history")]
+    [ApiController]
+    public class RideHistoryController : ControllerBase
+    {
+        private readonly AppDbContext _context;
+
+        public RideHistoryController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        [Authorize]
+        [HttpGet("rider")]
+        public async Task<IActionResult> GetRiderHistory()
+        {
+            var riderId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+            var history = await _context.RideHistories
+                .Where(rh => rh.RiderId == riderId)
+                .Select(rh => new
+                {
+                    rh.Id,
+                    rh.Driver.Name,
+                    rh.Distance,
+                    rh.Fare,
+                    rh.RideDate,
+                    rh.Rating
+                })
+                .ToListAsync();
+
+            return Ok(history);
+        }
+
+        [Authorize(Roles = "Driver")]
+        [HttpGet("driver")]
+        public async Task<IActionResult> GetDriverHistory()
+        {
+            var driverId = int.Parse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+            var history = await _context.RideHistories
+                .Where(rh => rh.DriverId == driverId)
+                .Select(rh => new
+                {
+                    rh.Id,
+                    rh.Rider.Username,
+                    rh.Distance,
+                    rh.Fare,
+                    rh.RideDate,
+                    rh.Rating
+                })
+                .ToListAsync();
+
+            return Ok(history);
+        }
+
+        [Authorize(Roles = "Rider")]
+        [HttpPost("rate")]
+        public async Task<IActionResult> RateRide(RideRatingDto dto)
+        {
+            var history = await _context.RideHistories.FindAsync(dto.RideHistoryId);
+            if (history == null) return NotFound();
+
+            history.Rating = dto.Rating;
+            var driver = await _context.Drivers.FindAsync(history.DriverId);
+            var driverRatings = await _context.RideHistories
+                .Where(rh => rh.DriverId == driver.Id && rh.Rating > 0)
+                .Select(rh => rh.Rating)
+                .ToListAsync();
+
+            driver.Rating = driverRatings.Any() ? driverRatings.Average() : 0.0;
+
+            await _context.SaveChangesAsync();
+            return Ok(new { Message = "Rating submitted" });
+        }
+    }
+
+    public class UserRegisterDto
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string Email { get; set; }
+        public string Phone { get; set; }
+    }
+
+    public class UserLoginDto
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class DriverRegisterDto
+    {
+        public string Name { get; set; }
+        public bool IsAffiliated { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+    }
+
+    public class LocationUpdateDto
+    {
+        public int DriverId { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+        public bool IsAvailable { get; set; }
+    }
+
+    public class RideRequestDto
+    {
+        public double StartLat { get; set; }
+        public double StartLon { get; set; }
+        public double EndLat { get; set; }
+        public double EndLon { get; set; }
+    }
+
+    public class RideCompleteDto
+    {
+        public int RideId { get; set; }
+    }
+
+    public class RideCancelDto
+    {
+        public int RideId { get; set; }
+    }
+
+    public class PaymentProcessDto
+    {
+        public int PaymentId { get; set; }
+    }
+
+    public class RideRatingDto
+    {
+        public int RideHistoryId { get; set; }
+        public double Rating { get; set; }
+    }
+}

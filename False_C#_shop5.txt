@@ -1,0 +1,551 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SQLite;
+using System.Linq;
+
+namespace AnythingshopForAll
+{
+    class UserProfile
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string Address { get; set; }
+        public List<Coupon> Coupons { get; set; }
+
+        public UserProfile(string username, string password, string address)
+        {
+            Username = username;
+            Password = password;
+            Address = address;
+            Coupons = new List<Coupon>();
+        }
+    }
+
+    class Category
+    {
+        public string Name { get; set; }
+        public string Description { get; set; }
+
+        public Category(string name, string description)
+        {
+            Name = name;
+            Description = description;
+        }
+    }
+
+    class Product
+    {
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public double Price { get; set; }
+        public string Category { get; set; }
+        public int Stock { get; set; }
+        public List<string> LikedBy { get; set; }
+        public List<Review> Reviews { get; set; }
+
+        public Product(string name, string description, double price, string category, int stock)
+        {
+            Name = name;
+            Description = description;
+            Price = price;
+            Category = category;
+            Stock = stock;
+            LikedBy = new List<string>();
+            Reviews = new List<Review>();
+        }
+    }
+
+    class Review
+    {
+        public UserProfile User { get; set; }
+        public string Comment { get; set; }
+        public int Rating { get; set; }
+
+        public Review(UserProfile user, string comment, int rating)
+        {
+            User = user;
+            Comment = comment;
+            Rating = rating;
+        }
+    }
+
+    class Coupon
+    {
+        public string Code { get; set; }
+        public double Discount { get; set; }
+
+        public Coupon(string code, double discount)
+        {
+            Code = code;
+            Discount = discount;
+        }
+    }
+
+    class Order
+    {
+        public UserProfile User { get; set; }
+        public Product Product { get; set; }
+        public int Quantity { get; set; }
+        public string Status { get; set; }
+
+        public Order(UserProfile user, Product product, int quantity)
+        {
+            User = user;
+            Product = product;
+            Quantity = quantity;
+            Status = "Processing";
+        }
+    }
+
+    class SupportTicket
+    {
+        public UserProfile User { get; set; }
+        public string Message { get; set; }
+        public string Status { get; set; }
+
+        public SupportTicket(UserProfile user, string message)
+        {
+            User = user;
+            Message = message;
+            Status = "Open";
+        }
+    }
+
+    class ShoppingCart
+    {
+        public List<Order> Items { get; set; }
+
+        public ShoppingCart()
+        {
+            Items = new List<Order>();
+        }
+
+        public void AddProduct(Order order)
+        {
+            Items.Add(order);
+        }
+
+        public void RemoveProduct(Order order)
+        {
+            Items.Remove(order);
+        }
+
+        public double CalculateTotal()
+        {
+            return Items.Sum(i => i.Product.Price * i.Quantity);
+        }
+
+        public double ApplyCoupon(Coupon coupon)
+        {
+            return CalculateTotal() * (1 - coupon.Discount / 100);
+        }
+    }
+
+    public class Shop
+    {
+        private List<UserProfile> users = new List<UserProfile>();
+        private List<Category> categories = new List<Category>();
+        private List<Product> products = new List<Product>();
+        private List<Coupon> availableCoupons = new List<Coupon>();
+        private List<SupportTicket> supportTickets = new List<SupportTicket>();
+        private List<Order> orders = new List<Order>();
+        private ShoppingCart shoppingCart = new ShoppingCart();
+        private UserProfile currentUser = null;
+        private string connectionString = "Data Source=shop.db;Version=3;";
+
+        public Shop()
+        {
+            LoadDataFromDatabase();
+        }
+
+        private void LoadDataFromDatabase()
+        {
+            using (var connection = new SQLiteConnection(connectionString))
+            {
+                connection.Open();
+
+                using (var command = new SQLiteCommand("SELECT * FROM Users", connection))
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        users.Add(new UserProfile(reader["Username"].ToString(), reader["Password"].ToString(), reader["Address"].ToString()));
+                    }
+                }
+
+                using (var command = new SQLiteCommand("SELECT * FROM Categories", connection))
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        categories.Add(new Category(reader["Name"].ToString(), reader["Description"].ToString()));
+                    }
+                }
+
+                using (var command = new SQLiteCommand("SELECT * FROM Products", connection))
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        products.Add(new Product(reader["Name"].ToString(), reader["Description"].ToString(), Convert.ToDouble(reader["Price"]), reader["Category"].ToString(), Convert.ToInt32(reader["Stock"])));
+                    }
+                }
+
+                using (var command = new SQLiteCommand("SELECT * FROM Coupons", connection))
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        availableCoupons.Add(new Coupon(reader["Code"].ToString(), Convert.ToDouble(reader["Discount"])));
+                    }
+                }
+            }
+        }
+
+        public bool Login(string username, string password)
+        {
+            foreach (var user in users)
+            {
+                if (user.Username == username && user.Password == password)
+                {
+                    currentUser = user;
+                    Console.WriteLine($"Logged in as {username}");
+                    return true;
+                }
+            }
+            Console.WriteLine("Login failed");
+            return false;
+        }
+
+        public void Signup(string username, string password, string address)
+        {
+            using (var connection = new SQLiteConnection(connectionString))
+            {
+                connection.Open();
+
+                using (var command = new SQLiteCommand("INSERT INTO Users (Username, Password, Address) VALUES (@username, @password, @address)", connection))
+                {
+                    command.Parameters.AddWithValue("@username", username);
+                    command.Parameters.AddWithValue("@password", password);
+                    command.Parameters.AddWithValue("@address", address);
+                    command.ExecuteNonQuery();
+                }
+            }
+            users.Add(new UserProfile(username, password, address));
+            Console.WriteLine("User registered successfully!");
+        }
+
+        public void SearchProducts(string query)
+        {
+            Console.WriteLine($"Search results for '{query}':");
+            foreach (var product in products)
+            {
+                if (product.Name.Contains(query) || product.Description.Contains(query))
+                {
+                    Console.WriteLine($"{product.Name} - {product.Price} USD");
+                }
+            }
+        }
+
+        public void FilterProductsByCategory(string category)
+        {
+            Console.WriteLine($"Products in category '{category}':");
+            foreach (var product in products)
+            {
+                if (product.Category == category)
+                {
+                    Console.WriteLine($"{product.Name} - {product.Price} USD");
+                }
+            }
+        }
+
+        public void ToggleLikeProduct(string productName)
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            foreach (var product in products)
+            {
+                if (product.Name == productName)
+                {
+                    if (product.LikedBy.Contains(currentUser.Username))
+                    {
+                        product.LikedBy.Remove(currentUser.Username);
+                        Console.WriteLine("Product removed from wishlist.");
+                    }
+                    else
+                    {
+                        product.LikedBy.Add(currentUser.Username);
+                        Console.WriteLine("Product added to wishlist.");
+                    }
+                    return;
+                }
+            }
+            Console.WriteLine("Product not found.");
+        }
+
+        public void AddToCart(string productName, int quantity)
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            foreach (var product in products)
+            {
+                if (product.Name == productName)
+                {
+                    if (product.Stock >= quantity)
+                    {
+                        var order = new Order(currentUser, product, quantity);
+                        shoppingCart.AddProduct(order);
+                        orders.Add(order);
+                        Console.WriteLine($"{productName} added to cart.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Not enough stock for {productName}. Only {product.Stock} left.");
+                    }
+                    return;
+                }
+            }
+            Console.WriteLine("Product not found.");
+        }
+
+        public void ViewCart()
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            Console.WriteLine("Your Cart:");
+            foreach (var order in shoppingCart.Items)
+            {
+                if (order.User == currentUser)
+                {
+                    Console.WriteLine($"{order.Product.Name} - {order.Quantity} units - {order.Product.Price * order.Quantity} USD");
+                }
+            }
+        }
+
+        public void ApplyCoupon(string couponCode)
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            var coupon = availableCoupons.FirstOrDefault(c => c.Code == couponCode);
+            if (coupon != null)
+            {
+                double total = shoppingCart.ApplyCoupon(coupon);
+                Console.WriteLine($"Coupon applied. Total after discount: {total} USD");
+            }
+            else
+            {
+                Console.WriteLine("Invalid coupon code.");
+            }
+        }
+
+        public void Checkout()
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            double total = shoppingCart.CalculateTotal();
+            Console.WriteLine($"Total amount to pay: {total} USD");
+            Console.WriteLine("Order placed successfully!");
+
+            foreach (var order in shoppingCart.Items)
+            {
+                order.Product.Stock -= order.Quantity;
+            }
+
+            shoppingCart.Items.Clear();
+        }
+
+        public void WriteReview(string productName, string comment, int rating)
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            foreach (var product in products)
+            {
+                if (product.Name == productName)
+                {
+                    product.Reviews.Add(new Review(currentUser, comment, rating));
+                    Console.WriteLine("Review added.");
+                    return;
+                }
+            }
+            Console.WriteLine("Product not found.");
+        }
+
+        public void ViewReviews(string productName)
+        {
+            foreach (var product in products)
+            {
+                if (product.Name == productName)
+                {
+                    Console.WriteLine($"Reviews for {product.Name}:");
+                    foreach (var review in product.Reviews)
+                    {
+                        Console.WriteLine($"{review.User.Username}: {review.Comment} (Rating: {review.Rating}/5)");
+                    }
+                    return;
+                }
+            }
+            Console.WriteLine("Product not found.");
+        }
+
+        public void ContactSupport(string message)
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            supportTickets.Add(new SupportTicket(currentUser, message));
+            Console.WriteLine("Support ticket created. We will get back to you soon.");
+        }
+
+        public void ViewSupportTickets()
+        {
+            if (currentUser == null)
+            {
+                Console.WriteLine("Please login first.");
+                return;
+            }
+
+            Console.WriteLine("Your Support Tickets:");
+            foreach (var ticket in supportTickets.Where(t => t.User == currentUser))
+            {
+                Console.WriteLine($"{ticket.Message} - Status: {ticket.Status}");
+            }
+        }
+
+        public void Run()
+        {
+            string command;
+
+            while (true)
+            {
+                Console.WriteLine("\nEnter a command (signup, login, search, category, like, add, cart, applycoupon, checkout, review, viewreviews, support, viewsupport, exit): ");
+                command = Console.ReadLine();
+
+                if (command == "signup")
+                {
+                    Console.WriteLine("Username: ");
+                    string username = Console.ReadLine();
+                    Console.WriteLine("Password: ");
+                    string password = Console.ReadLine();
+                    Console.WriteLine("Address: ");
+                    string address = Console.ReadLine();
+                    Signup(username, password, address);
+                }
+                else if (command == "login")
+                {
+                    Console.WriteLine("Username: ");
+                    string username = Console.ReadLine();
+                    Console.WriteLine("Password: ");
+                    string password = Console.ReadLine();
+                    Login(username, password);
+                }
+                else if (command == "search")
+                {
+                    Console.WriteLine("Search: ");
+                    string query = Console.ReadLine();
+                    SearchProducts(query);
+                }
+                else if (command == "category")
+                {
+                    Console.WriteLine("Category: ");
+                    string category = Console.ReadLine();
+                    FilterProductsByCategory(category);
+                }
+                else if (command == "like")
+                {
+                    Console.WriteLine("Product name: ");
+                    string productName = Console.ReadLine();
+                    ToggleLikeProduct(productName);
+                }
+                else if (command == "add")
+                {
+                    Console.WriteLine("Product name: ");
+                    string productName = Console.ReadLine();
+                    Console.WriteLine("Quantity: ");
+                    int quantity = int.Parse(Console.ReadLine());
+                    AddToCart(productName, quantity);
+                }
+                else if (command == "cart")
+                {
+                    ViewCart();
+                }
+                else if (command == "applycoupon")
+                {
+                    Console.WriteLine("Coupon code: ");
+                    string couponCode = Console.ReadLine();
+                    ApplyCoupon(couponCode);
+                }
+                else if (command == "checkout")
+                {
+                    Checkout();
+                }
+                else if (command == "review")
+                {
+                    Console.WriteLine("Product name: ");
+                    string productName = Console.ReadLine();
+                    Console.WriteLine("Your review: ");
+                    string comment = Console.ReadLine();
+                    Console.WriteLine("Rating (1-5): ");
+                    int rating = int.Parse(Console.ReadLine());
+                    WriteReview(productName, comment, rating);
+                }
+                else if (command == "viewreviews")
+                {
+                    Console.WriteLine("Product name: ");
+                    string productName = Console.ReadLine();
+                    ViewReviews(productName);
+                }
+                else if (command == "support")
+                {
+                    Console.WriteLine("Your message: ");
+                    string message = Console.ReadLine();
+                    ContactSupport(message);
+                }
+                else if (command == "viewsupport")
+                {
+                    ViewSupportTickets();
+                }
+                else if (command == "exit")
+                {
+                    break;
+                }
+                else
+                {
+                    Console.WriteLine("Invalid command");
+                }
+            }
+        }
+
+        public static void Main(string[] args)
+        {
+            Shop shop = new Shop();
+            shop.Run();
+        }
+    }
+}

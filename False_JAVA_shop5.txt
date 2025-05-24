@@ -1,0 +1,440 @@
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+class UserProfile {
+    String username;
+    String password;
+    String address;
+    List<Coupon> coupons = new ArrayList<>();
+
+    UserProfile(String username, String password, String address) {
+        this.username = username;
+        this.password = password;
+        this.address = address;
+    }
+}
+
+class Category {
+    String name;
+    String description;
+
+    Category(String name, String description) {
+        this.name = name;
+        this.description = description;
+    }
+}
+
+class Product {
+    String name;
+    String description;
+    double price;
+    String category;
+    int stock;
+    List<String> likedBy = new ArrayList<>();
+    List<Review> reviews = new ArrayList<>();
+
+    Product(String name, String description, double price, String category, int stock) {
+        this.name = name;
+        this.description = description;
+        this.price = price;
+        this.category = category;
+        this.stock = stock;
+    }
+}
+
+class Review {
+    UserProfile user;
+    String comment;
+    int rating;
+
+    Review(UserProfile user, String comment, int rating) {
+        this.user = user;
+        this.comment = comment;
+        this.rating = rating;
+    }
+}
+
+class Coupon {
+    String code;
+    double discount;
+
+    Coupon(String code, double discount) {
+        this.code = code;
+        this.discount = discount;
+    }
+}
+
+class Order {
+    UserProfile user;
+    Product product;
+    int quantity;
+    String status;
+
+    Order(UserProfile user, Product product, int quantity) {
+        this.user = user;
+        this.product = product;
+        this.quantity = quantity;
+        this.status = "Processing";
+    }
+}
+
+class SupportTicket {
+    UserProfile user;
+    String message;
+    String status;
+
+    SupportTicket(UserProfile user, String message) {
+        this.user = user;
+        this.message = message;
+        this.status = "Open";
+    }
+}
+
+class ShoppingCart {
+    List<Order> items = new ArrayList<>();
+
+    void addProduct(Order order) {
+        items.add(order);
+    }
+
+    void removeProduct(Order order) {
+        items.remove(order);
+    }
+
+    double calculateTotal() {
+        return items.stream().mapToDouble(i -> i.product.price * i.quantity).sum();
+    }
+
+    double applyCoupon(Coupon coupon) {
+        return calculateTotal() * (1 - coupon.discount / 100);
+    }
+}
+
+class Shop {
+    private List<UserProfile> users = new ArrayList<>();
+    private List<Category> categories = new ArrayList<>();
+    private List<Product> products = new ArrayList<>();
+    private List<Coupon> availableCoupons = new ArrayList<>();
+    private List<SupportTicket> supportTickets = new ArrayList<>();
+    private List<Order> orders = new ArrayList<>();
+    private ShoppingCart shoppingCart = new ShoppingCart();
+    private UserProfile currentUser = null;
+    private String connectionString = "jdbc:sqlite:shop.db";
+
+    public Shop() {
+        loadDataFromDatabase();
+    }
+
+    private void loadDataFromDatabase() {
+        try (Connection connection = DriverManager.getConnection(connectionString)) {
+            Statement statement = connection.createStatement();
+
+            ResultSet rs = statement.executeQuery("SELECT * FROM Users");
+            while (rs.next()) {
+                users.add(new UserProfile(rs.getString("Username"), rs.getString("Password"), rs.getString("Address")));
+            }
+
+            rs = statement.executeQuery("SELECT * FROM Categories");
+            while (rs.next()) {
+                categories.add(new Category(rs.getString("Name"), rs.getString("Description")));
+            }
+
+            rs = statement.executeQuery("SELECT * FROM Products");
+            while (rs.next()) {
+                products.add(new Product(rs.getString("Name"), rs.getString("Description"), rs.getDouble("Price"), rs.getString("Category"), rs.getInt("Stock")));
+            }
+
+            rs = statement.executeQuery("SELECT * FROM Coupons");
+            while (rs.next()) {
+                availableCoupons.add(new Coupon(rs.getString("Code"), rs.getDouble("Discount")));
+            }
+
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean login(String username, String password) {
+        for (UserProfile user : users) {
+            if (user.username.equals(username) && user.password.equals(password)) {
+                currentUser = user;
+                System.out.println("Logged in as " + username);
+                return true;
+            }
+        }
+        System.out.println("Login failed");
+        return false;
+    }
+
+    public void signup(String username, String password, String address) {
+        try (Connection connection = DriverManager.getConnection(connectionString)) {
+            PreparedStatement ps = connection.prepareStatement("INSERT INTO Users (Username, Password, Address) VALUES (?, ?, ?)");
+            ps.setString(1, username);
+            ps.setString(2, password);
+            ps.setString(3, address);
+            ps.executeUpdate();
+
+            users.add(new UserProfile(username, password, address));
+            System.out.println("User registered successfully!");
+
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void searchProducts(String query) {
+        System.out.println("Search results for '" + query + "':");
+        for (Product product : products) {
+            if (product.name.contains(query) || product.description.contains(query)) {
+                System.out.println(product.name + " - " + product.price + " USD");
+            }
+        }
+    }
+
+    public void filterProductsByCategory(String category) {
+        System.out.println("Products in category '" + category + "':");
+        for (Product product : products) {
+            if (product.category.equals(category)) {
+                System.out.println(product.name + " - " + product.price + " USD");
+            }
+        }
+    }
+
+    public void toggleLikeProduct(String productName) {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        for (Product product : products) {
+            if (product.name.equals(productName)) {
+                if (product.likedBy.contains(currentUser.username)) {
+                    product.likedBy.remove(currentUser.username);
+                    System.out.println("Product removed from wishlist.");
+                } else {
+                    product.likedBy.add(currentUser.username);
+                    System.out.println("Product added to wishlist.");
+                }
+                return;
+            }
+        }
+        System.out.println("Product not found.");
+    }
+
+    public void addToCart(String productName, int quantity) {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        for (Product product : products) {
+            if (product.name.equals(productName)) {
+                if (product.stock >= quantity) {
+                    Order order = new Order(currentUser, product, quantity);
+                    shoppingCart.addProduct(order);
+                    orders.add(order);
+                    System.out.println(productName + " added to cart.");
+                } else {
+                    System.out.println("Not enough stock for " + productName + ". Only " + product.stock + " left.");
+                }
+                return;
+            }
+        }
+        System.out.println("Product not found.");
+    }
+
+    public void viewCart() {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        System.out.println("Your Cart:");
+        for (Order order : shoppingCart.items) {
+            if (order.user == currentUser) {
+                System.out.println(order.product.name + " - " + order.quantity + " units - " + order.product.price * order.quantity + " USD");
+            }
+        }
+    }
+
+    public void applyCoupon(String couponCode) {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        Coupon coupon = availableCoupons.stream().filter(c -> c.code.equals(couponCode)).findFirst().orElse(null);
+        if (coupon != null) {
+            double total = shoppingCart.applyCoupon(coupon);
+            System.out.println("Coupon applied. Total after discount: " + total + " USD");
+        } else {
+            System.out.println("Invalid coupon code.");
+        }
+    }
+
+    public void checkout() {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        double total = shoppingCart.calculateTotal();
+        System.out.println("Total amount to pay: " + total + " USD");
+        System.out.println("Order placed successfully!");
+
+        for (Order order : shoppingCart.items) {
+            order.product.stock -= order.quantity;
+        }
+
+        shoppingCart.items.clear();
+    }
+
+    public void writeReview(String productName, String comment, int rating) {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        for (Product product : products) {
+            if (product.name.equals(productName)) {
+                product.reviews.add(new Review(currentUser, comment, rating));
+                System.out.println("Review added.");
+                return;
+            }
+        }
+        System.out.println("Product not found.");
+    }
+
+    public void viewReviews(String productName) {
+        for (Product product : products) {
+            if (product.name.equals(productName)) {
+                System.out.println("Reviews for " + product.name + ":");
+                for (Review review : product.reviews) {
+                    System.out.println(review.user.username + ": " + review.comment + " (Rating: " + review.rating + "/5)");
+                }
+                return;
+            }
+        }
+        System.out.println("Product not found.");
+    }
+
+    public void contactSupport(String message) {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        supportTickets.add(new SupportTicket(currentUser, message));
+        System.out.println("Support ticket created. We will get back to you soon.");
+    }
+
+    public void viewSupportTickets() {
+        if (currentUser == null) {
+            System.out.println("Please login first.");
+            return;
+        }
+
+        System.out.println("Your Support Tickets:");
+        for (SupportTicket ticket : supportTickets) {
+            if (ticket.user == currentUser) {
+                System.out.println(ticket.message + " - Status: " + ticket.status);
+            }
+        }
+    }
+
+    public void run() {
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.print("\nEnter a command (signup, login, search, category, like, add, cart, applycoupon, checkout, review, viewreviews, support, viewsupport, exit): ");
+            String command = scanner.nextLine();
+
+            switch (command) {
+                case "signup":
+                    System.out.print("Username: ");
+                    String username = scanner.nextLine();
+                    System.out.print("Password: ");
+                    String password = scanner.nextLine();
+                    System.out.print("Address: ");
+                    String address = scanner.nextLine();
+                    signup(username, password, address);
+                    break;
+                case "login":
+                    System.out.print("Username: ");
+                    username = scanner.nextLine();
+                    System.out.print("Password: ");
+                    password = scanner.nextLine();
+                    login(username, password);
+                    break;
+                case "search":
+                    System.out.print("Search: ");
+                    String query = scanner.nextLine();
+                    searchProducts(query);
+                    break;
+                case "category":
+                    System.out.print("Category: ");
+                    String category = scanner.nextLine();
+                    filterProductsByCategory(category);
+                    break;
+                case "like":
+                    System.out.print("Product name: ");
+                    String productName = scanner.nextLine();
+                    toggleLikeProduct(productName);
+                    break;
+                case "add":
+                    System.out.print("Product name: ");
+                    productName = scanner.nextLine();
+                    System.out.print("Quantity: ");
+                    int quantity = scanner.nextInt();
+                    scanner.nextLine();
+                    addToCart(productName, quantity);
+                    break;
+                case "cart":
+                    viewCart();
+                    break;
+                case "applycoupon":
+                    System.out.print("Coupon code: ");
+                    String couponCode = scanner.nextLine();
+                    applyCoupon(couponCode);
+                    break;
+                case "checkout":
+                    checkout();
+                    break;
+                case "review":
+                    System.out.print("Product name: ");
+                    productName = scanner.nextLine();
+                    System.out.print("Your review: ");
+                    String comment = scanner.nextLine();
+                    System.out.print("Rating (1-5): ");
+                    int rating = scanner.nextInt();
+                    scanner.nextLine();
+                    writeReview(productName, comment, rating);
+                    break;
+                case "viewreviews":
+                    System.out.print("Product name: ");
+                    productName = scanner.nextLine();
+                    viewReviews(productName);
+                    break;
+                case "support":
+                    System.out.print("Your message: ");
+                    String message = scanner.nextLine();
+                    contactSupport(message);
+                    break;
+                case "viewsupport":
+                    viewSupportTickets();
+                    break;
+                case "exit":
+                    scanner.close();
+                    return;
+                default:
+                    System.out.println("Invalid command");
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        Shop shop = new Shop();
+        shop.run();
+    }
+}

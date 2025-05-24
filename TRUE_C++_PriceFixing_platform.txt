@@ -1,0 +1,257 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <ctime>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <sstream>
+
+using json = nlohmann::json;
+
+struct PricingConfig {
+    double BasePriceWeight;
+    double CompetitorPriceWeight;
+    double DemandWeight;
+    double MinPriceMargin;
+    double MaxPriceMargin;
+};
+
+struct Product {
+    int Id;
+    std::string Name;
+    std::string Description;
+    double BasePrice;
+    double CurrentPrice;
+    double Discount;
+    int Stock;
+    std::vector<std::string> Keywords;
+};
+
+struct CompetitorPrice {
+    int ProductId;
+    std::string CompetitorName;
+    double Price;
+    std::time_t LastUpdated;
+};
+
+struct CartItem {
+    int ProductId;
+    int Quantity;
+    double PriceAtAdd;
+};
+
+struct Order {
+    int Id;
+    std::string UserId;
+    std::vector<CartItem> Items;
+    double Total;
+    std::time_t OrderDate;
+    std::string Status;
+};
+
+class ECommerceService {
+private:
+    std::string dbConnectionString;
+    PricingConfig config;
+
+    PricingConfig LoadPricingConfig(const std::string& filePath) {
+        std::ifstream file(filePath);
+        json j;
+        file >> j;
+        PricingConfig cfg;
+        cfg.BasePriceWeight = j["BasePriceWeight"];
+        cfg.CompetitorPriceWeight = j["CompetitorPriceWeight"];
+        cfg.DemandWeight = j["DemandWeight"];
+        cfg.MinPriceMargin = j["MinPriceMargin"];
+        cfg.MaxPriceMargin = j["MaxPriceMargin"];
+        return cfg;
+    }
+
+    double CalculateNewPrice(const Product& product) {
+        std::vector<CompetitorPrice> competitorPrices = GetCompetitorPrices(product.Id);
+        double avgCompetitorPrice = competitorPrices.empty() ? product.BasePrice : 
+            std::accumulate(competitorPrices.begin(), competitorPrices.end(), 0.0, 
+                [](double sum, const CompetitorPrice& cp) { return sum + cp.Price; }) / competitorPrices.size();
+
+        double demandFactor = CalculateDemandFactor(product.Id);
+        double weightedPrice = (config.BasePriceWeight * product.BasePrice +
+                              config.CompetitorPriceWeight * avgCompetitorPrice +
+                              config.DemandWeight * demandFactor * product.BasePrice) /
+                              (config.BasePriceWeight + config.CompetitorPriceWeight + config.DemandWeight);
+
+        double minPrice = product.BasePrice * config.MinPriceMargin;
+        double maxPrice = product.BasePrice * config.MaxPriceMargin;
+        return std::clamp(weightedPrice, minPrice, maxPrice);
+    }
+
+    double CalculateDemandFactor(int productId) {
+        std::time_t now = std::time(nullptr);
+        std::tm lastMonth = *std::gmtime(&now);
+        lastMonth.tm_mon -= 1;
+        std::time_t lastMonthTime = std::mktime(&lastMonth);
+        
+        int salesLastMonth = GetSalesCount(productId, lastMonthTime);
+        int avgSales = GetAverageSalesCount(productId);
+        return (salesLastMonth > 0 && avgSales > 0) ? static_cast<double>(salesLastMonth) / avgSales : 1.0;
+    }
+
+    std::vector<CompetitorPrice> GetCompetitorPrices(int productId) {
+        std::vector<CompetitorPrice> prices;
+        sqlite3* db;
+        sqlite3_open(dbConnectionString.c_str(), &db);
+        std::string query = "SELECT ProductId, CompetitorName, Price, LastUpdated FROM CompetitorPrices WHERE ProductId = ?";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, productId);
+        
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CompetitorPrice cp;
+            cp.ProductId = sqlite3_column_int(stmt, 0);
+            cp.CompetitorName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            cp.Price = sqlite3_column_double(stmt, 2);
+            cp.LastUpdated = sqlite3_column_int64(stmt, 3);
+            prices.push_back(cp);
+        }
+        
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return prices;
+    }
+
+    int GetSalesCount(int productId, std::time_t startDate) {
+        sqlite3* db;
+        sqlite3_open(dbConnectionString.c_str(), &db);
+        std::string query = "SELECT SUM(Quantity) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, productId);
+        sqlite3_bind_int64(stmt, 2, startDate);
+        
+        int result = 0;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = sqlite3_column_int(stmt, 0);
+        }
+        
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return result;
+    }
+
+    int GetAverageSalesCount(int productId) {
+        std::time_t now = std::time(nullptr);
+        std::tm lastYear = *std::gmtime(&now);
+        lastYear.tm_year -= 1;
+        std::time_t lastYearTime = std::mktime(&lastYear);
+        
+        sqlite3* db;
+        sqlite3_open(dbConnectionString.c_str(), &db);
+        std::string query = "SELECT AVG(Quantity) FROM OrderItems WHERE ProductId = ? AND OrderId IN (SELECT Id FROM Orders WHERE OrderDate >= ?)";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, productId);
+        sqlite3_bind_int64(stmt, 2, lastYearTime);
+        
+        int result = 1;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = sqlite3_column_int(stmt, 0);
+        }
+        
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return result;
+    }
+
+public:
+    ECommerceService(const std::string& dbConnStr, const std::string& configFilePath) 
+        : dbConnectionString(dbConnStr), config(LoadPricingConfig(configFilePath)) {}
+
+    void UpdateProductPrices() {
+        std::vector<Product> products = GetAllProducts();
+        for (const auto& product : products) {
+            double newPrice = CalculateNewPrice(product);
+            UpdateProductPrice(product.Id, newPrice);
+        }
+    }
+
+    std::vector<Product> GetAllProducts() {
+        std::vector<Product> products;
+        sqlite3* db;
+        sqlite3_open(dbConnectionString.c_str(), &db);
+        std::string query = "SELECT Id, Name, Description, BasePrice, CurrentPrice, Discount, Stock, Keywords FROM Products";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+        
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Product p;
+            p.Id = sqlite3_column_int(stmt, 0);
+            p.Name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            p.Description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            p.BasePrice = sqlite3_column_double(stmt, 3);
+            p.CurrentPrice = sqlite3_column_double(stmt, 4);
+            p.Discount = sqlite3_column_double(stmt, 5);
+            p.Stock = sqlite3_column_int(stmt, 6);
+            std::string keywords = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            std::stringstream ss(keywords);
+            std::string keyword;
+            while (std::getline(ss, keyword, ',')) {
+                p.Keywords.push_back(keyword);
+            }
+            products.push_back(p);
+        }
+        
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return products;
+    }
+
+    void UpdateProductPrice(int productId, double newPrice) {
+        sqlite3* db;
+        sqlite3_open(dbConnectionString.c_str(), &db);
+        std::string query = "UPDATE Products SET CurrentPrice = ?, LastUpdated = ? WHERE Id = ?";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+        sqlite3_bind_double(stmt, 1, newPrice);
+        sqlite3_bind_int64(stmt, 2, std::time(nullptr));
+        sqlite3_bind_int(stmt, 3, productId);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+
+    std::vector<Product> SearchProducts(const std::string& keyword, const std::string& sortBy) {
+        std::vector<Product> products = GetAllProducts();
+        std::vector<Product> filtered;
+        std::string lowerKeyword = keyword;
+        std::transform(lowerKeyword.begin(), lowerKeyword.end(), lowerKeyword.begin(), ::tolower);
+        
+        for (const auto& p : products) {
+            std::string lowerName = p.Name;
+            std::string lowerDesc = p.Description;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+            std::transform(lowerDesc.begin(), lowerDesc.end(), lowerDesc.begin(), ::tolower);
+            
+            bool keywordMatch = lowerName.find(lowerKeyword) != std::string::npos ||
+                              lowerDesc.find(lowerKeyword) != std::string::npos;
+            for (const auto& k : p.Keywords) {
+                std::string lowerK = k;
+                std::transform(lowerK.begin(), lowerK.end(), lowerK.begin(), ::tolower);
+                if (lowerK.find(lowerKeyword) != std::string::npos) {
+                    keywordMatch = true;
+                    break;
+                }
+            }
+            if (keywordMatch) {
+                filtered.push_back(p);
+            }
+        }
+
+        if (sortBy == "priceasc") {
+            std::sort(filtered.begin(), filtered.end(), 
+                [](const Product& a, const Product& b) { return a.CurrentPrice < b.CurrentPrice; });
+        }
+        
+        return filtered;
+    }
+};

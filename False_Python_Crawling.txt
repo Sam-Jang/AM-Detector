@@ -1,0 +1,66 @@
+import requests
+from bs4 import BeautifulSoup
+import sqlite3
+import time
+from datetime import datetime
+
+conn = sqlite3.connect('hotels.db')
+cursor = conn.cursor()
+
+base_url = 'https://www.hotelbookworld.co.kr/hotels?page='
+page = 1
+has_more_hotels = True
+
+def download_image(url):
+    response = requests.get(url)
+    return response.content
+
+while has_more_hotels:
+    url = base_url + str(page)
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    hotels = soup.find_all('div', class_='hotel-info')
+    
+    if not hotels:
+        has_more_hotels = False
+        break
+
+    for hotel in hotels:
+        name = hotel.find('h2', class_='hotel-name').text.strip()
+        location = hotel.find('p', class_='hotel-location').text.strip()
+        phone = hotel.find('p', class_='hotel-phone').text.strip()
+        breakfast = hotel.find('span', class_='hotel-breakfast').text.strip()
+        amenities = hotel.find('span', class_='hotel-amenities').text.strip()
+
+        image_url = hotel.find('img', class_='hotel-image')['src']
+        image_blob = download_image(image_url)
+
+        cursor.execute('''
+            INSERT INTO hotels (name, location, phone, breakfast, amenities, image)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, location, phone, breakfast, amenities, image_blob))
+
+        hotel_id = cursor.lastrowid
+
+        rooms = hotel.find_all('div', class_='room-info')
+
+        for room in rooms:
+            room_type = room.find('h3', class_='room-type').text.strip()
+            
+            price_entries = room.find_all('div', class_='price-entry')
+            for entry in price_entries:
+                date = entry.find('span', class_='date').text.strip()
+                price = float(entry.find('span', class_='price').text.strip().replace(',', '').replace('₩', ''))
+
+                cursor.execute('''
+                    INSERT INTO room_prices (hotel_id, room_type, date, price)
+                    VALUES (?, ?, ?, ?)
+                ''', (hotel_id, room_type, date, price))
+
+    conn.commit()
+
+    page += 1
+    time.sleep(1)
+
+conn.close()

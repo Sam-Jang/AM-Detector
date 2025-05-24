@@ -1,0 +1,515 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MySql.Data.MySqlClient;
+using Newtonsoft.Json;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace GameServer
+{
+    class Program
+    {
+        static string dbConnStr = "Server=localhost;Database=game_db;Uid=game_user;Pwd=secure_pwd;";
+        static string configPath = "game_config.json";
+        static GameConfig config;
+
+        class GameConfig
+        {
+            public Dictionary<string, double> ItemPrices { get; set; }
+            public Dictionary<string, int> ItemPointReqs { get; set; }
+            public double BaseProb { get; set; }
+            public int MaxAttempts { get; set; }
+        }
+
+        class User
+        {
+            public int Id { get; set; }
+            public string Username { get; set; }
+            public string PasswordHash { get; set; }
+            public int Currency { get; set; }
+        }
+
+        class Item
+        {
+            public int Id { get; set; }
+            public string Name { get; set; }
+            public double Price { get; set; }
+            public bool IsProb { get; set; }
+        }
+
+        class Inventory
+        {
+            public int UserId { get; set; }
+            public int ItemId { get; set; }
+            public int Quantity { get; set; }
+        }
+
+        class Transaction
+        {
+            public int Id { get; set; }
+            public int UserId { get; set; }
+            public int ItemId { get; set; }
+            public DateTime Time { get; set; }
+            public double Amount { get; set; }
+        }
+
+        class ProbAttempt
+        {
+            public int UserId { get; set; }
+            public int ItemId { get; set; }
+            public int Points { get; set; }
+            public int Attempts { get; set; }
+        }
+
+        static async Task Main(string[] args)
+        {
+            config = JsonConvert.DeserializeObject<GameConfig>(File.ReadAllText(configPath));
+            await InitDb();
+            await RunServer();
+        }
+
+        static async Task InitDb()
+        {
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand(@"
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        username VARCHAR(50) UNIQUE,
+                        password_hash VARCHAR(256),
+                        currency INT DEFAULT 0
+                    );
+                    CREATE TABLE IF NOT EXISTS items (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        name VARCHAR(100),
+                        price DOUBLE,
+                        is_prob BOOLEAN
+                    );
+                    CREATE TABLE IF NOT EXISTS inventory (
+                        user_id INT,
+                        item_id INT,
+                        quantity INT,
+                        PRIMARY KEY (user_id, item_id),
+                        FOREIGN KEY (user_id) REFERENCES users(id),
+                        FOREIGN KEY (item_id) REFERENCES items(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id INT,
+                        item_id INT,
+                        time DATETIME,
+                        amount DOUBLE,
+                        FOREIGN KEY (user_id) REFERENCES users(id),
+                        FOREIGN KEY (item_id) REFERENCES items(id)
+                    );
+                    CREATE TABLE IF NOT EXISTS prob_attempts (
+                        user_id INT,
+                        item_id INT,
+                        points INT DEFAULT 0,
+                        attempts INT DEFAULT 0,
+                        PRIMARY KEY (user_id, item_id),
+                        FOREIGN KEY (user_id) REFERENCES users(id),
+                        FOREIGN KEY (item_id) REFERENCES items(id)
+                    );", conn);
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+
+        static async Task RunServer()
+        {
+            while (true)
+            {
+                Console.WriteLine("1: Register, 2: Login, 3: Shop, 4: Inventory, 5: Search, 6: History, 7: Use Item");
+                var choice = Console.ReadLine();
+                switch (choice)
+                {
+                    case "1": await RegisterUser(); break;
+                    case "2": await LoginUser(); break;
+                    case "3": await ShopMenu(); break;
+                    case "4": await ViewInventory(); break;
+                    case "5": await SearchItems(); break;
+                    case "6": await ViewHistory(); break;
+                    case "7": await UseItem(); break;
+                }
+            }
+        }
+
+        static async Task RegisterUser()
+        {
+            Console.Write("Username: ");
+            var username = Console.ReadLine();
+            Console.Write("Password: ");
+            var password = Console.ReadLine();
+            var pwdHash = HashPassword(password);
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("INSERT INTO users (username, password_hash, currency) VALUES (@un, @ph, 1000)", conn);
+                cmd.Parameters.AddWithValue("@un", username);
+                cmd.Parameters.AddWithValue("@ph", pwdHash);
+                await cmd.ExecuteNonQueryAsync();
+                Console.WriteLine("User registered.");
+            }
+        }
+
+        static async Task<User> LoginUser()
+        {
+            Console.Write("Username: ");
+            var username = Console.ReadLine();
+            Console.Write("Password: ");
+            var password = Console.ReadLine();
+            var pwdHash = HashPassword(password);
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT id, username, currency FROM users WHERE username = @un AND password_hash = @ph", conn);
+                cmd.Parameters.AddWithValue("@un", username);
+                cmd.Parameters.AddWithValue("@ph", pwdHash);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    if (await reader.ReadAsync())
+                    {
+                        var user = new User
+                        {
+                            Id = reader.GetInt32("id"),
+                            Username = reader.GetString("username"),
+                            Currency = reader.GetInt32("currency")
+                        };
+                        Console.WriteLine($"Logged in as {user.Username}. Currency: {user.Currency}");
+                        return user;
+                    }
+                    Console.WriteLine("Invalid credentials.");
+                    return null;
+                }
+            }
+        }
+
+        static string HashPassword(string password)
+        {
+            using (var sha256 = SHA256.Create())
+            {
+                var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password));
+                var builder = new StringBuilder();
+                foreach (var b in bytes)
+                    builder.Append(b.ToString("x2"));
+                return builder.ToString();
+            }
+        }
+
+        static async Task ShopMenu()
+        {
+            var user = await LoginUser();
+            if (user == null) return;
+
+            var items = await GetItems();
+            Console.WriteLine("Shop Items:");
+            foreach (var item in items)
+                Console.WriteLine($"ID: {item.Id}, Name: {item.Name}, Price: {item.Price}, Probabilistic: {item.IsProb}");
+
+            Console.Write("Enter item ID to purchase: ");
+            if (!int.TryParse(Console.ReadLine(), out int itemId)) return;
+            var selectedItem = items.FirstOrDefault(i => i.Id == itemId);
+            if (selectedItem == null)
+            {
+                Console.WriteLine("Invalid item ID.");
+                return;
+            }
+
+            if (user.Currency < selectedItem.Price)
+            {
+                Console.WriteLine("Insufficient currency.");
+                return;
+            }
+
+            await PurchaseItem(user, selectedItem);
+        }
+
+        static async Task<List<Item>> GetItems()
+        {
+            var items = new List<Item>();
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT id, name, price, is_prob FROM items", conn);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        items.Add(new Item
+                        {
+                            Id = reader.GetInt32("id"),
+                            Name = reader.GetString("name"),
+                            Price = reader.GetDouble("price"),
+                            IsProb = reader.GetBoolean("is_prob")
+                        });
+                    }
+                }
+            }
+            return items;
+        }
+
+        static async Task PurchaseItem(User user, Item item)
+        {
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                using (var tx = await conn.BeginTransactionAsync())
+                {
+                    var cmd = new MySqlCommand("UPDATE users SET currency = currency - @price WHERE id = @uid", conn, tx);
+                    cmd.Parameters.AddWithValue("@price", item.Price);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    await cmd.ExecuteNonQueryAsync();
+
+                    cmd = new MySqlCommand("INSERT INTO inventory (user_id, item_id, quantity) VALUES (@uid, @iid, 1) ON DUPLICATE KEY UPDATE quantity = quantity + 1", conn, tx);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    cmd.Parameters.AddWithValue("@iid", item.Id);
+                    await cmd.ExecuteNonQueryAsync();
+
+                    cmd = new MySqlCommand("INSERT INTO transactions (user_id, item_id, time, amount) VALUES (@uid, @iid, @time, @amt)", conn, tx);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    cmd.Parameters.AddWithValue("@iid", item.Id);
+                    cmd.Parameters.AddWithValue("@time", DateTime.Now);
+                    cmd.Parameters.AddWithValue("@amt", item.Price);
+                    await cmd.ExecuteNonQueryAsync();
+
+                    await tx.CommitAsync();
+                    Console.WriteLine($"Purchased {item.Name}.");
+                }
+            }
+        }
+
+        static async Task ViewInventory()
+        {
+            var user = await LoginUser();
+            if (user == null) return;
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = @uid", conn);
+                cmd.Parameters.AddWithValue("@uid", user.Id);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    Console.WriteLine("Inventory:");
+                    while (await reader.ReadAsync())
+                        Console.WriteLine($"Item: {reader.GetString("name")}, Quantity: {reader.GetInt32("quantity")}");
+                }
+            }
+        }
+
+        static async Task SearchItems()
+        {
+            Console.Write("Search keyword: ");
+            var keyword = Console.ReadLine();
+            Console.WriteLine("Sort by: 1: Price Asc, 2: Price Desc, 3: Name Asc, 4: Name Desc");
+            var sortChoice = Console.ReadLine();
+
+            string sortSql = sortChoice switch
+            {
+                "1" => "ORDER BY price ASC",
+                "2" => "ORDER BY price DESC",
+                "3" => "ORDER BY name ASC",
+                "4" => "ORDER BY name DESC",
+                _ => ""
+            };
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand($"SELECT id, name, price, is_prob FROM items WHERE name LIKE @kw {sortSql}", conn);
+                cmd.Parameters.AddWithValue("@kw", $"%{keyword}%");
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    Console.WriteLine("Search Results:");
+                    while (await reader.ReadAsync())
+                        Console.WriteLine($"ID: {reader.GetInt32("id")}, Name: {reader.GetString("name")}, Price: {reader.GetDouble("price")}, Probabilistic: {reader.GetBoolean("is_prob")}");
+                }
+            }
+        }
+
+        static async Task ViewHistory()
+        {
+            var user = await LoginUser();
+            if (user == null) return;
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT i.name, t.time, t.amount FROM transactions t JOIN items i ON t.item_id = i.id WHERE t.user_id = @uid ORDER BY t.time DESC", conn);
+                cmd.Parameters.AddWithValue("@uid", user.Id);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    Console.WriteLine("Transaction History:");
+                    while (await reader.ReadAsync())
+                        Console.WriteLine($"Item: {reader.GetString("name")}, Time: {reader.GetDateTime("time")}, Amount: {reader.GetDouble("amount")}");
+                }
+            }
+        }
+
+        static async Task UseItem()
+        {
+            var user = await LoginUser();
+            if (user == null) return;
+
+            var invItems = await GetInventoryItems(user.Id);
+            Console.WriteLine("Your Items:");
+            foreach (var item in invItems)
+                Console.WriteLine($"ID: {item.ItemId}, Name: {item.Name}, Quantity: {item.Quantity}");
+
+            Console.Write("Enter item ID to use: ");
+            if (!int.TryParse(Console.ReadLine(), out int itemId)) return;
+            var selectedItem = invItems.FirstOrDefault(i => i.ItemId == itemId);
+            if (selectedItem == null || selectedItem.Quantity == 0)
+            {
+                Console.WriteLine("Invalid item or insufficient quantity.");
+                return;
+            }
+
+            var itemDetails = await GetItemDetails(itemId);
+            if (itemDetails.IsProb)
+                await ProcessProbItem(user, itemDetails);
+            else
+                await ProcessRegularItem(user, itemDetails);
+        }
+
+        static async Task<List<Inventory>> GetInventoryItems(int userId)
+        {
+            var items = new List<Inventory>();
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT inv.item_id, i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = @uid", conn);
+                cmd.Parameters.AddWithValue("@uid", userId);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        items.Add(new Inventory
+                        {
+                            ItemId = reader.GetInt32("item_id"),
+                            Quantity = reader.GetInt32("quantity")
+                        });
+                    }
+                }
+            }
+            return items;
+        }
+
+        static async Task<Item> GetItemDetails(int itemId)
+        {
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlCommand("SELECT id, name, price, is_prob FROM items WHERE id = @iid", conn);
+                cmd.Parameters.AddWithValue("@iid", itemId);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    if (await reader.ReadAsync())
+                        return new Item
+                        {
+                            Id = reader.GetInt32("id"),
+                            Name = reader.GetString("name"),
+                            Price = reader.GetDouble("price"),
+                            IsProb = reader.GetBoolean("is_prob")
+                        };
+                    return null;
+                }
+            }
+        }
+
+        static async Task ProcessRegularItem(User user, Item item)
+        {
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                using (var tx = await conn.BeginTransactionAsync())
+                {
+                    var cmd = new MySqlCommand("UPDATE inventory SET quantity = quantity - 1 WHERE user_id = @uid AND item_id = @iid AND quantity > 0", conn, tx);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    cmd.Parameters.AddWithValue("@iid", item.Id);
+                    var rows = await cmd.ExecuteNonQueryAsync();
+                    if (rows == 0)
+                    {
+                        Console.WriteLine("Failed to use item.");
+                        return;
+                    }
+
+                    await tx.CommitAsync();
+                    Console.WriteLine($"Used {item.Name}. Effect applied.");
+                }
+            }
+        }
+
+        static async Task ProcessProbItem(User user, Item item)
+        {
+            var attempt = await GetOrCreateAttempt(user.Id, item.Id);
+            attempt.Attempts++;
+            attempt.Points += new Random().Next(1, 10);
+
+            var reqPoints = config.ItemPointReqs.ContainsKey(item.Name) ? config.ItemPointReqs[item.Name] : 50;
+            bool success = attempt.Points >= reqPoints;
+
+            if (!success && attempt.Attempts >= config.MaxAttempts)
+            {
+                success = new Random().NextDouble() < config.BaseProb;
+            }
+
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                using (var tx = await conn.BeginTransactionAsync())
+                {
+                    var cmd = new MySqlCommand("UPDATE inventory SET quantity = quantity - 1 WHERE user_id = @uid AND item_id = @iid AND quantity > 0", conn, tx);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    cmd.Parameters.AddWithValue("@iid", item.Id);
+                    var rows = await cmd.ExecuteNonQueryAsync();
+                    if (rows == 0)
+                    {
+                        Console.WriteLine("Failed to use item.");
+                        return;
+                    }
+
+                    cmd = new MySqlCommand("INSERT INTO prob_attempts (user_id, item_id, points, attempts) VALUES (@uid, @iid, @pts, @atm) ON DUPLICATE KEY UPDATE points = @pts, attempts = @atm", conn, tx);
+                    cmd.Parameters.AddWithValue("@uid", user.Id);
+                    cmd.Parameters.AddWithValue("@iid", item.Id);
+                    cmd.Parameters.AddWithValue("@pts", attempt.Points);
+                    cmd.Parameters.AddWithValue("@atm", attempt.Attempts);
+                    await cmd.ExecuteNonQueryAsync();
+
+                    await tx.CommitAsync();
+                }
+            }
+
+            Console.WriteLine(success ? $"Success! {item.Name} unlocked reward." : "Failed to unlock reward.");
+        }
+
+        static async Task<ProbAttempt> GetOrCreateAttempt(int userId, int itemId)
+        {
+            using (var conn = new MySqlConnection(dbConnStr))
+            {
+                await conn.OpenAsync();
+                var cmd = new MySqlConnection("SELECT points, attempts FROM prob_attempts WHERE user_id = @uid AND item_id = @iid", conn);
+                cmd.Parameters.AddWithValue("@uid", userId);
+                cmd.Parameters.AddWithValue("@iid", itemId);
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    if (await reader.ReadAsync())
+                        return new ProbAttempt
+                        {
+                            UserId = userId,
+                            ItemId = itemId,
+                            Points = reader.GetInt32("points"),
+                            Attempts = reader.GetInt32("attempts")
+                        };
+                }
+            }
+            return new ProbAttempt { UserId = userId, ItemId = itemId, Points = 0, Attempts = 0 };
+        }
+    }
+}

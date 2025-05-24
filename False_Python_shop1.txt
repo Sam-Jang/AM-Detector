@@ -1,0 +1,130 @@
+import pyodbc
+
+class User:
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+
+class Product:
+    def __init__(self, name, description, price, category, stock):
+        self.name = name
+        self.description = description
+        self.price = price
+        self.category = category
+        self.stock = stock
+
+class CartItem:
+    def __init__(self, product, quantity):
+        self.product = product
+        self.quantity = quantity
+
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    def add_product(self, product, quantity):
+        self.items.append(CartItem(product, quantity))
+
+    def show_cart(self):
+        print("Your Cart:")
+        for item in self.items:
+            print(f"{item.product.name} - {item.product.price} USD - Quantity: {item.quantity}")
+
+    def calculate_total(self):
+        total = sum(item.product.price * item.quantity for item in self.items)
+        return total
+
+class ShopEasy:
+    def __init__(self):
+        self.users = []
+        self.products = []
+        self.current_user = None
+        self.conn = self.connect_to_database()
+        self.load_users()
+        self.load_products()
+
+    def connect_to_database(self):
+        conn_str = (
+            r'DRIVER={SQL Server};'
+            r'SERVER=YOUR_SERVER_NAME;'
+            r'DATABASE=YOUR_DB_NAME;'
+            r'Trusted_Connection=yes;'
+        )
+        conn = pyodbc.connect(conn_str)
+        print("Connected to database!")
+        return conn
+
+    def load_users(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT username, password FROM Users")
+        for row in cursor:
+            self.users.append(User(row[0], row[1]))
+
+    def load_products(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name, description, price, category, stock FROM Products")
+        for row in cursor:
+            self.products.append(Product(row[0], row[1], row[2], row[3], row[4]))
+
+    def login(self, username, password):
+        for user in self.users:
+            if user.username == username and user.password == password:
+                self.current_user = user
+                print(f"Logged in as {username}")
+                return True
+        print("Login failed")
+        return False
+
+    def search_products(self, query):
+        print(f"Search results for '{query}':")
+        for product in self.products:
+            if query in product.name or query in product.description:
+                print(f"{product.name} - {product.price} USD")
+
+    def filter_products_by_category(self, category):
+        print(f"Products in category '{category}':")
+        for product in self.products:
+            if product.category == category:
+                print(f"{product.name} - {product.price} USD")
+
+    def checkout(self, cart):
+        total = cart.calculate_total()
+        print(f"Total amount to pay: {total} USD")
+        print("Order placed successfully!")
+        cart.items.clear()
+
+    def run(self):
+        cart = Cart()
+        while True:
+            command = input("\nEnter a command (login, search, category, add, cart, checkout, exit): ")
+
+            if command == "login":
+                username = input("Username: ")
+                password = input("Password: ")
+                self.login(username, password)
+            elif command == "search":
+                query = input("Search: ")
+                self.search_products(query)
+            elif command == "category":
+                category = input("Category: ")
+                self.filter_products_by_category(category)
+            elif command == "add":
+                product_name = input("Product name: ")
+                quantity = int(input("Quantity: "))
+                for product in self.products:
+                    if product.name == product_name:
+                        cart.add_product(product, quantity)
+                        print(f"{product_name} added to cart")
+                        break
+            elif command == "cart":
+                cart.show_cart()
+            elif command == "checkout":
+                self.checkout(cart)
+            elif command == "exit":
+                break
+            else:
+                print("Invalid command")
+
+if __name__ == "__main__":
+    shop = ShopEasy()
+    shop.run()

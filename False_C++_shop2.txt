@@ -1,0 +1,296 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+class Product {
+public:
+    int id;
+    std::string name;
+    double price;
+    std::string description;
+    std::string image;
+    int stock;
+
+    Product(int id, std::string name, double price, std::string description, std::string image, int stock)
+        : id(id), name(name), price(price), description(description), image(image), stock(stock) {}
+
+    std::string toString() {
+        return name;
+    }
+};
+
+class User {
+public:
+    int id;
+    std::string username;
+    std::string password;
+
+    User(int id, std::string username, std::string password) : id(id), username(username), password(password) {}
+
+    std::string getUsername() {
+        return username;
+    }
+
+    bool authenticate(std::string enteredPassword) {
+        return password == enteredPassword;
+    }
+};
+
+class Order {
+public:
+    int id;
+    User user;
+    Product product;
+    int quantity;
+    std::string createdAt;
+
+    Order(int id, User user, Product product, int quantity, std::string createdAt)
+        : id(id), user(user), product(product), quantity(quantity), createdAt(createdAt) {}
+
+    std::string toString() {
+        return "Order " + std::to_string(id) + " by " + user.getUsername();
+    }
+};
+
+class CartItem {
+public:
+    int id;
+    User user;
+    Product product;
+    int quantity;
+
+    CartItem(int id, User user, Product product, int quantity)
+        : id(id), user(user), product(product), quantity(quantity) {}
+
+    std::string toString() {
+        return product.name + " (" + std::to_string(quantity) + ")";
+    }
+};
+
+class Review {
+public:
+    int id;
+    Product product;
+    User user;
+    int rating;
+    std::string comment;
+    std::string createdAt;
+
+    Review(int id, Product product, User user, int rating, std::string comment, std::string createdAt)
+        : id(id), product(product), user(user), rating(rating), comment(comment), createdAt(createdAt) {}
+
+    std::string toString() {
+        return std::to_string(rating) + " by " + user.getUsername() + " on " + product.name;
+    }
+};
+
+class SupportTicket {
+public:
+    int id;
+    User user;
+    std::string subject;
+    std::string message;
+    std::string createdAt;
+    bool resolved;
+
+    SupportTicket(int id, User user, std::string subject, std::string message, std::string createdAt, bool resolved)
+        : id(id), user(user), subject(subject), message(message), createdAt(createdAt), resolved(resolved) {}
+
+    std::string toString() {
+        return "Ticket " + std::to_string(id) + " by " + user.getUsername();
+    }
+};
+
+class MainController {
+public:
+    std::vector<Product> productRepository;
+    std::vector<Order> orderRepository;
+    std::vector<CartItem> cartItemRepository;
+    std::vector<Review> reviewRepository;
+    std::vector<SupportTicket> supportTicketRepository;
+    std::vector<User> userRepository;
+
+    void signup(std::string username, std::string password) {
+        User newUser(userRepository.size() + 1, username, password);
+        userRepository.push_back(newUser);
+        std::cout << "Signup successful for " << username << std::endl;
+    }
+
+    bool login(std::string username, std::string password) {
+        auto it = std::find_if(userRepository.begin(), userRepository.end(), [&](User& u) {
+            return u.getUsername() == username && u.authenticate(password);
+        });
+
+        if (it != userRepository.end()) {
+            std::cout << "Login successful for " << username << std::endl;
+            return true;
+        } else {
+            std::cerr << "Login failed for " << username << std::endl;
+            return false;
+        }
+    }
+
+    void productList(std::string q = "", std::string sort_by = "") {
+        std::vector<Product> products = productRepository;
+
+        if (!q.empty()) {
+            products.erase(std::remove_if(products.begin(), products.end(), [&](Product& p) {
+                return p.name.find(q) == std::string::npos;
+            }), products.end());
+        }
+
+        if (sort_by == "price") {
+            std::sort(products.begin(), products.end(), [](Product& p1, Product& p2) {
+                return p1.price < p2.price;
+            });
+        } else if (sort_by == "name") {
+            std::sort(products.begin(), products.end(), [](Product& p1, Product& p2) {
+                return p1.name < p2.name;
+            });
+        }
+
+        for (Product& product : products) {
+            std::cout << product.toString() << std::endl;
+        }
+    }
+
+    void productDetail(int id) {
+        auto it = std::find_if(productRepository.begin(), productRepository.end(), [&](Product& p) {
+            return p.id == id;
+        });
+
+        if (it != productRepository.end()) {
+            Product product = *it;
+            std::cout << product.toString() << std::endl;
+        } else {
+            std::cerr << "Invalid product Id: " << id << std::endl;
+        }
+    }
+
+    void purchaseProduct(int productId, int quantity, User user) {
+        auto it = std::find_if(productRepository.begin(), productRepository.end(), [&](Product& p) {
+            return p.id == productId;
+        });
+
+        if (it != productRepository.end()) {
+            Product& product = *it;
+            if (product.stock >= quantity) {
+                product.stock -= quantity;
+
+                Order order(orderRepository.size() + 1, user, product, quantity, "2024-01-01");
+                orderRepository.push_back(order);
+
+                std::cout << "Order success!" << std::endl;
+            } else {
+                std::cerr << "Not enough stock" << std::endl;
+            }
+        } else {
+            std::cerr << "Invalid product Id: " << productId << std::endl;
+        }
+    }
+
+    void addToCart(int productId, User user) {
+        auto it = std::find_if(productRepository.begin(), productRepository.end(), [&](Product& p) {
+            return p.id == productId;
+        });
+
+        if (it != productRepository.end()) {
+            Product& product = *it;
+
+            auto cartIt = std::find_if(cartItemRepository.begin(), cartItemRepository.end(), [&](CartItem& c) {
+                return c.user.id == user.id && c.product.id == product.id;
+            });
+
+            if (cartIt == cartItemRepository.end()) {
+                CartItem cartItem(cartItemRepository.size() + 1, user, product, 1);
+                cartItemRepository.push_back(cartItem);
+            } else {
+                cartIt->quantity += 1;
+            }
+        } else {
+            std::cerr << "Invalid product Id: " << productId << std::endl;
+        }
+    }
+
+    void cartDetail(User user) {
+        auto cartItems = cartItemRepository;
+
+        cartItems.erase(std::remove_if(cartItems.begin(), cartItems.end(), [&](CartItem& item) {
+            return item.user.id != user.id;
+        }), cartItems.end());
+
+        for (CartItem& item : cartItems) {
+            std::cout << item.toString() << std::endl;
+        }
+    }
+
+    void orderHistory(User user) {
+        for (Order& order : orderRepository) {
+            if (order.user.id == user.id) {
+                std::cout << order.toString() << std::endl;
+            }
+        }
+    }
+
+    void addReview(int productId, int rating, std::string comment, User user) {
+        auto it = std::find_if(productRepository.begin(), productRepository.end(), [&](Product& p) {
+            return p.id == productId;
+        });
+
+        if (it != productRepository.end()) {
+            Product product = *it;
+            Review review(reviewRepository.size() + 1, product, user, rating, comment, "2024-01-01");
+            reviewRepository.push_back(review);
+        } else {
+            std::cerr << "Invalid product Id: " << productId << std::endl;
+        }
+    }
+
+    void supportTickets(User user) {
+        auto tickets = supportTicketRepository;
+
+        tickets.erase(std::remove_if(tickets.begin(), tickets.end(), [&](SupportTicket& t) {
+            return t.user.id != user.id;
+        }), tickets.end());
+
+        for (SupportTicket& ticket : tickets) {
+            std::cout << ticket.toString() << std::endl;
+        }
+    }
+
+    void createTicket(std::string subject, std::string message, User user) {
+        SupportTicket ticket(supportTicketRepository.size() + 1, user, subject, message, "2024-01-01", false);
+        supportTicketRepository.push_back(ticket);
+    }
+};
+
+int main() {
+    MainController controller;
+
+    controller.signup("johndoe", "password123");
+    controller.signup("janedoe", "password456");
+
+    User user(1, "johndoe", "password123");
+
+    controller.login(user.getUsername(), "password123");
+
+    controller.productRepository.push_back(Product(1, "Laptop", 999.99, "High-end gaming laptop", "laptop.jpg", 10));
+    controller.productRepository.push_back(Product(2, "Smartphone", 699.99, "Latest model smartphone", "smartphone.jpg", 5));
+    controller.productRepository.push_back(Product(3, "Headphones", 199.99, "Noise-cancelling headphones", "headphones.jpg", 15));
+
+    controller.productList();
+
+    controller.addToCart(1, user);
+    controller.cartDetail(user);
+
+    controller.purchaseProduct(1, 2, user);
+    controller.orderHistory(user);
+
+    controller.addReview(1, 5, "Excellent product!", user);
+
+    controller.createTicket("Order issue", "I have an issue with my order.", user);
+    controller.supportTickets(user);
+
+    return 0;
+}

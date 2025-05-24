@@ -1,0 +1,172 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Mvc;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class Program
+{
+    public static void Main(string[] args) => CreateHostBuilder(args).Build().Run();
+
+    public static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .ConfigureWebHostDefaults(webBuilder =>
+            {
+                webBuilder.UseStartup<Startup>();
+            });
+}
+
+public class Startup
+{
+    public void ConfigureServices(IServiceCollection services)
+    {
+        services.AddDbContext<ApplicationDbContext>(options =>
+            options.UseInMemoryDatabase("TestDb"));
+        services.AddControllersWithViews();
+    }
+
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+    {
+        if (env.IsDevelopment())
+        {
+            app.UseDeveloperExceptionPage();
+        }
+        else
+        {
+            app.UseExceptionHandler("/Home/Error");
+        }
+
+        app.UseRouting();
+        app.UseEndpoints(endpoints =>
+        {
+            endpoints.MapControllerRoute(
+                name: "default",
+                pattern: "{controller=User}/{action=ProfileLink}/{id?}");
+        });
+    }
+}
+
+public class ApplicationDbContext : DbContext
+{
+    public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options) : base(options) { }
+    public DbSet<User> Users { get; set; }
+}
+
+public class User
+{
+    public int Id { get; set; }
+    public string UserId { get; set; }
+    public string Password { get; set; }
+}
+
+[ApiController]
+[Route("[controller]")]
+public class UserController : Controller
+{
+    private readonly ApplicationDbContext _context;
+
+    public UserController(ApplicationDbContext context)
+    {
+        _context = context;
+    }
+
+    [HttpPost("profile_link")]
+    public IActionResult ProfileLink([FromForm] string profileUrl, [FromForm] string profileName)
+    {
+        var objectLink = $"<a href='{profileUrl}'>{profileName}</a>";
+        return Content(objectLink, "text/html");
+    }
+
+    [HttpPost("unsafe_login")]
+    public async Task<IActionResult> UnsafeLogin([FromForm] string username, [FromForm] string password)
+    {
+        var user = _context.Users.SingleOrDefault(u => u.UserId == username && u.Password == password);
+        if (user != null)
+        {
+            // Assume login logic
+            return Redirect("/home");
+        }
+        return View("Login", new { error = "Invalid credentials" });
+    }
+
+    [HttpPost("unsafe_comment")]
+    public IActionResult UnsafeComment([FromForm] string comment)
+    {
+        var commentDisplay = $"<p>{comment}</p>";
+        return Content(commentDisplay, "text/html");
+    }
+
+    [HttpGet("unsafe_redirect")]
+    public IActionResult UnsafeRedirect([FromQuery] string next)
+    {
+        return Redirect(next);
+    }
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register([FromForm] string userid, [FromForm] string password, [FromForm] string confirm_password)
+    {
+        if (password != confirm_password)
+        {
+            return BadRequest("Passwords do not match");
+        }
+        else
+        {
+            var user = new User { UserId = userid, Password = password };
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+            return Ok("Registration successful");
+        }
+    }
+
+    [HttpPost("login")]
+    public IActionResult Login([FromForm] string userid, [FromForm] string password)
+    {
+        var user = _context.Users.SingleOrDefault(u => u.UserId == userid && u.Password == password);
+        if (user != null)
+        {
+            return Ok("Login successful");
+        }
+        return BadRequest("Login failed");
+    }
+
+    [HttpPost("update_password")]
+    public async Task<IActionResult> UpdatePassword([FromForm] string userid, [FromForm] string new_password)
+    {
+        var user = _context.Users.SingleOrDefault(u => u.UserId == userid);
+        if (user != null)
+        {
+            user.Password = new_password;
+            await _context.SaveChangesAsync();
+            return Ok("Password updated successfully");
+        }
+        return BadRequest("User not found");
+    }
+
+    [HttpPost("delete_account")]
+    public async Task<IActionResult> DeleteAccount([FromForm] string userid)
+    {
+        var user = _context.Users.SingleOrDefault(u => u.UserId == userid);
+        if (user != null)
+        {
+            _context.Users.Remove(user);
+            await _context.SaveChangesAsync();
+            return Ok("Account deleted successfully");
+        }
+        return BadRequest("User not found");
+    }
+
+    [HttpGet("get_user")]
+    public IActionResult GetUser([FromQuery] string userid)
+    {
+        var user = _context.Users.SingleOrDefault(u => u.UserId == userid);
+        if (user != null)
+        {
+            return Ok($"User: {user.UserId}");
+        }
+        return BadRequest("User not found");
+    }
+}

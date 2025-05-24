@@ -1,0 +1,161 @@
+from django.db import models
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth import authenticate, login
+from django.contrib.auth.forms import UserCreationForm, AuthenticationForm
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import User
+
+class Product(models.Model):
+    name = models.CharField(max_length=200)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    description = models.TextField()
+    image = models.ImageField(upload_to='products/')
+    stock = models.IntegerField()
+
+    def __str__(self):
+        return self.name
+
+class Order(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Order {self.id} by {self.user.username}"
+
+class CartItem(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField(default=1)
+
+    def __str__(self):
+        return f"{self.product.name} ({self.quantity})"
+
+class Review(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='reviews')
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    rating = models.IntegerField(choices=[(i, str(i)) for i in range(1, 6)])
+    comment = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.rating} by {self.user.username} on {self.product.name}"
+
+class SupportTicket(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    subject = models.CharField(max_length=200)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"Ticket {self.id} by {self.user.username}"
+
+def signup_view(request):
+    if request.method == 'POST':
+        form = UserCreationForm(request.POST)
+        if form.is_valid():
+            form.save()
+            return redirect('login')
+    else:
+        form = UserCreationForm()
+    return render(request, 'signup.html', {'form': form})
+
+def login_view(request):
+    if request.method == 'POST':
+        form = AuthenticationForm(data=request.POST)
+        if form.is_valid():
+            user = form.get_user()
+            login(request, user)
+            return redirect('/')
+    else:
+        form = AuthenticationForm()
+    return render(request, 'login.html', {'form': form})
+
+def product_list(request):
+    query = request.GET.get('q')
+    products = Product.objects.all()
+
+    if query:
+        products = products.filter(name__icontains=query)
+
+    sort_by = request.GET.get('sort_by')
+    if sort_by == 'price':
+        products = products.order_by('price')
+    elif sort_by == 'name':
+        products = products.order_by('name')
+
+    return render(request, 'product_list.html', {'products': products})
+
+@login_required
+def purchase_product(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+
+    if request.method == 'POST':
+        quantity = int(request.POST.get('quantity', 1))
+        if product.stock >= quantity:
+            product.stock -= quantity
+            product.save()
+
+            order = Order.objects.create(
+                user=request.user,
+                product=product,
+                quantity=quantity
+            )
+            return redirect('order_success', order_id=order.id)
+        else:
+            return render(request, 'purchase.html', {'product': product, 'error': 'Not enough stock'})
+
+    return render(request, 'purchase.html', {'product': product})
+
+@login_required
+def add_to_cart(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+    cart_item, created = CartItem.objects.get_or_create(user=request.user, product=product)
+
+    if not created:
+        cart_item.quantity += 1
+        cart_item.save()
+
+    return redirect('cart_detail')
+
+@login_required
+def cart_detail(request):
+    cart_items = CartItem.objects.filter(user=request.user)
+    return render(request, 'cart_detail.html', {'cart_items': cart_items})
+
+@login_required
+def add_review(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+    if request.method == 'POST':
+        rating = int(request.POST.get('rating'))
+        comment = request.POST.get('comment')
+        Review.objects.create(product=product, user=request.user, rating=rating, comment=comment)
+        return redirect('product_detail', product_id=product.id)
+
+    return render(request, 'add_review.html', {'product': product})
+
+@login_required
+def order_history(request):
+    orders = Order.objects.filter(user=request.user).order_by('-created_at')
+    return render(request, 'order_history.html', {'orders': orders})
+
+@login_required
+def create_ticket(request):
+    if request.method == 'POST':
+        subject = request.POST.get('subject')
+        message = request.POST.get('message')
+        SupportTicket.objects.create(user=request.user, subject=subject, message=message)
+        return redirect('support_tickets')
+    return render(request, 'create_ticket.html')
+
+@login_required
+def support_tickets(request):
+    tickets = SupportTicket.objects.filter(user=request.user).order_by('-created_at')
+    return render(request, 'support_tickets.html', {'tickets': tickets})
+
+def product_detail(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+    reviews = product.reviews.all()
+    return render(request, 'product_detail.html', {'product': product, 'reviews': reviews})

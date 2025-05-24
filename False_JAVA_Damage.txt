@@ -1,0 +1,79 @@
+import java.sql.*;
+
+public class RPGDamageCalculator {
+
+    public static void main(String[] args) {
+        String url = "jdbc:mysql://localhost:3306/rpg_db";
+        String user = "root";
+        String password = "yourpassword";
+
+        try (Connection connection = DriverManager.getConnection(url, user, password)) {
+            var monster = getMonsterData(connection, monsterId);
+            var user = getUserData(connection, userId);
+
+            int damage = calculateDamage(user.attackPower, user.armorPenetration, monster.defense);
+
+            System.out.println("Calculated Damage: " + damage);
+            System.out.println("Monster's Remaining Health: " + Math.max(monster.health - damage, 0));
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    static Monster getMonsterData(Connection connection, int monsterId) throws SQLException {
+        String query = "SELECT Health, Defense FROM Monsters WHERE Id = ?";
+        try (PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setInt(1, monsterId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    int health = resultSet.getInt("Health");
+                    int defense = resultSet.getInt("Defense");
+                    return new Monster(health, defense);
+                } else {
+                    throw new SQLException("Monster not found");
+                }
+            }
+        }
+    }
+
+    static User getUserData(Connection connection, int userId) throws SQLException {
+        String query = "SELECT AttackPower, ArmorPenetration FROM Users WHERE Id = ?";
+        try (PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setInt(1, userId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    int attackPower = resultSet.getInt("AttackPower");
+                    int armorPenetration = resultSet.getInt("ArmorPenetration");
+                    return new User(attackPower, armorPenetration);
+                } else {
+                    throw new SQLException("User not found");
+                }
+            }
+        }
+    }
+
+    static int calculateDamage(int attackPower, int armorPenetration, int monsterDefense) {
+        int effectiveDefense = Math.max(monsterDefense - armorPenetration, 0);
+        return Math.max(attackPower - effectiveDefense, 0);
+    }
+
+    static class Monster {
+        int health;
+        int defense;
+
+        Monster(int health, int defense) {
+            this.health = health;
+            this.defense = defense;
+        }
+    }
+
+    static class User {
+        int attackPower;
+        int armorPenetration;
+
+        User(int attackPower, int armorPenetration) {
+            this.attackPower = attackPower;
+            this.armorPenetration = armorPenetration;
+        }
+    }
+}

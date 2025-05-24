@@ -1,0 +1,535 @@
+#include <cpprest/http_listener.h>
+#include <cpprest/json.h>
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/resultset.h>
+#include <memory>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <fstream>
+#include <chrono>
+#include <cmath>
+#include <base64.h>
+
+using namespace web;
+using namespace web::http;
+using namespace web::http::experimental::listener;
+
+struct PricingConfig {
+    double locationWeight;
+    double demandWeight;
+    double competitorWeight;
+    double basePrice;
+    double concessionFactor;
+};
+
+struct Property {
+    int id;
+    std::string name;
+    std::string location;
+    double basePrice;
+    double currentPrice;
+    double occupancyRate;
+    std::string lessor;
+};
+
+struct User {
+    int id;
+    std::string username;
+    std::string passwordHash;
+    std::string role;
+};
+
+struct Booking {
+    int id;
+    int userId;
+    int propertyId;
+    std::chrono::system_clock::time_point startDate;
+    std::chrono::system_clock::time_point endDate;
+    double totalPrice;
+};
+
+class DbService {
+private:
+    std::unique_ptr<sql::mysql::MySQL_Driver> driver;
+    std::unique_ptr<sql::Connection> conn;
+
+public:
+    DbService() {
+        driver = std::unique_ptr<sql::mysql::MySQL_Driver>(sql::mysql::get_mysql_driver_instance());
+        conn = std::unique_ptr<sql::Connection>(driver->connect("tcp://localhost:3306", "root", "password"));
+        conn->setSchema("rental_db");
+    }
+
+    std::vector<Property> getProperties() {
+        std::vector<Property> properties;
+        std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+        std::unique_ptr<sql::ResultSet> res(stmt->executeQuery("SELECT * FROM properties"));
+        
+        while (res->next()) {
+            Property p;
+            p.id = res->getInt("id");
+            p.name = res->getString("name");
+            p.location = res->getString("location");
+            p.basePrice = res->getDouble("base_price");
+            p.currentPrice = res->getDouble("current_price");
+            p.occupancyRate = res-audio->getDouble("occupancy_rate");
+            p.lessor = res->getString("lessor");
+            properties.push_back(p);
+        }
+        return properties;
+    }
+
+    Property getPropertyById(int id) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement("SELECT * FROM properties WHERE id = ?"));
+        pstmt->setInt(1, id);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        
+        if (res->next()) {
+            Property p;
+            p.id = res->getInt("id");
+            p.name = res->getString("name");
+            p.location = res->getString("location");
+            p.basePrice = res->getDouble("base_price");
+            p.currentPrice = res->getDouble("current_price");
+            p.occupancyRate = res->getDouble("occupancy_rate");
+            p.lessor = res->getString("lessor");
+            return p;
+        }
+        return Property();
+    }
+
+    void updatePropertyPrice(int id, double newPrice) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement("UPDATE properties SET current_price = ? WHERE id = ?"));
+        pstmt->setDouble(1, newPrice);
+        pstmt->setInt(2, id);
+        pstmt->executeUpdate();
+    }
+
+    User getUserByUsername(const std::string& username) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement("SELECT * FROM users WHERE username = ?"));
+        pstmt->setString(1, username);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        
+        if (res->next()) {
+            User u;
+            u.id = res->getInt("id");
+            u.username = res->getString("username");
+            u.passwordHash = res->getString("password_hash");
+            u.role = res->getString("role");
+            return u;
+        }
+        return User();
+    }
+
+    void addUser(const User& user) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)"));
+        pstmt->setString(1, user.username);
+        pstmt->setString(2, user.passwordHash);
+        pstmt->setString(3, user.role);
+        pstmt->executeUpdate();
+    }
+
+    void addBooking(const Booking& booking) {
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement(
+            "INSERT INTO bookings (user_id, property_id, start_date, end_date, total_price) VALUES (?, ?, ?, ?, ?)"));
+        pstmt->setInt(1, booking.userId);
+        pstmt->setInt(2, booking.propertyId);
+        pstmt->setString(3, std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+            booking.startDate.time_since_epoch()).count()));
+        pstmt->setString(4, std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+            booking.endDate.time_since_epoch()).count()));
+        pstmt->setDouble(5, booking.totalPrice);
+        pstmt->executeUpdate();
+    }
+
+    std::vector<Booking> getUserBookings(int userId) {
+        std::vector<Booking> bookings;
+        std::unique_ptr<sql::PreparedStatement> pstmt(conn->prepareStatement("SELECT * FROM bookings WHERE user_id = ?"));
+        pstmt->setInt(1, userId);
+        std::unique_ptr<sql::ResultSet> res(pstmt->executeQuery());
+        
+        while (res->next()) {
+            Booking b;
+            b.id = res->getInt("id");
+            b.userId = res->getInt("user_id");
+            b.propertyId = res->getInt("property_id");
+            b.startDate = std::chrono::system_clock::from_time_t(res->getInt64("start_date"));
+            b.endDate = std::chrono::system_clock::from_time_t(res->getInt64("end_date"));
+            b.totalPrice = res->getDouble("total_price");
+            bookings.push_back(b);
+        }
+        return bookings;
+    }
+};
+
+class PricingService {
+private:
+    DbService& dbService;
+    PricingConfig config;
+
+    PricingConfig loadConfig() {
+        std::ifstream file("pricing_config.json");
+        json::value json = json::value::parse(file);
+        PricingConfig cfg;
+        cfg.locationWeight = json.at(U("LocationWeight")).as_double();
+        cfg.demandWeight = json.at(U("DemandWeight")).as_double();
+        cfg.competitorWeight = json.at(U("CompetitorWeight")).as_double();
+        cfg.basePrice = json.at(U("BasePrice")).as_double();
+        cfg.concessionFactor = json.at(U("ConcessionFactor")).as_double();
+        return cfg;
+    }
+
+public:
+    PricingService(DbService& db) : dbService(db), config(loadConfig()) {}
+
+    double calculatePrice(int propertyId) {
+        Property property = dbService.getPropertyById(propertyId);
+        if (property.id == 0) return 0;
+
+        std::vector<Property> properties = dbService.getProperties();
+        std::vector<double> competitorPrices;
+        for (const auto& p : properties) {
+            if (p.location == property.location && p.id != property.id) {
+                competitorPrices.push_back(p.currentPrice);
+            }
+        }
+
+        double avgCompetitorPrice = competitorPrices.empty() ? 
+            property.basePrice : 
+            std::accumulate(competitorPrices.begin(), competitorPrices.end(), 0.0) / competitorPrices.size();
+        
+        double demandFactor = property.occupancyRate > 0.8 ? 1.2 : 
+                            property.occupancyRate > 0.5 ? 1.0 : 0.9;
+        double locationFactor = property.location.find("Downtown") != std::string::npos ? 1.3 : 1.0;
+
+        double recommendedPrice = config.basePrice +
+            (avgCompetitorPrice * config.competitorWeight) +
+            (property.basePrice * config.locationWeight * locationFactor) +
+            (property.basePrice * config.demandWeight * demandFactor);
+
+        double concession = recommendedPrice * config.concessionFactor;
+        return std::round((recommendedPrice - concession) * 100) / 100;
+    }
+
+    void updateAllPrices() {
+        std::vector<Property> properties = dbService.getProperties();
+        for (const auto& prop : properties) {
+            double newPrice = calculatePrice(prop.id);
+            dbService.updatePropertyPrice(prop.id, newPrice);
+        }
+    }
+};
+
+class UserService {
+private:
+    DbService& dbService;
+
+    std::string hashPassword(const std::string& password) {
+        return base64::encode(password);
+    }
+
+    bool verifyPassword(const std::string& password, const std::string& hash) {
+        return hashPassword(password) == hash;
+    }
+
+public:
+    UserService(DbService& db) : dbService(db) {}
+
+    User authenticate(const std::string& username, const std::string& password) {
+        User user = dbService.getUserByUsername(username);
+        if (user.id == 0) return User();
+        if (verifyPassword(password, user.passwordHash)) return user;
+        return User();
+    }
+
+    bool registerUser(const std::string& username, const std::string& password, const std::string& role) {
+        if (dbService.getUserByUsername(username).id != 0) return false;
+        
+        User user;
+        user.username = username;
+        user.passwordHash = hashPassword(password);
+        user.role = role;
+        dbService.addUser(user);
+        return true;
+    }
+};
+
+class BookingService {
+private:
+    DbService& dbService;
+
+public:
+    BookingService(DbService& db) : dbService(db) {}
+
+    bool createBooking(int userId, int propertyId, 
+                      std::chrono::system_clock::time_point startDate,
+                      std::chrono::system_clock::time_point endDate) {
+        Property property = dbService.getPropertyById(propertyId);
+        if (property.id == 0) return false;
+
+        auto days = std::chrono::duration_cast<std::chrono::hours>(endDate - startDate).count() / 24;
+        if (days <= 0) return false;
+
+        Booking booking;
+        booking.userId = userId;
+        booking.propertyId = propertyId;
+        booking.startDate = startDate;
+        booking.endDate = endDate;
+        booking.totalPrice = property.currentPrice * days;
+        
+        dbService.addBooking(booking);
+        return true;
+    }
+
+    std::vector<Booking> getUserBookings(int userId) {
+        return dbService.getUserBookings(userId);
+    }
+};
+
+class PropertyController {
+private:
+    DbService& dbService;
+    PricingService& pricingService;
+
+public:
+    PropertyController(DbService& db, PricingService& ps) : dbService(db), pricingService(ps) {}
+
+    void handleGet(http_request request) {
+        auto query = uri::split_query(request.request_uri().query());
+        std::string sort = query.find(U("sort")) != query.end() ? 
+                          utility::conversions::to_utf8string(query[U("sort")]) : "price";
+        std::string keyword = query.find(U("keyword")) != query.end() ? 
+                            utility::conversions::to_utf8string(query[U("keyword")]) : "";
+
+        std::vector<Property> properties = dbService.getProperties();
+        
+        if (!keyword.empty()) {
+            std::vector<Property> filtered;
+            std::copy_if(properties.begin(), properties.end(), std::back_inserter(filtered),
+                [&keyword](const Property& p) {
+                    std::string nameLower = p.name;
+                    std::string locLower = p.location;
+                    std::string keyLower = keyword;
+                    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+                    std::transform(locLower.begin(), locLower.end(), locLower.begin(), ::tolower);
+                    std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
+                    return nameLower.find(keyLower) != std::string::npos || 
+                           locLower.find(keyLower) != std::string::npos;
+                });
+            properties = filtered;
+        }
+
+        if (sort == "price") {
+            std::sort(properties.begin(), properties.end(), 
+                     [](const Property& a, const Property& b) { return a.currentPrice < b.currentPrice; });
+        } else if (sort == "discount") {
+            std::sort(properties.begin(), properties.end(),
+                     [](const Property& a, const Property& b) { 
+                         return (a.basePrice - a.currentPrice) > (b.basePrice - b.currentPrice); 
+                     });
+        } else if (sort == "recommended") {
+            std::sort(properties.begin(), properties.end(),
+                     [](const Property& a, const Property& b) { return a.occupancyRate > b.occupancyRate; });
+        }
+
+        json::value response = json::value::array();
+        for (size_t i = 0; i < properties.size(); ++i) {
+            response[i] = json::value::object();
+            response[i][U("id")] = json::value::number(properties[i].id);
+            response[i][U("name")] = json::value::string(utility::conversions::to_string_t(properties[i].name));
+            response[i][U("location")] = json::value::string(utility::conversions::to_string_t(properties[i].location));
+            response[i][U("basePrice")] = json::value::number(properties[i].basePrice);
+            response[i][U("currentPrice")] = json::value::number(properties[i].currentPrice);
+            response[i][U("occupancyRate")] = json::value::number(properties[i].occupancyRate);
+            response[i][U("lessor")] = json::value::string(utility::conversions::to_string_t(properties[i].lessor));
+        }
+        
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleGetById(http_request request, int id) {
+        Property property = dbService.getPropertyById(id);
+        if (property.id == 0) {
+            request.reply(status_codes::NotFound);
+            return;
+        }
+
+        json::value response;
+        response[U("id")] = json::value::number(property.id);
+        response[U("name")] = json::value::string(utility::conversions::to_string_t(property.name));
+        response[U("location")] = json::value::string(utility::conversions::to_string_t(property.location));
+        response[U("basePrice")] = json::value::number(property.basePrice);
+        response[U("currentPrice")] = json::value::number(property.currentPrice);
+        response[U("occupancyRate")] = json::value::number(property.occupancyRate);
+        response[U("lessor")] = json::value::string(utility::conversions::to_string_t(property.lessor));
+
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleUpdatePrices(http_request request) {
+        pricingService.updateAllPrices();
+        request.reply(status_codes::OK);
+    }
+};
+
+class UserController {
+private:
+    UserService& userService;
+
+public:
+    UserController(UserService& us) : userService(us) {}
+
+    void handleLogin(http_request request) {
+        json::value body = request.extract_json().get();
+        std::string username = utility::conversions::to_utf8string(body[U("username")].as_string());
+        std::string password = utility::conversions::to_utf8string(body[U("password")].as_string());
+
+        User user = userService.authenticate(username, password);
+        if (user.id == 0) {
+            request.reply(status_codes::Unauthorized);
+            return;
+        }
+
+        json::value response;
+        response[U("id")] = json::value::number(user.id);
+        response[U("username")] = json::value::string(utility::conversions::to_string_t(user.username));
+        response[U("role")] = json::value::string(utility::conversions::to_string_t(user.role));
+
+        request.reply(status_codes::OK, response);
+    }
+
+    void handleRegister(http_request request) {
+        json::value body = request.extract_json().get();
+        std::string username = utility::conversions::to_utf8string(body[U("username")].as_string());
+        std::string password = utility::conversions::to_utf8string(body[U("password")].as_string());
+        std::string role = utility::conversions::to_utf8string(body[U("role")].as_string());
+
+        bool success = userService.registerUser(username, password, role);
+        if (!success) {
+            request.reply(status_codes::BadRequest, U("Username already exists"));
+            return;
+        }
+
+        request.reply(status_codes::OK);
+    }
+};
+
+class BookingController {
+private:
+    BookingService& bookingService;
+
+public:
+    BookingController(BookingService& bs) : bookingService(bs) {}
+
+    void handleCreateBooking(http_request request) {
+        json::value body = request.extract_json().get();
+        int userId = body[U("userId")].as_integer();
+        int propertyId = body[U("propertyId")].as_integer();
+        auto startDate = std::chrono::system_clock::from_time_t(body[U("startDate")].as_integer());
+        auto endDate = std::chrono::system_clock::from_time_t(body[U("endDate")].as_integer());
+
+        bool success = bookingService.createBooking(userId, propertyId, startDate, endDate);
+        if (!success) {
+            request.reply(status_codes::BadRequest, U("Invalid booking details"));
+            return;
+        }
+
+        request.reply(status_codes::OK);
+    }
+
+    void handleGetUserBookings(http_request request, int userId) {
+        std::vector<Booking> bookings = bookingService.getUserBookings(userId);
+        
+        json::value response = json::value::array();
+        for (size_t i = 0; i < bookings.size(); ++i) {
+            response[i] = json::value::object();
+            response[i][U("id")] = json::value::number(bookings[i].id);
+            response[i][U("userId")] = json::value::number(bookings[i].userId);
+            response[i][U("propertyId")] = json::value::number(bookings[i].propertyId);
+            response[i][U("startDate")] = json::value::number(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    bookings[i].startDate.time_since_epoch()).count());
+            response[i][U("endDate")] = json::value::number(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    bookings[i].endDate.time_since_epoch()).count());
+            response[i][U("totalPrice")] = json::value::number(bookings[i].totalPrice);
+        }
+
+        request.reply(status_codes::OK, response);
+    }
+};
+
+int main() {
+    DbService dbService;
+    PricingService pricingService(dbService);
+    UserService userService(dbService);
+    BookingService bookingService(dbService);
+    PropertyController propertyController(dbService, pricingService);
+    UserController userController(userService);
+    BookingController bookingController(bookingService);
+
+    http_listener propertyListener(U("http://localhost:5000/api/property"));
+    http_listener userListener(U("http://localhost:5000/api/user"));
+    http_listener bookingListener(U("http://localhost:5000/api/booking"));
+
+    propertyListener.support(methods::GET, [&propertyController](http_request request) {
+        auto path = request.request_uri().path();
+        if (path == U("/api/property")) {
+            propertyController.handleGet(request);
+        } else {
+            auto parts = uri::split_path(path);
+            if (parts.size() > 2 && parts[2].find_first_not_of(U("0123456789")) == std::string::npos) {
+                int id = std::stoi(parts[2]);
+                propertyController.handleGetById(request, id);
+            }
+        }
+    });
+
+    propertyListener.support(methods::POST, [&propertyController](http_request request) {
+        if (request.request_uri().path() == U("/api/property/update-prices")) {
+            propertyController.handleUpdatePrices(request);
+        }
+    });
+
+    userListener.support(methods::POST, [&userController](http_request request) {
+        auto path = request.request_uri().path();
+        if (path == U("/api/user/login")) {
+            userController.handleLogin(request);
+        } else if (path == U("/api/user/register")) {
+            userController.handleRegister(request);
+        }
+    });
+
+    bookingListener.support(methods::POST, [&bookingController](http_request request) {
+        if (request.request_uri().path() == U("/api/booking")) {
+            bookingController.handleCreateBooking(request);
+        }
+    });
+
+    bookingListener.support(methods::GET, [&bookingController](http_request request) {
+        auto path = request.request_uri().path();
+        auto parts = uri::split_path(path);
+        if (parts.size() > 3 && parts[2] == U("user") && 
+            parts[3].find_first_not_of(U("0123456789")) == std::string::npos) {
+            int userId = std::stoi(parts[3]);
+            bookingController.handleGetUserBookings(request, userId);
+        }
+    });
+
+    try {
+        propertyListener.open().wait();
+        userListener.open().wait();
+        bookingListener.open().wait();
+        
+        std::cout << "Server running on http://localhost:5000\n";
+        std::this_thread::sleep_for(std::chrono::hours(24));
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    return 0;
+}

@@ -1,0 +1,494 @@
+#include <crow.h>
+#include <pqxx/pqxx>
+#include <jwt-cpp/jwt.h>
+#include <bcrypt/BCrypt.hpp>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <ctime>
+#include <algorithm>
+#include <numeric>
+
+using json = nlohmann::json;
+
+struct Product {
+    int id;
+    std::string name;
+    std::string description;
+    double price;
+    double discount;
+    int stock;
+    std::string keywords;
+};
+
+struct CartItem {
+    int id;
+    int user_id;
+    int product_id;
+    int quantity;
+};
+
+struct Order {
+    int id;
+    int user_id;
+    std::time_t order_date;
+    double total_amount;
+    std::string status;
+    std::vector<struct OrderItem> items;
+};
+
+struct OrderItem {
+    int id;
+    int order_id;
+    int product_id;
+    int quantity;
+    double price;
+};
+
+struct User {
+    int id;
+    std::string username;
+    std::string password_hash;
+    std::string email;
+};
+
+struct CompetitorPrice {
+    int id;
+    int product_id;
+    double price;
+    std::string source;
+    std::time_t last_updated;
+};
+
+struct PricingConfig {
+    double min_price;
+    double max_price;
+    double adjustment_factor;
+    double weight_competitor;
+    double weight_base;
+};
+
+class Database {
+private:
+    pqxx::connection conn;
+public:
+    Database(const std::string& conn_str) : conn(conn_str) {}
+    
+    std::vector<Product> get_products(const std::string& keyword, const std::string& sort_by, int page, int page_size) {
+        pqxx::work txn(conn);
+        std::string query = "SELECT * FROM products";
+        if (!keyword.empty()) {
+            query += " WHERE keywords ILIKE '%" + txn.esc(keyword) + "%' OR name ILIKE '%" + txn.esc(keyword) + "%'";
+        }
+        
+        if (sort_by == "price_asc") query += " ORDER BY price ASC";
+        else if (sort_by == "price_desc") query += " ORDER BY price DESC";
+        else if (sort_by == "discount") query += " ORDER BY discount DESC";
+        else if (sort_by == "recommend") query += " ORDER BY stock / (price + 1) DESC";
+        else query += " ORDER BY id";
+        
+        query += " LIMIT " + std::to_string(page_size) + " OFFSET " + std::to_string((page - 1) * page_size);
+        
+        std::vector<Product> products;
+        for (auto row : txn.query<int, std::string, std::string, double, double, int, std::string>(query)) {
+            products.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6]});
+        }
+        
+        return products;
+    }
+    
+    int get_products_count(const std::string& keyword) {
+        pqxx::work txn(conn);
+        std::string query = "SELECT COUNT(*) FROM products";
+        if (!keyword.empty()) {
+            query += " WHERE keywords ILIKE '%" + txn.esc(keyword) + "%' OR name ILIKE '%" + txn.esc(keyword) + "%'";
+        }
+        return txn.query_value<int>(query);
+    }
+    
+    std::optional<Product> get_product(int id) {
+        pqxx::work txn(conn);
+        auto result = txn.query<int, std::string, std::string, double, double, int, std::string>(
+            "SELECT * FROM products WHERE id = " + txn.esc(std::to_string(id)));
+        if (result.empty()) return std::nullopt;
+        auto row = result[0];
+        return Product{row[0], row[1], row[2], row[3], row[4], row[5], row[6]};
+    }
+    
+    std::vector<double> get_competitor_prices(int product_id, std::time_t since) {
+        pqxx::work txn(conn);
+        std::vector<double> prices;
+        for (auto row : txn.query<double>(
+            "SELECT price FROM competitor_prices WHERE product_id = " + txn.esc(std::to_string(product_id)) + 
+            " AND last_updated > " + txn.esc(std::to_string(since)))) {
+            prices.push_back(row[0]);
+        }
+        return prices;
+    }
+    
+    void update_product(const Product& product) {
+        pqxx::work txn(conn);
+        txn.exec0(
+            "UPDATE products SET name = " + txn.quote(product.name) + 
+            ", description = " + txn.quote(product.description) + 
+            ", price = " + txn.quote(product.price) + 
+            ", discount = " + txn.quote(product.discount) + 
+            ", stock = " + txn.quote(product.stock) + 
+            ", keywords = " + txn.quote(product.keywords) + 
+            " WHERE id = " + txn.quote(product.id));
+        txn.commit();
+    }
+    
+    std::vector<CartItem> get_cart_items(int user_id) {
+        pqxx::work txn(conn);
+        std::vector<CartItem> items;
+        for (auto row : txn.query<int, int, int, int>(
+            "SELECT id, user_id, product_id, quantity FROM cart_items WHERE user_id = " + 
+            txn.esc(std::to_string(user_id)))) {
+            items.push_back({row[0], row[1], row[2], row[3]});
+        }
+        return items;
+    }
+    
+    std::optional<CartItem> get_cart_item(int user_id, int product_id) {
+        pqxx::work txn(conn);
+        auto result = txn.query<int, int, int, int>(
+            "SELECT id, user_id, product_id, quantity FROM cart_items WHERE user_id = " + 
+            txn.esc(std::to_string(user_id)) + " AND product_id = " + 
+            txn.esc(std::to_string(product_id)));
+        if (result.empty()) return std::nullopt;
+        auto row = result[0];
+        return CartItem{row[0], row[1], row[2], row[3]};
+    }
+    
+    void add_cart_item(const CartItem& item) {
+        pqxx::work txn(conn);
+        txn.exec0(
+            "INSERT INTO cart_items (user_id, product_id, quantity) VALUES (" +
+            txn.quote(item.user_id) + ", " + txn.quote(item.product_id) + ", " + 
+            txn.quote(item.quantity) + ")");
+        txn.commit();
+    }
+    
+    void update_cart_item(const CartItem& item) {
+        pqxx::work txn(conn);
+        txn.exec0(
+            "UPDATE cart_items SET quantity = " + txn.quote(item.quantity) + 
+            " WHERE id = " + txn.quote(item.id));
+        txn.commit();
+    }
+    
+    void remove_cart_item(int id) {
+        pqxx::work txn(conn);
+        txn.exec0("DELETE FROM cart_items WHERE id = " + txn.quote(id));
+        txn.commit();
+    }
+    
+    void add_order(const Order& order) {
+        pqxx::work txn(conn);
+        auto result = txn.query<int>(
+            "INSERT INTO orders (user_id, order_date, total_amount, status) VALUES (" +
+            txn.quote(order.user_id) + ", " + txn.quote(order.order_date) + ", " + 
+            txn.quote(order.total_amount) + ", " + txn.quote(order.status) + 
+            ") RETURNING id");
+        int order_id = result[0][0];
+        
+        for (const auto& item : order.items) {
+            txn.exec0(
+                "INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (" +
+                txn.quote(order_id) + ", " + txn.quote(item.product_id) + ", " + 
+                txn.quote(item.quantity) + ", " + txn.quote(item.price) + ")");
+        }
+        txn.commit();
+    }
+    
+    void clear_cart(int user_id) {
+        pqxx::work txn(conn);
+        txn.exec0("DELETE FROM cart_items WHERE user_id = " + txn.quote(user_id));
+        txn.commit();
+    }
+    
+    std::vector<Order> get_orders(int user_id) {
+        pqxx::work txn(conn);
+        std::vector<Order> orders;
+        auto order_rows = txn.query<int, int, std::time_t, double, std::string>(
+            "SELECT id, user_id, order_date, total_amount, status FROM orders WHERE user_id = " + 
+            txn.esc(std::to_string(user_id)));
+        
+        for (const auto& row : order_rows) {
+            Order order{row[0], row[1], row[2], row[3], row[4], {}};
+            auto item_rows = txn.query<int, int, int, int, double>(
+                "SELECT id, order_id, product_id, quantity, price FROM order_items WHERE order_id = " + 
+                txn.esc(std::to_string(order.id)));
+            for (const auto& item_row : item_rows) {
+                order.items.push_back({item_row[0], item_row[1], item_row[2], item_row[3], item_row[4]});
+            }
+            orders.push_back(order);
+        }
+        return orders;
+    }
+    
+    std::optional<User> get_user(const std::string& username) {
+        pqxx::work txn(conn);
+        auto result = txn.query<int, std::string, std::string, std::string>(
+            "SELECT id, username, password_hash, email FROM users WHERE username = " + 
+            txn.quote(username));
+        if (result.empty()) return std::nullopt;
+        auto row = result[0];
+        return User{row[0], row[1], row[2], row[3]};
+    }
+    
+    void add_user(const User& user) {
+        pqxx::work txn(conn);
+        txn.exec0(
+            "INSERT INTO users (username, password_hash, email) VALUES (" +
+            txn.quote(user.username) + ", " + txn.quote(user.password_hash) + ", " + 
+            txn.quote(user.email) + ")");
+        txn.commit();
+    }
+};
+
+PricingConfig load_pricing_config() {
+    std::ifstream file("pricing_config.json");
+    json j;
+    file >> j;
+    return {
+        j["min_price"],
+        j["max_price"],
+        j["adjustment_factor"],
+        j["weight_competitor"],
+        j["weight_base"]
+    };
+}
+
+std::string generate_jwt_token(const User& user, const std::string& key, const std::string& issuer, const std::string& audience) {
+    auto token = jwt::create()
+        .set_issuer(issuer)
+        .set_audience(audience)
+        .set_type("JWT")
+        .set_payload_claim("sub", jwt::claim(std::to_string(user.id)))
+        .set_payload_claim("name", jwt::claim(user.username))
+        .set_payload_claim("role", jwt::claim("User"))
+        .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours(24))
+        .sign(jwt::algorithm::hs256{key});
+    return token;
+}
+
+int main() {
+    crow::SimpleApp app;
+    Database db("postgresql://user:password@localhost:5432/ecommerce");
+    PricingConfig pricing_config = load_pricing_config();
+    const std::string jwt_key = "your_jwt_secret_key";
+    const std::string jwt_issuer = "your_issuer";
+    const std::string jwt_audience = "your_audience";
+
+    CROW_ROUTE(app, "/api/products")
+    .methods(crow::HTTPMethod::GET)
+    ([&](const crow::request& req) {
+        std::string keyword = req.url_params.get("keyword") ? req.url_params.get("keyword") : "";
+        std::string sort_by = req.url_params.get("sortBy") ? req.url_params.get("sortBy") : "price_asc";
+        int page = req.url_params.get("page") ? std::stoi(req.url_params.get("page")) : 1;
+        int page_size = req.url_params.get("pageSize") ? std::stoi(req.url_params.get("pageSize")) : 10;
+
+        auto products = db.get_products(keyword, sort_by, page, page_size);
+        int total = db.get_products_count(keyword);
+
+        json response;
+        response["Total"] = total;
+        response["Products"] = products;
+        return crow::response(response.dump());
+    });
+
+    CROW_ROUTE(app, "/api/products/<int>")
+    .methods(crow::HTTPMethod::GET)
+    ([&](int id) {
+        auto product = db.get_product(id);
+        if (!product) return crow::response(404, "Product not found");
+        return crow::response(json(*product).dump());
+    });
+
+    CROW_ROUTE(app, "/api/products/adjust-prices")
+    .methods(crow::HTTPMethod::POST)
+    ([&](const crow::request& req) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            auto role = decoded.get_payload_claim("role").as_string();
+            if (role != "Admin") return crow::response(403, "Forbidden");
+
+            auto products = db.get_products("", "id", 1, INT_MAX);
+            for (auto& product : products) {
+                auto comp_prices = db.get_competitor_prices(product.id, std::time(nullptr) - 7*24*3600);
+                if (!comp_prices.empty()) {
+                    double avg_comp_price = std::accumulate(comp_prices.begin(), comp_prices.end(), 0.0) / comp_prices.size();
+                    double base_price = product.price;
+                    double new_price = (pricing_config.weight_competitor * avg_comp_price +
+                                      pricing_config.weight_base * base_price) /
+                                     (pricing_config.weight_competitor + pricing_config.weight_base);
+                    new_price *= pricing_config.adjustment_factor;
+                    new_price = std::max(pricing_config.min_price, std::min(pricing_config.max_price, new_price));
+                    product.price = std::round(new_price * 100) / 100;
+                    db.update_product(product);
+                }
+            }
+            return crow::response(json{{"Message", "Prices adjusted successfully"}}.dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/cart")
+    .methods(crow::HTTPMethod::GET)
+    ([&](const crow::request& req) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            int user_id = std::stoi(decoded.get_payload_claim("sub").as_string());
+            auto items = db.get_cart_items(user_id);
+            return crow::response(json(items).dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/cart")
+    .methods(crow::HTTPMethod::POST)
+    ([&](const crow::request& req) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            int user_id = std::stoi(decoded.get_payload_claim("sub").as_string());
+            auto body = json::parse(req.body);
+            int product_id = body["productId"];
+            int quantity = body["quantity"];
+
+            auto product = db.get_product(product_id);
+            if (!product) return crow::response(404, "Product not found");
+            if (product->stock < quantity) return crow::response(400, "Insufficient stock");
+
+            auto cart_item = db.get_cart_item(user_id, product_id);
+            if (!cart_item) {
+                cart_item = CartItem{0, user_id, product_id, quantity};
+                db.add_cart_item(*cart_item);
+            } else {
+                cart_item->quantity += quantity;
+                db.update_cart_item(*cart_item);
+            }
+
+            product->stock -= quantity;
+            db.update_product(*product);
+            return crow::response(json(*cart_item).dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/cart/<int>")
+    .methods(crow::HTTPMethod::DELETE)
+    ([&](const crow::request& req, int id) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            int user_id = std::stoi(decoded.get_payload_claim("sub").as_string());
+            auto cart_item = db.get_cart_item(user_id, id);
+            if (!cart_item) return crow::response(404, "Cart item not found");
+
+            auto product = db.get_product(cart_item->product_id);
+            product->stock += cart_item->quantity;
+            db.update_product(*product);
+            db.remove_cart_item(id);
+            return crow::response(json{{"Message", "Item removed from cart"}}.dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/orders")
+    .methods(crow::HTTPMethod::POST)
+    ([&](const crow::request& req) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            int user_id = std::stoi(decoded.get_payload_claim("sub").as_string());
+            auto cart_items = db.get_cart_items(user_id);
+            if (cart_items.empty()) return crow::response(400, "Cart is empty");
+
+            Order order{0, user_id, std::time(nullptr), 0.0, "Pending", {}};
+            for (const auto& cart_item : cart_items) {
+                auto product = db.get_product(cart_item.product_id);
+                OrderItem item{0, 0, cart_item.product_id, cart_item.quantity, 
+                             product->price - product->discount};
+                order.items.push_back(item);
+                order.total_amount += item.price * item.quantity;
+            }
+
+            db.add_order(order);
+            db.clear_cart(user_id);
+            return crow::response(json(order).dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/orders")
+    .methods(crow::HTTPMethod::GET)
+    ([&](const crow::request& req) {
+        auto auth = req.get_header_value("Authorization");
+        if (auth.empty()) return crow::response(401, "Unauthorized");
+
+        try {
+            auto decoded = jwt::decode(auth.substr(7));
+            int user_id = std::stoi(decoded.get_payload_claim("sub").as_string());
+            auto orders = db.get_orders(user_id);
+            return crow::response(json(orders).dump());
+        } catch (...) {
+            return crow::response(401, "Invalid token");
+        }
+    });
+
+    CROW_ROUTE(app, "/api/auth/register")
+    .methods(crow::HTTPMethod::POST)
+    ([&](const crow::request& req) {
+        auto body = json::parse(req.body);
+        std::string username = body["username"];
+        std::string password = body["password"];
+        std::string email = body["email"];
+
+        auto existing_user = db.get_user(username);
+        if (existing_user) return crow::response(400, "Username already exists");
+
+        User user{0, username, BCrypt::generateHash(password), email};
+        db.add_user(user);
+        return crow::response(json{{"Message", "User registered successfully"}}.dump());
+    });
+
+    CROW_ROUTE(app, "/api/auth/login")
+    .methods(crow::HTTPMethod::POST)
+    ([&](const crow::request& req) {
+        auto body = json::parse(req.body);
+        std::string username = body["username"];
+        std::string password = body["password"];
+
+        auto user = db.get_user(username);
+        if (!user || !BCrypt::validatePassword(password, user->password_hash)) {
+            return crow::response(401, "Invalid credentials");
+        }
+
+        std::string token = generate_jwt_token(*user, jwt_key, jwt_issuer, jwt_audience);
+        return crow::response(json{{"Token", token}}.dump());
+    });
+
+    app.port(8080).multithreaded().run();
+    return 0;
+}

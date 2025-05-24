@@ -1,0 +1,485 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using MySql.Data.MySqlClient;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.IO;
+using Microsoft.AspNetCore.Http;
+
+namespace RentalPlatform
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            CreateHostBuilder(args).Build().Run();
+        }
+
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+            Host.CreateDefaultBuilder(args)
+                .ConfigureWebHostDefaults(webBuilder =>
+                {
+                    webBuilder.UseStartup<Startup>();
+                });
+    }
+
+    public class Startup
+    {
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.AddControllers();
+            services.AddSingleton<DbService>();
+            services.AddSingleton<PricingService>();
+            services.AddSingleton<UserService>();
+            services.AddSingleton<BookingService>();
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllers();
+            });
+        }
+    }
+
+    public class PricingConfig
+    {
+        public double LocationWeight { get; set; }
+        public double DemandWeight { get; set; }
+        public double CompetitorWeight { get; set; }
+        public double BasePrice { get; set; }
+        public double ConcessionFactor { get; set; }
+    }
+
+    public class Property
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public string Location { get; set; }
+        public double BasePrice { get; set; }
+        public double CurrentPrice { get; set; }
+        public double OccupancyRate { get; set; }
+        public string Lessor { get; set; }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public string Role { get; set; }
+    }
+
+    public class Booking
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int PropertyId { get; set; }
+        public DateTime StartDate { get; set; }
+        public DateTime EndDate { get; set; }
+        public double TotalPrice { get; set; }
+    }
+
+    public class DbService
+    {
+        private readonly string connStr = "Server=localhost;Database=rental_db;Uid=root;Pwd=password;";
+
+        public async Task<List<Property>> GetPropertiesAsync()
+        {
+            var properties = new List<Property>();
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("SELECT * FROM properties", conn);
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                properties.Add(new Property
+                {
+                    Id = reader.GetInt32("id"),
+                    Name = reader.GetString("name"),
+                    Location = reader.GetString("location"),
+                    BasePrice = reader.GetDouble("base_price"),
+                    CurrentPrice = reader.GetDouble("current_price"),
+                    OccupancyRate = reader.GetDouble("occupancy_rate"),
+                    Lessor = reader.GetString("lessor")
+                });
+            }
+            return properties;
+        }
+
+        public async Task<Property> GetPropertyByIdAsync(int id)
+        {
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("SELECT * FROM properties WHERE id = @id", conn);
+            cmd.Parameters.AddWithValue("@id", id);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new Property
+                {
+                    Id = reader.GetInt32("id"),
+                    Name = reader.GetString("name"),
+                    Location = reader.GetString("location"),
+                    BasePrice = reader.GetDouble("base_price"),
+                    CurrentPrice = reader.GetDouble("current_price"),
+                    OccupancyRate = reader.GetDouble("occupancy_rate"),
+                    Lessor = reader.GetString("lessor")
+                };
+            }
+            return null;
+        }
+
+        public async Task UpdatePropertyPriceAsync(int id, double newPrice)
+        {
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("UPDATE properties SET current_price = @price WHERE id = @id", conn);
+            cmd.Parameters.AddWithValue("@price", newPrice);
+            cmd.Parameters.AddWithValue("@id", id);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        public async Task<User> GetUserByUsernameAsync(string username)
+        {
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("SELECT * FROM users WHERE username = @username", conn);
+            cmd.Parameters.AddWithValue("@username", username);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new User
+                {
+                    Id = reader.GetInt32("id"),
+                    Username = reader.GetString("username"),
+                    PasswordHash = reader.GetString("password_hash"),
+                    Role = reader.GetString("role")
+                };
+            }
+            return null;
+        }
+
+        public async Task AddUserAsync(User user)
+        {
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("INSERT INTO users (username, password_hash, role) VALUES (@username, @password_hash, @role)", conn);
+            cmd.Parameters.AddWithValue("@username", user.Username);
+            cmd.Parameters.AddWithValue("@password_hash", user.PasswordHash);
+            cmd.Parameters.AddWithValue("@role", user.Role);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        public async Task AddBookingAsync(Booking booking)
+        {
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("INSERT INTO bookings (user_id, property_id, start_date, end_date, total_price) VALUES (@user_id, @property_id, @start_date, @end_date, @total_price)", conn);
+            cmd.Parameters.AddWithValue("@user_id", booking.UserId);
+            cmd.Parameters.AddWithValue("@property_id", booking.PropertyId);
+            cmd.Parameters.AddWithValue("@start_date", booking.StartDate);
+            cmd.Parameters.AddWithValue("@end_date", booking.EndDate);
+            cmd.Parameters.AddWithValue("@total_price", booking.TotalPrice);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        public async Task<List<Booking>> GetUserBookingsAsync(int userId)
+        {
+            var bookings = new List<Booking>();
+            using var conn = new MySqlConnection(connStr);
+            await conn.OpenAsync();
+            using var cmd = new MySqlCommand("SELECT * FROM bookings WHERE user_id = @user_id", conn);
+            cmd.Parameters.AddWithValue("@user_id", userId);
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                bookings.Add(new Booking
+                {
+                    Id = reader.GetInt32("id"),
+                    UserId = reader.GetInt32("user_id"),
+                    PropertyId = reader.GetInt32("property_id"),
+                    StartDate = reader.GetDateTime("start_date"),
+                    EndDate = reader.GetDateTime("end_date"),
+                    TotalPrice = reader.GetDouble("total_price")
+                });
+            }
+            return bookings;
+        }
+    }
+
+    public class PricingService
+    {
+        private readonly DbService dbSvc;
+        private readonly PricingConfig config;
+
+        public PricingService(DbService dbService)
+        {
+            dbSvc = dbService;
+            config = LoadConfig();
+        }
+
+        private PricingConfig LoadConfig()
+        {
+            var json = File.ReadAllText("pricing_config.json");
+            return JsonSerializer.Deserialize<PricingConfig>(json);
+        }
+
+        public async Task<double> CalculatePriceAsync(int propertyId)
+        {
+            var property = await dbSvc.GetPropertyByIdAsync(propertyId);
+            if (property == null) return 0;
+
+            var properties = await dbSvc.GetPropertiesAsync();
+            var competitorPrices = properties
+                .Where(p => p.Location == property.Location && p.Id != property.Id)
+                .Select(p => p.CurrentPrice)
+                .ToList();
+
+            double avgCompetitorPrice = competitorPrices.Any() ? competitorPrices.Average() : property.BasePrice;
+            double demandFactor = property.OccupancyRate > 0.8 ? 1.2 : property.OccupancyRate > 0.5 ? 1.0 : 0.9;
+            double locationFactor = property.Location.Contains("Downtown") ? 1.3 : 1.0;
+
+            double recommendedPrice = config.BasePrice +
+                (avgCompetitorPrice * config.CompetitorWeight) +
+                (property.BasePrice * config.LocationWeight * locationFactor) +
+                (property.BasePrice * config.DemandWeight * demandFactor);
+
+            double concession = recommendedPrice * config.ConcessionFactor;
+            return Math.Round(recommendedPrice - concession, 2);
+        }
+
+        public async Task UpdateAllPricesAsync()
+        {
+            var properties = await dbSvc.GetPropertiesAsync();
+            foreach (var prop in properties)
+            {
+                var newPrice = await CalculatePriceAsync(prop.Id);
+                await dbSvc.UpdatePropertyPriceAsync(prop.Id, newPrice);
+            }
+        }
+    }
+
+    public class UserService
+    {
+        private readonly DbService dbSvc;
+
+        public UserService(DbService dbService)
+        {
+            dbSvc = dbService;
+        }
+
+        public async Task<User> AuthenticateAsync(string username, string password)
+        {
+            var user = await dbSvc.GetUserByUsernameAsync(username);
+            if (user == null) return null;
+
+            if (VerifyPassword(password, user.PasswordHash))
+            {
+                return user;
+            }
+            return null;
+        }
+
+        public async Task<bool> RegisterAsync(string username, string password, string role)
+        {
+            var existingUser = await dbSvc.GetUserByUsernameAsync(username);
+            if (existingUser != null) return false;
+
+            var passwordHash = HashPassword(password);
+            var user = new User
+            {
+                Username = username,
+                PasswordHash = passwordHash,
+                Role = role
+            };
+            await dbSvc.AddUserAsync(user);
+            return true;
+        }
+
+        private string HashPassword(string password)
+        {
+            return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(password));
+        }
+
+        private bool VerifyPassword(string password, string hash)
+        {
+            return HashPassword(password) == hash;
+        }
+    }
+
+    public class BookingService
+    {
+        private readonly DbService dbSvc;
+
+        public BookingService(DbService dbService)
+        {
+            dbSvc = dbService;
+        }
+
+        public async Task<bool> CreateBookingAsync(int userId, int propertyId, DateTime startDate, DateTime endDate)
+        {
+            var property = await dbSvc.GetPropertyByIdAsync(propertyId);
+            if (property == null) return false;
+
+            var days = (endDate - startDate).Days;
+            if (days <= 0) return false;
+
+            var totalPrice = property.CurrentPrice * days;
+            var booking = new Booking
+            {
+                UserId = userId,
+                PropertyId = propertyId,
+                StartDate = startDate,
+                EndDate = endDate,
+                TotalPrice = totalPrice
+            };
+            await dbSvc.AddBookingAsync(booking);
+            return true;
+        }
+
+        public async Task<List<Booking>> GetUserBookingsAsync(int userId)
+        {
+            return await dbSvc.GetUserBookingsAsync(userId);
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PropertyController : ControllerBase
+    {
+        private readonly DbService dbSvc;
+        private readonly PricingService priceSvc;
+
+        public PropertyController(DbService dbService, PricingService pricingService)
+        {
+            dbSvc = dbService;
+            priceSvc = pricingService;
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetProperties([FromQuery] string sort = "price", [FromQuery] string keyword = "")
+        {
+            var properties = await dbSvc.GetPropertiesAsync();
+            if (!string.IsNullOrEmpty(keyword))
+            {
+                properties = properties.Where(p => p.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                                                  p.Location.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
+            }
+
+            properties = sort switch
+            {
+                "price" => properties.OrderBy(p => p.CurrentPrice).ToList(),
+                "discount" => properties.OrderBy(p => p.BasePrice - p.CurrentPrice).ToList(),
+                "recommended" => properties.OrderByDescending(p => p.OccupancyRate).ToList(),
+                _ => properties
+            };
+
+            return Ok(properties);
+        }
+
+        [HttpGet("{id}")]
+        public async Task<IActionResult> GetProperty(int id)
+        {
+            var property = await dbSvc.GetPropertyByIdAsync(id);
+            if (property == null) return NotFound();
+            return Ok(property);
+        }
+
+        [HttpPost("update-prices")]
+        public async Task<IActionResult> UpdatePrices()
+        {
+            await priceSvc.UpdateAllPricesAsync();
+            return Ok();
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class UserController : ControllerBase
+    {
+        private readonly UserService userSvc;
+
+        public UserController(UserService userService)
+        {
+            userSvc = userService;
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginRequest request)
+        {
+            var user = await userSvc.AuthenticateAsync(request.Username, request.Password);
+            if (user == null) return Unauthorized();
+            return Ok(new { user.Id, user.Username, user.Role });
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] RegisterRequest request)
+        {
+            var success = await userSvc.RegisterAsync(request.Username, request.Password, request.Role);
+            if (!success) return BadRequest("Username already exists");
+            return Ok();
+        }
+    }
+
+    public class LoginRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class RegisterRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string Role { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class BookingController : ControllerBase
+    {
+        private readonly BookingService bookingSvc;
+
+        public BookingController(BookingService bookingService)
+        {
+            bookingSvc = bookingService;
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> CreateBooking([FromBody] BookingRequest request)
+        {
+            var success = await bookingSvc.CreateBookingAsync(request.UserId, request.PropertyId, request.StartDate, request.EndDate);
+            if (!success) return BadRequest("Invalid booking details");
+            return Ok();
+        }
+
+        [HttpGet("user/{userId}")]
+        public async Task<IActionResult> GetUserBookings(int userId)
+        {
+            var bookings = await bookingSvc.GetUserBookingsAsync(userId);
+            return Ok(bookings);
+        }
+    }
+
+    public class BookingRequest
+    {
+        public int UserId { get; set; }
+        public int PropertyId { get; set; }
+        public DateTime StartDate { get; set; }
+        public DateTime EndDate { get; set; }
+    }
+}

@@ -1,0 +1,673 @@
+package com.video.platform;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.Key;
+import java.sql.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.Date;
+import java.util.stream.Collectors;
+
+@SpringBootApplication
+public class VideoPlatformApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(VideoPlatformApplication.class, args);
+    }
+}
+
+@Configuration
+@EnableWebSecurity
+class SecurityConfig {
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http, JwtRequestFilter jwtRequestFilter) throws Exception {
+        http
+            .csrf().disable()
+            .authorizeHttpRequests()
+            .antMatchers("/api/user/register", "/api/user/login").permitAll()
+            .anyRequest().authenticated()
+            .and()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .addFilterBefore(jwtRequestFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration authenticationConfiguration) throws Exception {
+        return authenticationConfiguration.getAuthenticationManager();
+    }
+}
+
+class JwtRequestFilter extends OncePerRequestFilter {
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        String header = request.getHeader("Authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            String token = header.substring(7);
+            try {
+                Jwts.parser().setSigningKey(jwtSecret.getBytes()).parseClaimsJws(token);
+            } catch (Exception e) {
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                return;
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+
+class WeightConfig {
+    private double viewWeight;
+    private double likeWeight;
+    private double platformBias;
+    private double keywordWeight;
+
+    public double getViewWeight() { return viewWeight; }
+    public void setViewWeight(double viewWeight) { this.viewWeight = viewWeight; }
+    public double getLikeWeight() { return likeWeight; }
+    public void setLikeWeight(double likeWeight) { this.likeWeight = likeWeight; }
+    public double getPlatformBias() { return platformBias; }
+    public void setPlatformBias(double platformBias) { this.platformBias = platformBias; }
+    public double getKeywordWeight() { return keywordWeight; }
+    public void setKeywordWeight(double keywordWeight) { this.keywordWeight = keywordWeight; }
+}
+
+class Video {
+    private int id;
+    private String title;
+    private String description;
+    private String url;
+    private boolean isPlatformOwned;
+    private int views;
+    private int likes;
+    private String keywords;
+    private Date uploadDate;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getTitle() { return title; }
+    public void setTitle(String title) { this.title = title; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public String getUrl() { return url; }
+    public void setUrl(String url) { this.url = url; }
+    public boolean isPlatformOwned() { return isPlatformOwned; }
+    public void setPlatformOwned(boolean platformOwned) { isPlatformOwned = platformOwned; }
+    public int getViews() { return views; }
+    public void setViews(int views) { this.views = views; }
+    public int getLikes() { return likes; }
+    public void setLikes(int likes) { this.likes = likes; }
+    public String getKeywords() { return keywords; }
+    public void setKeywords(String keywords) { this.keywords = keywords; }
+    public Date getUploadDate() { return uploadDate; }
+    public void setUploadDate(Date uploadDate) { this.uploadDate = uploadDate; }
+}
+
+class User {
+    private int id;
+    private String username;
+    private String passwordHash;
+    private String email;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+}
+
+class Favorite {
+    private int id;
+    private int userId;
+    private int videoId;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public int getVideoId() { return videoId; }
+    public void setVideoId(int videoId) { this.videoId = videoId; }
+}
+
+class Playlist {
+    private int id;
+    private int userId;
+    private String name;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+}
+
+class PlaylistVideo {
+    private int playlistId;
+    private int videoId;
+
+    public int getPlaylistId() { return playlistId; }
+    public void setPlaylistId(int playlistId) { this.playlistId = playlistId; }
+    public int getVideoId() { return videoId; }
+    public void setVideoId(int videoId) { this.videoId = videoId; }
+}
+
+class WatchHistory {
+    private int id;
+    private int userId;
+    private int videoId;
+    private Date watchedAt;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public int getVideoId() { return videoId; }
+    public void setVideoId(int videoId) { this.videoId = videoId; }
+    public Date getWatchedAt() { return watchedAt; }
+    public void setWatchedAt(Date watchedAt) { this.watchedAt = watchedAt; }
+}
+
+class SearchResult {
+    private int videoId;
+    private String title;
+    private String description;
+    private String url;
+    private double score;
+
+    public int getVideoId() { return videoId; }
+    public void setVideoId(int videoId) { this.videoId = videoId; }
+    public String getTitle() { return title; }
+    public void setTitle(String title) { this.title = title; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public String getUrl() { return url; }
+    public void setUrl(String url) { this.url = url; }
+    public double getScore() { return score; }
+    public void setScore(double score) { this.score = score; }
+}
+
+@RestController
+@RequestMapping("/api/video")
+class VideoController {
+    @Value("${spring.datasource.url}")
+    private String connectionString;
+    @Value("${weights.file.path:weights.json}")
+    private String weightsFilePath;
+    private final WeightConfig weights;
+
+    public VideoController() throws IOException {
+        String json = Files.readString(Paths.get("weights.json"));
+        weights = new ObjectMapper().readValue(json, WeightConfig.class);
+    }
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(connectionString);
+    }
+
+    @GetMapping("/search")
+    public ResponseEntity<List<SearchResult>> searchVideos(@RequestParam String query, @RequestParam(defaultValue = "relevance") String sort) throws SQLException {
+        List<Video> videos = getVideosFromDb();
+        List<SearchResult> results = videos.stream().map(video -> {
+            double score = calculateVideoScore(video, query);
+            SearchResult result = new SearchResult();
+            result.setVideoId(video.getId());
+            result.setTitle(video.getTitle());
+            result.setDescription(video.getDescription());
+            result.setUrl(video.getUrl());
+            result.setScore(score);
+            return result;
+        }).collect(Collectors.toList());
+
+        switch (sort.toLowerCase()) {
+            case "views":
+                results.sort((r1, r2) -> Integer.compare(getVideoViews(r2.getVideoId()), getVideoViews(r1.getVideoId())));
+                break;
+            case "upload":
+                results.sort((r1, r2) -> getVideoUploadDate(r2.getVideoId()).compareTo(getVideoUploadDate(r1.getVideoId())));
+                break;
+            default:
+                results.sort((r1, r2) -> Double.compare(r2.getScore(), r1.getScore()));
+                break;
+        }
+
+        return ResponseEntity.ok(results);
+    }
+
+    private List<Video> getVideosFromDb() throws SQLException {
+        List<Video> videos = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos");
+             ResultSet rs = stmt.executeQuery()) {
+            while (rs.next()) {
+                Video video = new Video();
+                video.setId(rs.getInt("id"));
+                video.setTitle(rs.getString("title"));
+                video.setDescription(rs.getString("description"));
+                video.setUrl(rs.getString("url"));
+                video.setPlatformOwned(rs.getBoolean("is_platform_owned"));
+                video.setViews(rs.getInt("views"));
+                video.setLikes(rs.getInt("likes"));
+                video.setKeywords(rs.getString("keywords"));
+                video.setUploadDate(rs.getTimestamp("upload_date"));
+                videos.add(video);
+            }
+        }
+        return videos;
+    }
+
+    private double calculateVideoScore(Video video, String query) {
+        double score = 0;
+        String[] queryTerms = query.toLowerCase().split(" ");
+        String[] videoKeywords = video.getKeywords().toLowerCase().split(",");
+
+        for (String term : queryTerms) {
+            if (video.getTitle().toLowerCase().contains(term) || video.getDescription().toLowerCase().contains(term)) {
+                score += weights.getKeywordWeight();
+            }
+            if (Arrays.stream(videoKeywords).anyMatch(k -> k.trim().equals(term))) {
+                score += weights.getKeywordWeight() * 1.5;
+            }
+        }
+
+        score += video.getViews() * weights.getViewWeight();
+        score += video.getLikes() * weights.getLikeWeight();
+
+        if (video.isPlatformOwned()) {
+            score += weights.getPlatformBias();
+        }
+
+        long recency = (System.currentTimeMillis() - video.getUploadDate().getTime()) / (1000 * 60 * 60 * 24);
+        score += Math.max(0, 30 - recency) * 0.1;
+
+        return score;
+    }
+
+    private int getVideoViews(int videoId) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement("SELECT views FROM videos WHERE id = ?")) {
+            stmt.setInt(1, videoId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt("views");
+                }
+            }
+        }
+        return 0;
+    }
+
+    private Date getVideoUploadDate(int videoId) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement("SELECT upload_date FROM videos WHERE id = ?")) {
+            stmt.setInt(1, videoId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getTimestamp("upload_date");
+                }
+            }
+        }
+        return new Date();
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Video> getVideo(@PathVariable int id) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos WHERE id = ?")) {
+            stmt.setInt(1, id);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    Video video = new Video();
+                    video.setId(rs.getInt("id"));
+                    video.setTitle(rs.getString("title"));
+                    video.setDescription(rs.getString("description"));
+                    video.setUrl(rs.getString("url"));
+                    video.setPlatformOwned(rs.getBoolean("is_platform_owned"));
+                    video.setViews(rs.getInt("views"));
+                    video.setLikes(rs.getInt("likes"));
+                    video.setKeywords(rs.getString("keywords"));
+                    video.setUploadDate(rs.getTimestamp("upload_date"));
+                    return ResponseEntity.ok(video);
+                }
+            }
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    @PostMapping
+    public ResponseEntity<Void> uploadVideo(@RequestBody Video video) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO videos (title, description, url, is_platform_owned, views, likes, keywords, upload_date) VALUES (?, ?, ?, ?, 0, 0, ?, ?)")) {
+            stmt.setString(1, video.getTitle());
+            stmt.setString(2, video.getDescription());
+            stmt.setString(3, video.getUrl());
+            stmt.setBoolean(4, video.isPlatformOwned());
+            stmt.setString(5, video.getKeywords());
+            stmt.setTimestamp(6, new Timestamp(System.currentTimeMillis()));
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @PostMapping("/like")
+    public ResponseEntity<Void> likeVideo(@RequestParam int videoId) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement("UPDATE videos SET likes = likes + 1 WHERE id = ?")) {
+            stmt.setInt(1, videoId);
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @PostMapping("/view")
+    public ResponseEntity<Void> recordView(@RequestParam int videoId) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement("UPDATE videos SET views = views + 1 WHERE id = ?")) {
+            stmt.setInt(1, videoId);
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+}
+
+@RestController
+@RequestMapping("/api/user")
+class UserController {
+    @Value("${spring.datasource.url}")
+    private String connectionString;
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+    private final PasswordEncoder passwordEncoder;
+
+    public UserController(PasswordEncoder passwordEncoder) {
+        this.passwordEncoder = passwordEncoder;
+    }
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(connectionString);
+    }
+
+    @PostMapping("/register")
+    public ResponseEntity<Void> register(@RequestBody User user) throws SQLException {
+        String passwordHash = passwordEncoder.encode(user.getPasswordHash());
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)")) {
+            stmt.setString(1, user.getUsername());
+            stmt.setString(2, passwordHash);
+            stmt.setString(3, user.getEmail());
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<Map<String, String>> login(@RequestBody User login) throws SQLException {
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, username, password_hash FROM users WHERE username = ?")) {
+            stmt.setString(1, login.getUsername());
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    String storedHash = rs.getString("password_hash");
+                    if (passwordEncoder.matches(login.getPasswordHash(), storedHash)) {
+                        String token = generateJwtToken(rs.getInt("id"), login.getUsername());
+                        return ResponseEntity.ok(Map.of("Token", token));
+                    }
+                }
+            }
+        }
+        return ResponseEntity.status(401).build();
+    }
+
+    private String generateJwtToken(int userId, String username) {
+        Key key = Keys.hmacShaKeyFor(jwtSecret.getBytes());
+        return Jwts.builder()
+                .setClaims(Map.of("userId", String.valueOf(userId), "username", username))
+                .setIssuedAt(new Date())
+                .setExpiration(new Date(System.currentTimeMillis() + 3600000))
+                .signWith(key, SignatureAlgorithm.HS256)
+                .compact();
+    }
+}
+
+@RestController
+@RequestMapping("/api/favorite")
+class FavoriteController {
+    @Value("${spring.datasource.url}")
+    private String connectionString;
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(connectionString);
+    }
+
+    @PostMapping
+    public ResponseEntity<Void> addFavorite(@RequestParam int videoId, @RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO favorites (user_id, video_id) VALUES (?, ?)")) {
+            stmt.setInt(1, userId);
+            stmt.setInt(2, videoId);
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Favorite>> getFavorites(@RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        List<Favorite> favorites = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, user_id, video_id FROM favorites WHERE user_id = ?")) {
+            stmt.setInt(1, userId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    Favorite favorite = new Favorite();
+                    favorite.setId(rs.getInt("id"));
+                    favorite.setUserId(rs.getInt("user_id"));
+                    favorite.setVideoId(rs.getInt("video_id"));
+                    favorites.add(favorite);
+                }
+            }
+        }
+        return ResponseEntity.ok(favorites);
+    }
+
+    private int extractUserIdFromToken(String authHeader) {
+        String token = authHeader.substring(7);
+        String userId = Jwts.parser().setSigningKey(Keys.hmacShaKeyFor(connectionString.getBytes()))
+                .parseClaimsJws(token).getBody().get("userId", String.class);
+        return Integer.parseInt(userId);
+    }
+}
+
+@RestController
+@RequestMapping("/api/playlist")
+class PlaylistController {
+    @Value("${spring.datasource.url}")
+    private String connectionString;
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(connectionString);
+    }
+
+    @PostMapping
+    public ResponseEntity<Void> createPlaylist(@RequestParam String name, @RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO playlists (user_id, name) VALUES (?, ?)")) {
+            stmt.setInt(1, userId);
+            stmt.setString(2, name);
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @PostMapping("/video")
+    public ResponseEntity<Void> addVideoToPlaylist(@RequestParam int playlistId, @RequestParam int videoId,
+                                                  @RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO playlist_videos (playlist_id, video_id) VALUES (?, ?)")) {
+            stmt.setInt(1, playlistId);
+            stmt.setInt(2, videoId);
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Playlist>> getPlaylists(@RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        List<Playlist> playlists = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, user_id, name FROM playlists WHERE user_id = ?")) {
+            stmt.setInt(1, userId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    Playlist playlist = new Playlist();
+                    playlist.setId(rs.getInt("id"));
+                    playlist.setUserId(rs.getInt("user_id"));
+                    playlist.setName(rs.getString("name"));
+                    playlists.add(playlist);
+                }
+            }
+        }
+        return ResponseEntity.ok(playlists);
+    }
+
+    @GetMapping("/{id}/videos")
+    public ResponseEntity<List<Video>> getPlaylistVideos(@PathVariable int id) throws SQLException {
+        List<Video> videos = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT v.id, v.title, v.description, v.url, v.is_platform_owned, v.views, v.likes, v.keywords, v.upload_date " +
+                             "FROM videos v JOIN playlist_videos pv ON v.id = pv.video_id WHERE pv.playlist_id = ?")) {
+            stmt.setInt(1, id);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    Video video = new Video();
+                    video.setId(rs.getInt("id"));
+                    video.setTitle(rs.getString("title"));
+                    video.setDescription(rs.getString("description"));
+                    video.setUrl(rs.getString("url"));
+                    video.setPlatformOwned(rs.getBoolean("is_platform_owned"));
+                    video.setViews(rs.getInt("views"));
+                    video.setLikes(rs.getInt("likes"));
+                    video.setKeywords(rs.getString("keywords"));
+                    video.setUploadDate(rs.getTimestamp("upload_date"));
+                    videos.add(video);
+                }
+            }
+        }
+        return ResponseEntity.ok(videos);
+    }
+
+    private int extractUserIdFromToken(String authHeader) {
+        String token = authHeader.substring(7);
+        String userId = Jwts.parser().setSigningKey(Keys.hmacShaKeyFor(connectionString.getBytes()))
+                .parseClaimsJws(token).getBody().get("userId", String.class);
+        return Integer.parseInt(userId);
+    }
+}
+
+@RestController
+@RequestMapping("/api/watchhistory")
+class WatchHistoryController {
+    @Value("${spring.datasource.url}")
+    private String connectionString;
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(connectionString);
+    }
+
+    @PostMapping
+    public ResponseEntity<Void> addWatchHistory(@RequestParam int videoId, @RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO watch_history (user_id, video_id, watched_at) VALUES (?, ?, ?)")) {
+            stmt.setInt(1, userId);
+            stmt.setInt(2, videoId);
+            stmt.setTimestamp(3, new Timestamp(System.currentTimeMillis()));
+            stmt.executeUpdate();
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<List<WatchHistory>> getWatchHistory(@RequestHeader("Authorization") String authHeader) throws SQLException {
+        int userId = extractUserIdFromToken(authHeader);
+        List<WatchHistory> history = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement stmt = conn.prepareStatement(
+                     "SELECT id, user_id, video_id, watched_at FROM watch_history WHERE user_id = ? ORDER BY watched_at DESC")) {
+            stmt.setInt(1, userId);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    WatchHistory watchHistory = new WatchHistory();
+                    watchHistory.setId(rs.getInt("id"));
+                    watchHistory.setUserId(rs.getInt("user_id"));
+                    watchHistory.setVideoId(rs.getInt("video_id"));
+                    watchHistory.setWatchedAt(rs.getTimestamp("watched_at"));
+                    history.add(watchHistory);
+                }
+            }
+        }
+        return ResponseEntity.ok(history);
+    }
+
+    private int extractUserIdFromToken(String authHeader) {
+        String token = authHeader.substring(7);
+        String userId = Jwts.parser().setSigningKey(Keys.hmacShaKeyFor(connectionString.getBytes()))
+                .parseClaimsJws(token).getBody().get("userId", String.class);
+        return Integer.parseInt(userId);
+    }
+}

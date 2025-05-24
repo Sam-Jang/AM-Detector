@@ -1,0 +1,470 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <memory>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <cmath>
+#include <chrono>
+
+using json = nlohmann::json;
+using namespace std;
+
+struct Constants {
+    double PriceWeight;
+    double DeliverySpeedWeight;
+    double SellerRatingWeight;
+    double PrimeBiasFactor;
+    double FeaturedOfferPriceDiff;
+    double SecondOfferMinPriceDiff;
+    int MinSellerSales;
+    double FraudRiskThreshold;
+};
+
+struct Product {
+    int ProductId;
+    string ASIN;
+    string Name;
+    string Description;
+    string Category;
+    double BasePrice;
+    int StockQuantity;
+};
+
+struct Seller {
+    int SellerId;
+    string SellerName;
+    bool IsPlatformRetail;
+    double Rating;
+    int TotalSales;
+    bool IsActive;
+    time_t AccountCreated;
+};
+
+struct Offer {
+    int OfferId;
+    int ProductId;
+    int SellerId;
+    double Price;
+    double ShippingCost;
+    int DeliveryDays;
+    bool IsPrimeEligible;
+    int StockQuantity;
+    shared_ptr<Product> Product;
+    shared_ptr<Seller> Seller;
+};
+
+struct CartItem {
+    int CartItemId;
+    int UserId;
+    int OfferId;
+    int Quantity;
+    shared_ptr<Offer> Offer;
+};
+
+struct Order {
+    int OrderId;
+    int UserId;
+    time_t OrderDate;
+    string Status;
+    vector<shared_ptr<struct OrderItem>> OrderItems;
+};
+
+struct OrderItem {
+    int OrderItemId;
+    int OrderId;
+    int OfferId;
+    int Quantity;
+    double Price;
+    time_t ExpectedDeliveryDate;
+    time_t DeliveryDate;
+    string Status;
+};
+
+struct FeaturedOfferResult {
+    shared_ptr<Offer> FeaturedOffer;
+    shared_ptr<Offer> SecondOffer;
+};
+
+class Database {
+    sqlite3* db;
+public:
+    Database(const string& path) {
+        sqlite3_open(path.c_str(), &db);
+    }
+    ~Database() {
+        sqlite3_close(db);
+    }
+    sqlite3* get() { return db; }
+};
+
+class ECommerce {
+    Database db;
+    Constants constants;
+
+    static int callback(void* data, int argc, char** argv, char** colNames) {
+        vector<shared_ptr<Offer>>* offers = static_cast<vector<shared_ptr<Offer>>*>(data);
+        auto offer = make_shared<Offer>();
+        offer->OfferId = atoi(argv[0]);
+        offer->ProductId = atoi(argv[1]);
+        offer->SellerId = atoi(argv[2]);
+        offer->Price = atof(argv[3]);
+        offer->ShippingCost = atof(argv[4]);
+        offer->DeliveryDays = atoi(argv[5]);
+        offer->IsPrimeEligible = atoi(argv[6]);
+        offer->StockQuantity = atoi(argv[7]);
+        auto product = make_shared<Product>();
+        product->ProductId = atoi(argv[8]);
+        product->ASIN = argv[9];
+        product->Name = argv[10];
+        product->Description = argv[11];
+        product->Category = argv[12];
+        product->BasePrice = atof(argv[13]);
+        product->StockQuantity = atoi(argv[14]);
+        auto seller = make_shared<Seller>();
+        seller->SellerId = atoi(argv[15]);
+        seller->SellerName = argv[16];
+        seller->IsPlatformRetail = atoi(argv[17]);
+        seller->Rating = atof(argv[18]);
+        seller->TotalSales = atoi(argv[19]);
+        seller->IsActive = atoi(argv[20]);
+        seller->AccountCreated = atoll(argv[21]);
+        offer->Product = product;
+        offer->Seller = seller;
+        offers->push_back(offer);
+        return 0;
+    }
+
+public:
+    ECommerce(const string& dbPath) : db(dbPath) {
+        ifstream file("constants.json");
+        json j;
+        file >> j;
+        constants.PriceWeight = j["PriceWeight"];
+        constants.DeliverySpeedWeight = j["DeliverySpeedWeight"];
+        constants.SellerRatingWeight = j["SellerRatingWeight"];
+        constants.PrimeBiasFactor = j["PrimeBiasFactor"];
+        constants.FeaturedOfferPriceDiff = j["FeaturedOfferPriceDiff"];
+        constants.SecondOfferMinPriceDiff = j["SecondOfferMinPriceDiff"];
+        constants.MinSellerSales = j["MinSellerSales"];
+        constants.FraudRiskThreshold = j["FraudRiskThreshold"];
+    }
+
+    vector<shared_ptr<Offer>> SearchProducts(const string& keyword, const string& sortBy, int page, int pageSize) {
+        vector<shared_ptr<Offer>> offers;
+        string query = "SELECT o.*, p.*, s.* FROM Offers o "
+                      "JOIN Products p ON o.ProductId = p.ProductId "
+                      "JOIN Sellers s ON o.SellerId = s.SellerId "
+                      "WHERE o.StockQuantity > 0 AND s.IsActive";
+        if (!keyword.empty()) {
+            query += " AND (p.Name LIKE '%" + keyword + "%' OR p.Description LIKE '%" + keyword + "%')";
+        }
+        if (sortBy == "priceasc") {
+            query += " ORDER BY (o.Price + o.ShippingCost) ASC";
+        } else if (sortBy == "pricedesc") {
+            query += " ORDER BY (o.Price + o.ShippingCost) DESC";
+        } else if (sortBy == "discount") {
+            query += " ORDER BY ((p.BasePrice - o.Price) / p.BasePrice) DESC";
+        } else if (sortBy == "rating") {
+            query += " ORDER BY s.Rating DESC";
+        } else {
+            query += " ORDER BY p.Name";
+        }
+        query += " LIMIT " + to_string(pageSize) + " OFFSET " + to_string((page - 1) * pageSize);
+        sqlite3_exec(db.get(), query.c_str(), callback, &offers, nullptr);
+        return offers;
+    }
+
+    shared_ptr<FeaturedOfferResult> GetProductOffers(const string& asin) {
+        vector<shared_ptr<Offer>> offers;
+        string query = "SELECT o.*, p.*, s.* FROM Offers o "
+                      "JOIN Products p ON o.ProductId = p.ProductId "
+                      "JOIN Sellers s ON o.SellerId = s.SellerId "
+                      "WHERE p.ASIN = '" + asin + "' AND o.StockQuantity > 0 AND s.IsActive";
+        sqlite3_exec(db.get(), query.c_str(), callback, &offers, nullptr);
+        if (offers.empty()) return nullptr;
+        return SelectFeaturedAndSecondOffer(offers);
+    }
+
+    shared_ptr<FeaturedOfferResult> SelectFeaturedAndSecondOffer(const vector<shared_ptr<Offer>>& offers) {
+        auto eligibleOffers = FilterEligibleOffers(offers);
+        if (eligibleOffers.empty()) return make_shared<FeaturedOfferResult>();
+        vector<pair<shared_ptr<Offer>, double>> scoredOffers;
+        for (const auto& o : eligibleOffers) {
+            scoredOffers.emplace_back(o, CalculateOfferScore(o));
+        }
+        sort(scoredOffers.begin(), scoredOffers.end(), 
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+        auto featured = scoredOffers[0].first;
+        auto secondOffer = SelectSecondOffer(scoredOffers, featured);
+        return make_shared<FeaturedOfferResult>(FeaturedOfferResult{featured, secondOffer});
+    }
+
+    vector<shared_ptr<Offer>> FilterEligibleOffers(const vector<shared_ptr<Offer>>& offers) {
+        vector<shared_ptr<Offer>> result;
+        for (const auto& o : offers) {
+            if (IsGenuineSeller(o->Seller) && !IsAtypicalPrice(o) && !IsDisqualifiedCompetitor(o)) {
+                result.push_back(o);
+            }
+        }
+        return result;
+    }
+
+    bool IsGenuineSeller(const shared_ptr<Seller>& seller) {
+        auto now = time(nullptr);
+        double daysActive = difftime(now, seller->AccountCreated) / (60 * 60 * 24);
+        return seller->IsActive && daysActive >= 90 && 
+               seller->TotalSales >= constants.MinSellerSales && 
+               seller->Rating >= constants.FraudRiskThreshold;
+    }
+
+    bool IsAtypicalPrice(const shared_ptr<Offer>& offer) {
+        double avgPrice = 0;
+        int count = 0;
+        string query = "SELECT AVG(Price) FROM Offers WHERE ProductId = " + to_string(offer->ProductId);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            avgPrice = sqlite3_column_double(stmt, 0);
+            count = 1;
+        }
+        sqlite3_finalize(stmt);
+        return count > 0 ? abs(offer->Price - avgPrice) / avgPrice > 0.3 : false;
+    }
+
+    bool IsDisqualifiedCompetitor(const shared_ptr<Offer>& offer) {
+        return offer->Seller->Rating < 3.0 || offer->StockQuantity < 5;
+    }
+
+    double CalculateOfferScore(const shared_ptr<Offer>& offer) {
+        double landedPrice = offer->Price + offer->ShippingCost;
+        double deliveryScore = 1.0 / (offer->DeliveryDays + 1);
+        double ratingScore = offer->Seller->Rating / 5.0;
+        double score = (constants.PriceWeight * (1.0 / landedPrice)) +
+                       (constants.DeliverySpeedWeight * deliveryScore) +
+                       (constants.SellerRatingWeight * ratingScore);
+        if (offer->Seller->IsPlatformRetail) {
+            score *= (1.0 + constants.PrimeBiasFactor);
+        }
+        return score;
+    }
+
+    shared_ptr<Offer> SelectSecondOffer(const vector<pair<shared_ptr<Offer>, double>>& scoredOffers, const shared_ptr<Offer>& featured) {
+        vector<pair<shared_ptr<Offer>, double>> candidates;
+        for (const auto& x : scoredOffers) {
+            if (x.first->SellerId != featured->SellerId && IsSufficientlyDifferentiated(x.first, featured)) {
+                candidates.push_back(x);
+            }
+        }
+        if (candidates.empty()) return nullptr;
+        sort(candidates.begin(), candidates.end(), 
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+        return candidates[0].first;
+    }
+
+    bool IsSufficientlyDifferentiated(const shared_ptr<Offer>& candidate, const shared_ptr<Offer>& featured) {
+        double candidateLanded = candidate->Price + candidate->ShippingCost;
+        double featuredLanded = featured->Price + featured->ShippingCost;
+        double priceDiff = abs(candidateLanded - featuredLanded);
+        int deliveryDiff = abs(candidate->DeliveryDays - featured->DeliveryDays);
+        double minPriceDiff = constants.SecondOfferMinPriceDiff + 
+                             (constants.FeaturedOfferPriceDiff * deliveryDiff);
+        return priceDiff >= minPriceDiff || candidateLanded <= featuredLanded * 0.9;
+    }
+
+    bool CheckPrimeEligibility(int sellerId) {
+        sqlite3_stmt* stmt;
+        string query = "SELECT * FROM Sellers WHERE SellerId = " + to_string(sellerId);
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        auto seller = make_shared<Seller>();
+        seller->SellerId = sqlite3_column_int(stmt, 0);
+        seller->IsActive = sqlite3_column_int(stmt, 5);
+        seller->Rating = sqlite3_column_double(stmt, 3);
+        seller->TotalSales = sqlite3_column_int(stmt, 4);
+        sqlite3_finalize(stmt);
+        if (!seller->IsActive) return false;
+        return EvaluatePrimeEligibility(seller);
+    }
+
+    bool EvaluatePrimeEligibility(const shared_ptr<Seller>& seller) {
+        vector<shared_ptr<OrderItem>> recentOrders;
+        string query = "SELECT oi.* FROM Offers o "
+                      "JOIN OrderItems oi ON o.OfferId = oi.OfferId "
+                      "WHERE o.SellerId = " + to_string(seller->SellerId) + 
+                      " AND oi.OrderDate >= " + to_string(time(nullptr) - 30 * 24 * 60 * 60);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto item = make_shared<OrderItem>();
+            item->OrderDate = sqlite3_column_int64(stmt, 6);
+            item->ExpectedDeliveryDate = sqlite3_column_int64(stmt, 5);
+            item->DeliveryDate = sqlite3_column_int64(stmt, 6);
+            item->Status = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            recentOrders.push_back(item);
+        }
+        sqlite3_finalize(stmt);
+        double onTimeDeliveryRate = recentOrders.empty() ? 0.0 : 
+            count_if(recentOrders.begin(), recentOrders.end(), 
+                [](const auto& o) { return o->DeliveryDate <= o->ExpectedDeliveryDate; }) / 
+                static_cast<double>(recentOrders.size());
+        double cancellationRate = recentOrders.empty() ? 0.0 : 
+            count_if(recentOrders.begin(), recentOrders.end(), 
+                [](const auto& o) { return o->Status == "Cancelled"; }) / 
+                static_cast<double>(recentOrders.size());
+        return onTimeDeliveryRate >= 0.95 && cancellationRate <= 0.02 && 
+               seller->Rating >= 4.0 && !IsFraudRisk(seller);
+    }
+
+    bool IsFraudRisk(const shared_ptr<Seller>& seller) {
+        return seller->Rating < constants.FraudRiskThreshold || 
+               seller->TotalSales < constants.MinSellerSales / 2;
+    }
+
+    shared_ptr<CartItem> AddToCart(int userId, int offerId, int quantity) {
+        sqlite3_stmt* stmt;
+        string query = "SELECT StockQuantity FROM Offers WHERE OfferId = " + to_string(offerId);
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) < quantity) {
+            sqlite3_finalize(stmt);
+            return nullptr;
+        }
+        sqlite3_finalize(stmt);
+        query = "SELECT * FROM CartItems WHERE UserId = " + to_string(userId) + 
+                " AND OfferId = " + to_string(offerId);
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        shared_ptr<CartItem> cartItem;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            cartItem = make_shared<CartItem>();
+            cartItem->CartItemId = sqlite3_column_int(stmt, 0);
+            cartItem->Quantity = sqlite3_column_int(stmt, 3);
+            query = "UPDATE CartItems SET Quantity = " + to_string(cartItem->Quantity + quantity) + 
+                    " WHERE CartItemId = " + to_string(cartItem->CartItemId);
+        } else {
+            cartItem = make_shared<CartItem>();
+            cartItem->UserId = userId;
+            cartItem->OfferId = offerId;
+            cartItem->Quantity = quantity;
+            query = "INSERT INTO CartItems (UserId, OfferId, Quantity) VALUES (" + 
+                    to_string(userId) + "," + to_string(offerId) + "," + to_string(quantity) + ")";
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        return cartItem;
+    }
+
+    vector<shared_ptr<CartItem>> GetCart(int userId) {
+        vector<shared_ptr<CartItem>> items;
+        string query = "SELECT c.*, o.*, p.*, s.* FROM CartItems c "
+                      "JOIN Offers o ON c.OfferId = o.OfferId "
+                      "JOIN Products p ON o.ProductId = p.ProductId "
+                      "JOIN Sellers s ON o.SellerId = s.SellerId "
+                      "WHERE c.UserId = " + to_string(userId);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto item = make_shared<CartItem>();
+            item->CartItemId = sqlite3_column_int(stmt, 0);
+            item->UserId = sqlite3_column_int(stmt, 1);
+            item->OfferId = sqlite3_column_int(stmt, 2);
+            item->Quantity = sqlite3_column_int(stmt, 3);
+            auto offer = make_shared<Offer>();
+            offer->OfferId = sqlite3_column_int(stmt, 4);
+            offer->ProductId = sqlite3_column_int(stmt, 5);
+            offer->SellerId = sqlite3_column_int(stmt, 6);
+            offer->Price = sqlite3_column_double(stmt, 7);
+            offer->ShippingCost = sqlite3_column_double(stmt, 8);
+            offer->DeliveryDays = sqlite3_column_int(stmt, 9);
+            offer->IsPrimeEligible = sqlite3_column_int(stmt, 10);
+            offer->StockQuantity = sqlite3_column_int(stmt, 11);
+            auto product = make_shared<Product>();
+            product->ProductId = sqlite3_column_int(stmt, 12);
+            product->ASIN = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 13));
+            product->Name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
+            product->Description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 15));
+            product->Category = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 16));
+            product->BasePrice = sqlite3_column_double(stmt, 17);
+            product->StockQuantity = sqlite3_column_int(stmt, 18);
+            auto seller = make_shared<Seller>();
+            seller->SellerId = sqlite3_column_int(stmt, 19);
+            seller->SellerName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 20));
+            seller->IsPlatformRetail = sqlite3_column_int(stmt, 21);
+            seller->Rating = sqlite3_column_double(stmt, 22);
+            seller->TotalSales = sqlite3_column_int(stmt, 23);
+            seller->IsActive = sqlite3_column_int(stmt, 24);
+            seller->AccountCreated = sqlite3_column_int64(stmt, 25);
+            offer->Product = product;
+            offer->Seller = seller;
+            item->Offer = offer;
+            items.push_back(item);
+        }
+        sqlite3_finalize(stmt);
+        return items;
+    }
+
+    shared_ptr<CartItem> UpdateCartItem(int cartItemId, int quantity) {
+        string query = "SELECT c.OfferId, o.StockQuantity FROM CartItems c "
+                      "JOIN Offers o ON c.OfferId = o.OfferId "
+                      "WHERE c.CartItemId = " + to_string(cartItemId);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 1) < quantity) {
+            sqlite3_finalize(stmt);
+            return nullptr;
+        }
+        int offerId = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        query = "UPDATE CartItems SET Quantity = " + to_string(quantity) + 
+                " WHERE CartItemId = " + to_string(cartItemId);
+        sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        auto item = make_shared<CartItem>();
+        item->CartItemId = cartItemId;
+        item->OfferId = offerId;
+        item->Quantity = quantity;
+        return item;
+    }
+
+    bool RemoveFromCart(int cartItemId) {
+        string query = "DELETE FROM CartItems WHERE CartItemId = " + to_string(cartItemId);
+        return sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+    }
+
+    shared_ptr<Order> Checkout(int userId) {
+        auto cartItems = GetCart(userId);
+        if (cartItems.empty()) return nullptr;
+        auto order = make_shared<Order>();
+        order->UserId = userId;
+        order->OrderDate = time(nullptr);
+        order->Status = "Pending";
+        for (const auto& item : cartItems) {
+            auto orderItem = make_shared<OrderItem>();
+            orderItem->OfferId = item->OfferId;
+            orderItem->Quantity = item->Quantity;
+            orderItem->Price = item->Offer->Price;
+            orderItem->ExpectedDeliveryDate = order->OrderDate + item->Offer->DeliveryDays * 24 * 60 * 60;
+            order->OrderItems.push_back(orderItem);
+            string query = "UPDATE Offers SET StockQuantity = StockQuantity - " + to_string(item->Quantity) + 
+                          " WHERE OfferId = " + to_string(item->OfferId);
+            sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        }
+        string query = "INSERT INTO Orders (UserId, OrderDate, Status) VALUES (" + 
+                      to_string(userId) + "," + to_string(order->OrderDate) + ",'Pending')";
+        sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        int orderId = sqlite3_last_insert_rowid(db.get());
+        for (const auto& item : order->OrderItems) {
+            query = "INSERT INTO OrderItems (OrderId, OfferId, Quantity, Price, ExpectedDeliveryDate, Status) VALUES (" +
+                    to_string(orderId) + "," + to_string(item->OfferId) + "," + to_string(item->Quantity) + "," +
+                    to_string(item->Price) + "," + to_string(item->ExpectedDeliveryDate) + ",'Pending')";
+            sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        }
+        query = "DELETE FROM CartItems WHERE UserId = " + to_string(userId);
+        sqlite3_exec(db.get(), query.c_str(), nullptr, nullptr, nullptr);
+        order->OrderId = orderId;
+        return order;
+    }
+};

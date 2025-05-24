@@ -1,0 +1,83 @@
+using System;
+using MySql.Data.MySqlClient;
+
+namespace RPGDamageCalculator
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            string connectionString = "Server=localhost;Database=rpg_db;User ID=root;Password=yourpassword;";
+
+            var monsterId = int.Parse(args[0]);
+            var userId = int.Parse(args[1]);
+
+            var monster = GetMonsterData(connectionString, monsterId);
+            var user = GetUserData(connectionString, userId);
+
+            int damage = CalculateDamage(user.AttackPower, user.ArmorPenetration, monster.Defense);
+
+            Console.WriteLine($"Calculated Damage: {damage}");
+            Console.WriteLine($"Monster's Remaining Health: {Math.Max(monster.Health - damage, 0)}");
+        }
+
+        static (int Health, int Defense) GetMonsterData(string connectionString, int monsterId)
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                connection.Open();
+                var query = "SELECT Health, Defense FROM Monsters WHERE Id = @monsterId";
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    command.Parameters.AddWithValue("@monsterId", monsterId);
+                    using (var reader = command.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            int health = reader.GetInt32("Health");
+                            int defense = reader.GetInt32("Defense");
+                            return (health, defense);
+                        }
+                        else
+                        {
+                            throw new Exception("Monster not found");
+                        }
+                    }
+                }
+            }
+        }
+
+        static (int AttackPower, int ArmorPenetration) GetUserData(string connectionString, int userId)
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                connection.Open();
+                var query = "SELECT AttackPower, ArmorPenetration FROM Users WHERE Id = @userId";
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    command.Parameters.AddWithValue("@userId", userId);
+                    using (var reader = command.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            int attackPower = reader.GetInt32("AttackPower");
+                            int armorPenetration = reader.GetInt32("ArmorPenetration");
+                            return (attackPower, armorPenetration);
+                        }
+                        else
+                        {
+                            throw new Exception("User not found");
+                        }
+                    }
+                }
+            }
+        }
+
+        static int CalculateDamage(int attackPower, int armorPenetration, int monsterDefense)
+        {
+            int effectiveDefense = Math.Max(monsterDefense - armorPenetration, 0);
+            int damage = Math.Max(attackPower - effectiveDefense, 0);
+            return damage;
+        }
+    }
+}

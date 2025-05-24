@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+
+class User {
+    public string Username { get; }
+    public string Password { get; }
+
+    public User(string u, string p) {
+        Username = u;
+        Password = p;
+    }
+}
+
+class Product {
+    public string Name { get; }
+    public string Description { get; }
+    public double Price { get; }
+    public string Category { get; }
+    public int Stock { get; }
+
+    public Product(string n, string d, double p, string c, int s) {
+        Name = n;
+        Description = d;
+        Price = p;
+        Category = c;
+        Stock = s;
+    }
+}
+
+class CartItem {
+    public Product Product { get; }
+    public int Quantity { get; }
+
+    public CartItem(Product p, int q) {
+        Product = p;
+        Quantity = q;
+    }
+}
+
+class Cart {
+    public List<CartItem> Items { get; } = new List<CartItem>();
+
+    public void AddProduct(Product product, int quantity) {
+        Items.Add(new CartItem(product, quantity));
+    }
+
+    public void ShowCart() {
+        Console.WriteLine("Your Cart:");
+        foreach (var item in Items) {
+            Console.WriteLine($"{item.Product.Name} - {item.Product.Price} USD - Quantity: {item.Quantity}");
+        }
+    }
+
+    public double CalculateTotal() {
+        double total = 0;
+        foreach (var item in Items) {
+            total += item.Product.Price * item.Quantity;
+        }
+        return total;
+    }
+}
+
+class ShopEasy {
+    private List<User> users = new List<User>();
+    private List<Product> products = new List<Product>();
+    private User currentUser = null;
+
+    private SqlConnection conn;
+
+    public ShopEasy() {
+        ConnectToDatabase();
+        LoadUsers();
+        LoadProducts();
+    }
+
+    private void ConnectToDatabase() {
+        string connectionString = "Server=YOUR_SERVER_NAME;Database=YOUR_DB_NAME;Trusted_Connection=True;";
+        conn = new SqlConnection(connectionString);
+
+        try {
+            conn.Open();
+            Console.WriteLine("Connected to database!");
+        } catch (Exception e) {
+            Console.WriteLine("Failed to connect to database.");
+            Console.WriteLine(e.Message);
+            Environment.Exit(1);
+        }
+    }
+
+    private void LoadUsers() {
+        string query = "SELECT username, password FROM Users";
+        SqlCommand cmd = new SqlCommand(query, conn);
+        SqlDataReader reader = cmd.ExecuteReader();
+
+        while (reader.Read()) {
+            users.Add(new User(reader.GetString(0), reader.GetString(1)));
+        }
+
+        reader.Close();
+    }
+
+    private void LoadProducts() {
+        string query = "SELECT name, description, price, category, stock FROM Products";
+        SqlCommand cmd = new SqlCommand(query, conn);
+        SqlDataReader reader = cmd.ExecuteReader();
+
+        while (reader.Read()) {
+            products.Add(new Product(reader.GetString(0), reader.GetString(1), reader.GetDouble(2), reader.GetString(3), reader.GetInt32(4)));
+        }
+
+        reader.Close();
+    }
+
+    public bool Login(string username, string password) {
+        foreach (var user in users) {
+            if (user.Username == username && user.Password == password) {
+                currentUser = user;
+                Console.WriteLine("Logged in as " + username);
+                return true;
+            }
+        }
+        Console.WriteLine("Login failed");
+        return false;
+    }
+
+    public void SearchProducts(string query) {
+        Console.WriteLine("Search results for '" + query + "':");
+        foreach (var product in products) {
+            if (product.Name.Contains(query) || product.Description.Contains(query)) {
+                Console.WriteLine(product.Name + " - " + product.Price + " USD");
+            }
+        }
+    }
+
+    public void FilterProductsByCategory(string category) {
+        Console.WriteLine("Products in category '" + category + "':");
+        foreach (var product in products) {
+            if (product.Category == category) {
+                Console.WriteLine(product.Name + " - " + product.Price + " USD");
+            }
+        }
+    }
+
+    public void Checkout(Cart cart) {
+        double total = cart.CalculateTotal();
+        Console.WriteLine("Total amount to pay: " + total + " USD");
+        Console.WriteLine("Order placed successfully!");
+        cart.Items.Clear();
+    }
+
+    public void Run() {
+        Cart cart = new Cart();
+
+        while (true) {
+            Console.Write("\nEnter a command (login, search, category, add, cart, checkout, exit): ");
+            string command = Console.ReadLine();
+
+            switch (command) {
+                case "login":
+                    Console.Write("Username: ");
+                    string username = Console.ReadLine();
+                    Console.Write("Password: ");
+                    string password = Console.ReadLine();
+                    Login(username, password);
+                    break;
+                case "search":
+                    Console.Write("Search: ");
+                    string query = Console.ReadLine();
+                    SearchProducts(query);
+                    break;
+                case "category":
+                    Console.Write("Category: ");
+                    string category = Console.ReadLine();
+                    FilterProductsByCategory(category);
+                    break;
+                case "add":
+                    Console.Write("Product name: ");
+                    string productName = Console.ReadLine();
+                    Console.Write("Quantity: ");
+                    int quantity = int.Parse(Console.ReadLine());
+                    foreach (var product in products) {
+                        if (product.Name == productName) {
+                            cart.AddProduct(product, quantity);
+                            Console.WriteLine(productName + " added to cart");
+                            break;
+                        }
+                    }
+                    break;
+                case "cart":
+                    cart.ShowCart();
+                    break;
+                case "checkout":
+                    Checkout(cart);
+                    break;
+                case "exit":
+                    return;
+                default:
+                    Console.WriteLine("Invalid command");
+                    break;
+            }
+        }
+    }
+
+    static void Main(string[] args) {
+        ShopEasy shop = new ShopEasy();
+        shop.Run();
+    }
+}

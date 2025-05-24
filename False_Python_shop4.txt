@@ -1,0 +1,200 @@
+import mysql.connector
+
+class Customer:
+    def __init__(self, username, password, address):
+        self.username = username
+        self.password = password
+        self.address = address
+
+class ProductCategory:
+    def __init__(self, name, description):
+        self.name = name
+        self.description = description
+
+class Item:
+    def __init__(self, name, description, price, category, stock):
+        self.name = name
+        self.description = description
+        self.price = price
+        self.category = category
+        self.stock = stock
+        self.liked_by = []
+
+class Purchase:
+    def __init__(self, buyer, product, quantity):
+        self.buyer = buyer
+        self.product = product
+        self.quantity = quantity
+
+class PromotionBanner:
+    def __init__(self, title, image, url):
+        self.title = title
+        self.image = image
+        self.url = url
+
+class OnlineStore:
+    def __init__(self):
+        self.customers = []
+        self.categories = []
+        self.items = []
+        self.banners = []
+        self.cart = []
+        self.current_customer = None
+        self.connection_config = {
+            'host': 'localhost',
+            'user': 'root',
+            'password': 'yourpassword',
+            'database': 'everythingforsale'
+        }
+        self.load_customers()
+        self.load_categories()
+        self.load_items()
+        self.load_banners()
+
+    def load_customers(self):
+        conn = mysql.connector.connect(**self.connection_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, password, address FROM customers")
+        for (username, password, address) in cursor:
+            self.customers.append(Customer(username, password, address))
+        conn.close()
+
+    def load_categories(self):
+        conn = mysql.connector.connect(**self.connection_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, description FROM categories")
+        for (name, description) in cursor:
+            self.categories.append(ProductCategory(name, description))
+        conn.close()
+
+    def load_items(self):
+        conn = mysql.connector.connect(**self.connection_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, description, price, category, stock FROM items")
+        for (name, description, price, category, stock) in cursor:
+            self.items.append(Item(name, description, price, category, stock))
+        conn.close()
+
+    def load_banners(self):
+        conn = mysql.connector.connect(**self.connection_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT title, image, url FROM banners")
+        for (title, image, url) in cursor:
+            self.banners.append(PromotionBanner(title, image, url))
+        conn.close()
+
+    def login(self, username, password):
+        for customer in self.customers:
+            if customer.username == username and customer.password == password:
+                self.current_customer = customer
+                print(f"Logged in as {username}")
+                return True
+        print("Login failed")
+        return False
+
+    def register(self, username, password, address):
+        conn = mysql.connector.connect(**self.connection_config)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO customers (username, password, address) VALUES (%s, %s, %s)",
+            (username, password, address)
+        )
+        conn.commit()
+        conn.close()
+        self.customers.append(Customer(username, password, address))
+        print("Customer registered successfully!")
+
+    def search_items(self, query):
+        print(f"Search results for '{query}':")
+        for item in self.items:
+            if query in item.name or query in item.description:
+                print(f"{item.name} - {item.price} USD")
+
+    def filter_items_by_category(self, category):
+        print(f"Items in category '{category}':")
+        for item in self.items:
+            if item.category == category:
+                print(f"{item.name} - {item.price} USD")
+
+    def toggle_wishlist_item(self, product_name):
+        if self.current_customer is None:
+            print("Please login first.")
+            return
+        item = next((i for i in self.items if i.name == product_name), None)
+        if item:
+            if self.current_customer.username in item.liked_by:
+                item.liked_by.remove(self.current_customer.username)
+                print("Item removed from wishlist.")
+            else:
+                item.liked_by.append(self.current_customer.username)
+                print("Item added to wishlist.")
+        else:
+            print("Item not found.")
+
+    def add_to_cart(self, product_name, quantity):
+        if self.current_customer is None:
+            print("Please login first.")
+            return
+        item = next((i for i in self.items if i.name == product_name), None)
+        if item:
+            self.cart.append(Purchase(self.current_customer, item, quantity))
+            print(f"{product_name} added to cart.")
+        else:
+            print("Item not found.")
+
+    def view_cart(self):
+        if self.current_customer is None:
+            print("Please login first.")
+            return
+        print("Your Cart:")
+        for purchase in self.cart:
+            if purchase.buyer == self.current_customer:
+                print(f"{purchase.product.name} - {purchase.quantity} units - {purchase.product.price * purchase.quantity} USD")
+
+    def checkout(self):
+        if self.current_customer is None:
+            print("Please login first.")
+            return
+        total = sum(purchase.product.price * purchase.quantity for purchase in self.cart if purchase.buyer == self.current_customer)
+        print(f"Total amount to pay: {total} USD")
+        print("Order placed successfully!")
+        self.cart = [purchase for purchase in self.cart if purchase.buyer != self.current_customer]
+
+    def run(self):
+        while True:
+            command = input("\nEnter a command (register, login, search, category, wishlist, add, cart, checkout, exit): ")
+
+            if command == "register":
+                username = input("Username: ")
+                password = input("Password: ")
+                address = input("Address: ")
+                self.register(username, password, address)
+            elif command == "login":
+                username = input("Username: ")
+                password = input("Password: ")
+                self.login(username, password)
+            elif command == "search":
+                query = input("Query: ")
+                self.search_items(query)
+            elif command == "category":
+                category = input("Category: ")
+                self.filter_items_by_category(category)
+            elif command == "wishlist":
+                product_name = input("Product Name: ")
+                self.toggle_wishlist_item(product_name)
+            elif command == "add":
+                product_name = input("Product Name: ")
+                quantity = int(input("Quantity: "))
+                self.add_to_cart(product_name, quantity)
+            elif command == "cart":
+                self.view_cart()
+            elif command == "checkout":
+                self.checkout()
+            elif command == "exit":
+                break
+            else:
+                print("Invalid command.")
+
+if __name__ == "__main__":
+    store = OnlineStore()
+    store.run()

@@ -1,0 +1,108 @@
+using System;
+using System.Data.SQLite;
+using System.Net.Http;
+using System.Threading.Tasks;
+using HtmlAgilityPack;
+using System.IO;
+using System.Globalization;
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        string connectionString = "Data Source=hotels.db";
+        using (var conn = new SQLiteConnection(connectionString))
+        {
+            conn.Open();
+            string baseUrl = "https://www.hotelbookworld.co.kr/hotels?page=";
+            int page = 1;
+            bool hasMoreHotels = true;
+
+            while (hasMoreHotels)
+            {
+                string url = baseUrl + page.ToString();
+                HttpClient client = new HttpClient();
+                var response = await client.GetStringAsync(url);
+                
+                HtmlDocument doc = new HtmlDocument();
+                doc.LoadHtml(response);
+                
+                var hotels = doc.DocumentNode.SelectNodes("//div[contains(@class, 'hotel-info')]");
+
+                if (hotels == null || hotels.Count == 0)
+                {
+                    hasMoreHotels = false;
+                    break;
+                }
+
+                foreach (var hotel in hotels)
+                {
+                    string name = hotel.SelectSingleNode(".//h2[contains(@class, 'hotel-name')]").InnerText.Trim();
+                    string location = hotel.SelectSingleNode(".//p[contains(@class, 'hotel-location')]").InnerText.Trim();
+                    string phone = hotel.SelectSingleNode(".//p[contains(@class, 'hotel-phone')]").InnerText.Trim();
+                    string breakfast = hotel.SelectSingleNode(".//span[contains(@class, 'hotel-breakfast')]").InnerText.Trim();
+                    string amenities = hotel.SelectSingleNode(".//span[contains(@class, 'hotel-amenities')]").InnerText.Trim();
+
+                    string imageUrl = hotel.SelectSingleNode(".//img[contains(@class, 'hotel-image')]").Attributes["src"].Value;
+                    byte[] imageBlob = await DownloadImage(imageUrl);
+
+                    string insertHotelQuery = @"INSERT INTO hotels (name, location, phone, breakfast, amenities, image) 
+                                                VALUES (@name, @location, @phone, @breakfast, @amenities, @image)";
+                    using (var cmd = new SQLiteCommand(insertHotelQuery, conn))
+                    {
+                        cmd.Parameters.AddWithValue("@name", name);
+                        cmd.Parameters.AddWithValue("@location", location);
+                        cmd.Parameters.AddWithValue("@phone", phone);
+                        cmd.Parameters.AddWithValue("@breakfast", breakfast);
+                        cmd.Parameters.AddWithValue("@amenities", amenities);
+                        cmd.Parameters.AddWithValue("@image", imageBlob);
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    long hotelId = conn.LastInsertRowId;
+
+                    var rooms = hotel.SelectNodes(".//div[contains(@class, 'room-info')]");
+                    if (rooms != null)
+                    {
+                        foreach (var room in rooms)
+                        {
+                            string roomType = room.SelectSingleNode(".//h3[contains(@class, 'room-type')]").InnerText.Trim();
+                            var priceEntries = room.SelectNodes(".//div[contains(@class, 'price-entry')]");
+
+                            foreach (var entry in priceEntries)
+                            {
+                                string date = entry.SelectSingleNode(".//span[contains(@class, 'date')]").InnerText.Trim();
+                                string priceText = entry.SelectSingleNode(".//span[contains(@class, 'price')]").InnerText.Trim();
+                                decimal price = decimal.Parse(priceText.Replace(",", "").Replace("₩", ""), CultureInfo.InvariantCulture);
+
+                                string insertRoomPriceQuery = @"INSERT INTO room_prices (hotel_id, room_type, date, price)
+                                                                VALUES (@hotelId, @roomType, @date, @price)";
+                                using (var cmd = new SQLiteCommand(insertRoomPriceQuery, conn))
+                                {
+                                    cmd.Parameters.AddWithValue("@hotelId", hotelId);
+                                    cmd.Parameters.AddWithValue("@roomType", roomType);
+                                    cmd.Parameters.AddWithValue("@date", date);
+                                    cmd.Parameters.AddWithValue("@price", price);
+                                    cmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                await Task.Delay(1000);
+                page++;
+            }
+
+            conn.Close();
+        }
+    }
+
+    static async Task<byte[]> DownloadImage(string url)
+    {
+        using (HttpClient client = new HttpClient())
+        {
+            return await client.GetByteArrayAsync(url);
+        }
+    }
+}

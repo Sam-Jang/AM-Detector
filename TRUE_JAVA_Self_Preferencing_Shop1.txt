@@ -1,0 +1,327 @@
+package com.shoppingmall;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.*;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+@Data
+@Entity
+@Table(name = "products")
+class Product {
+    @Id
+    private int id;
+    private String name;
+    private double price;
+    private double discount;
+    private String category;
+    @Column(name = "is_preferred")
+    private boolean isPreferredPlatform;
+    private int stock;
+    private String description;
+}
+
+@Data
+@Entity
+@Table(name = "cart")
+class CartItem {
+    @Id
+    @Column(name = "user_id")
+    private int userId;
+    @Column(name = "product_id")
+    private int productId;
+    private int quantity;
+}
+
+@Data
+class SearchWeights {
+    private double priceWeight;
+    private double discountWeight;
+    private double platformWeight;
+    private double relevanceWeight;
+}
+
+@Data
+class SearchRequest {
+    @NotNull
+    private String keyword;
+    private String sortBy;
+    private String category;
+    private int page = 1;
+    private int pageSize = 20;
+}
+
+@Data
+class CartRequest {
+    @NotNull
+    private Integer userId;
+    @NotNull
+    private Integer productId;
+    @NotNull
+    private Integer quantity;
+}
+
+@RestController
+@RequestMapping("/api")
+class ShoppingController {
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    private final SearchWeights weights;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public ShoppingController() {
+        this.weights = loadSearchWeights();
+    }
+
+    private SearchWeights loadSearchWeights() {
+        String jsonPath = "config/weights.json";
+        try {
+            String json = Files.readString(Paths.get(jsonPath));
+            return objectMapper.readValue(json, SearchWeights.class);
+        } catch (IOException e) {
+            SearchWeights defaultWeights = new SearchWeights();
+            defaultWeights.setPriceWeight(0.3);
+            defaultWeights.setDiscountWeight(0.3);
+            defaultWeights.setPlatformWeight(0.3);
+            defaultWeights.setRelevanceWeight(0.1);
+            return defaultWeights;
+        }
+    }
+
+    @GetMapping("/products")
+    public ResponseEntity<List<Product>> getProducts(@Valid @ModelAttribute SearchRequest req) {
+        List<Product> products = new ArrayList<>();
+        String query = buildProductQuery(req);
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(query, getQueryParameters(req));
+        
+        for (Map<String, Object> row : rows) {
+            Product product = new Product();
+            product.setId((Integer) row.get("id"));
+            product.setName((String) row.get("name"));
+            product.setPrice(((Number) row.get("price")).doubleValue());
+            product.setDiscount(((Number) row.get("discount")).doubleValue());
+            product.setCategory((String) row.get("category"));
+            product.setPreferredPlatform((Boolean) row.get("is_preferred"));
+            product.setStock((Integer) row.get("stock"));
+            product.setDescription((String) row.get("description"));
+            products.add(product);
+        }
+
+        List<Product> rankedProducts = rankProducts(products, req);
+        List<Product> pagedProducts = rankedProducts.subList(
+            Math.min((req.getPage() - 1) * req.getPageSize(), rankedProducts.size()),
+            Math.min(req.getPage() * req.getPageSize(), rankedProducts.size())
+        );
+
+        return ResponseEntity.ok(pagedProducts);
+    }
+
+    private String buildProductQuery(SearchRequest req) {
+        StringBuilder query = new StringBuilder("SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE 1=1");
+        if (req.getKeyword() != null && !req.getKeyword().isEmpty()) {
+            query.append(" AND (name LIKE ? OR description LIKE ?)");
+        }
+        if (req.getCategory() != null && !req.getCategory().isEmpty()) {
+            query.append(" AND category = ?");
+        }
+        return query.toString();
+    }
+
+    private Object[] getQueryParameters(SearchRequest req) {
+        List<Object> params = new ArrayList<>();
+        if (req.getKeyword() != null && !req.getKeyword().isEmpty()) {
+            String keyword = "%" + req.getKeyword() + "%";
+            params.add(keyword);
+            params.add(keyword);
+        }
+        if (req.getCategory() != null && !req.getCategory().isEmpty()) {
+            params.add(req.getCategory());
+        }
+        return params.toArray();
+    }
+
+    private List<Product> rankProducts(List<Product> products, SearchRequest req) {
+        if (req.getSortBy() == null || req.getSortBy().isEmpty()) {
+            return applyManipulatedRanking(products, req.getKeyword());
+        }
+
+        switch (req.getSortBy().toLowerCase()) {
+            case "price_asc":
+                products.sort((p1, p2) -> Double.compare(p1.getPrice(), p2.getPrice()));
+                break;
+            case "price_desc":
+                products.sort((p1, p2) -> Double.compare(p2.getPrice(), p1.getPrice()));
+                break;
+            case "discount":
+                products.sort((p1, p2) -> Double.compare(p2.getDiscount(), p1.getDiscount()));
+                break;
+            case "recommend":
+                return applyManipulatedRanking(products, req.getKeyword());
+            default:
+                break;
+        }
+        return products;
+    }
+
+    private List<Product> applyManipulatedRanking(List<Product> products, String keyword) {
+        return products.stream()
+            .map(p -> new Object[]{p, calculateProductScore(p, keyword)})
+            .sorted((o1, o2) -> Double.compare((Double) o2[1], (Double) o1[1]))
+            .map(o -> (Product) o[0])
+            .toList();
+    }
+
+    private double calculateProductScore(Product p, String keyword) {
+        double priceScore = normalizePrice(p.getPrice(), products);
+        double discountScore = p.getDiscount() / Math.max(p.getPrice(), 1);
+        double platformScore = p.isPreferredPlatform() ? 1.0 : 0.0;
+        double relevanceScore = calculateRelevance(p, keyword);
+
+        return (weights.getPriceWeight() * priceScore) +
+               (weights.getDiscountWeight() * discountScore) +
+               (weights.getPlatformWeight() * platformScore) +
+               (weights.getRelevanceWeight() * relevanceScore);
+    }
+
+    private double normalizePrice(double price, List<Product> products) {
+        if (products.isEmpty()) return 0;
+        double maxPrice = products.stream().mapToDouble(Product::getPrice).max().orElse(0);
+        double minPrice = products.stream().mapToDouble(Product::getPrice).min().orElse(0);
+        if (maxPrice == minPrice) return 0.5;
+        return (maxPrice - price) / (maxPrice - minPrice);
+    }
+
+    private double calculateRelevance(Product p, String keyword) {
+        if (keyword == null || keyword.isEmpty()) return 0;
+        String[] words = keyword.toLowerCase().split("\\s+");
+        int matches = 0;
+        for (String word : words) {
+            if (p.getName().toLowerCase().contains(word) || p.getDescription().toLowerCase().contains(word)) {
+                matches++;
+            }
+        }
+        return (double) matches / Math.max(words.length, 1);
+    }
+
+    @PostMapping("/cart/add")
+    public ResponseEntity<String> addToCart(@Valid @RequestBody CartRequest req) {
+        Integer stock = jdbcTemplate.queryForObject(
+            "SELECT stock FROM products WHERE id = ?", Integer.class, req.getProductId()
+        );
+        if (stock == null) {
+            return ResponseEntity.status(404).body("Product not found");
+        }
+        if (stock < req.getQuantity()) {
+            return ResponseEntity.badRequest().body("Insufficient stock");
+        }
+
+        jdbcTemplate.update(
+            "INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, ?) " +
+            "ON DUPLICATE KEY UPDATE quantity = quantity + ?",
+            req.getUserId(), req.getProductId(), req.getQuantity(), req.getQuantity()
+        );
+
+        return ResponseEntity.ok("Item added to cart");
+    }
+
+    @GetMapping("/cart/{userId}")
+    public ResponseEntity<List<CartItem>> getCart(@PathVariable int userId) {
+        List<CartItem> cartItems = jdbcTemplate.query(
+            "SELECT c.user_id, c.product_id, c.quantity FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = ?",
+            new Object[]{userId},
+            (rs, rowNum) -> {
+                CartItem item = new CartItem();
+                item.setUserId(rs.getInt("user_id"));
+                item.setProductId(rs.getInt("product_id"));
+                item.setQuantity(rs.getInt("quantity"));
+                return item;
+            }
+        );
+        return ResponseEntity.ok(cartItems);
+    }
+
+    @DeleteMapping("/cart/remove")
+    public ResponseEntity<String> removeFromCart(@Valid @RequestBody CartRequest req) {
+        int rowsAffected = jdbcTemplate.update(
+            "DELETE FROM cart WHERE user_id = ? AND product_id = ?",
+            req.getUserId(), req.getProductId()
+        );
+        if (rowsAffected == 0) {
+            return ResponseEntity.status(404).body("Item not found in cart");
+        }
+        return ResponseEntity.ok("Item removed from cart");
+    }
+
+    @GetMapping("/categories")
+    public ResponseEntity<List<String>> getCategories() {
+        List<String> categories = jdbcTemplate.queryForList(
+            "SELECT DISTINCT category FROM products", String.class
+        );
+        return ResponseEntity.ok(categories);
+    }
+
+    @GetMapping("/product/{id}")
+    public ResponseEntity<Product> getProductDetails(@PathVariable int id) {
+        Product product = jdbcTemplate.query(
+            "SELECT id, name, price, discount, category, is_preferred, stock, description FROM products WHERE id = ?",
+            new Object[]{id},
+            rs -> {
+                if (rs.next()) {
+                    Product p = new Product();
+                    p.setId(rs.getInt("id"));
+                    p.setName(rs.getString("name"));
+                    p.setPrice(rs.getDouble("price"));
+                    p.setDiscount(rs.getDouble("discount"));
+                    p.setCategory(rs.getString("category"));
+                    p.setPreferredPlatform(rs.getBoolean("is_preferred"));
+                    p.setStock(rs.getInt("stock"));
+                    p.setDescription(rs.getString("description"));
+                    return p;
+                }
+                return null;
+            }
+        );
+
+        if (product == null) {
+            return ResponseEntity.status(404).body(null);
+        }
+        return ResponseEntity.ok(product);
+    }
+}
+
+@Configuration
+@EnableWebMvc
+class WebConfig {
+    @Bean
+    public JdbcTemplate jdbcTemplate(DataSource dataSource) {
+        return new JdbcTemplate(dataSource);
+    }
+}
+
+@SpringBootApplication
+public class ShoppingMallApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ShoppingMallApplication.class, args);
+    }
+}

@@ -1,0 +1,108 @@
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.text.NumberFormat;
+import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
+public class HotelScraper {
+    public static void main(String[] args) {
+        String urlBase = "https://www.hotelbookworld.co.kr/hotels?page=";
+        int page = 1;
+        boolean hasMoreHotels = true;
+
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotels.db")) {
+            while (hasMoreHotels) {
+                String url = urlBase + page;
+                Document doc = Jsoup.connect(url).get();
+                
+                Elements hotels = doc.select("div.hotel-info");
+                if (hotels.isEmpty()) {
+                    hasMoreHotels = false;
+                    break;
+                }
+
+                for (Element hotel : hotels) {
+                    String name = hotel.select("h2.hotel-name").text().trim();
+                    String location = hotel.select("p.hotel-location").text().trim();
+                    String phone = hotel.select("p.hotel-phone").text().trim();
+                    String breakfast = hotel.select("span.hotel-breakfast").text().trim();
+                    String amenities = hotel.select("span.hotel-amenities").text().trim();
+
+                    String imageUrl = hotel.select("img.hotel-image").attr("src");
+                    byte[] imageBlob = downloadImage(imageUrl);
+
+                    String insertHotelQuery = "INSERT INTO hotels (name, location, phone, breakfast, amenities, image) VALUES (?, ?, ?, ?, ?, ?)";
+                    try (PreparedStatement pstmt = conn.prepareStatement(insertHotelQuery, Statement.RETURN_GENERATED_KEYS)) {
+                        pstmt.setString(1, name);
+                        pstmt.setString(2, location);
+                        pstmt.setString(3, phone);
+                        pstmt.setString(4, breakfast);
+                        pstmt.setString(5, amenities);
+                        pstmt.setBytes(6, imageBlob);
+                        pstmt.executeUpdate();
+
+                        ResultSet rs = pstmt.getGeneratedKeys();
+                        long hotelId = 0;
+                        if (rs.next()) {
+                            hotelId = rs.getLong(1);
+                        }
+
+                        Elements rooms = hotel.select("div.room-info");
+                        for (Element room : rooms) {
+                            String roomType = room.select("h3.room-type").text().trim();
+                            Elements priceEntries = room.select("div.price-entry");
+
+                            for (Element entry : priceEntries) {
+                                String date = entry.select("span.date").text().trim();
+                                String priceStr = entry.select("span.price").text().replace(",", "").replace("₩", "").trim();
+                                double price = NumberFormat.getNumberInstance(Locale.KOREA).parse(priceStr).doubleValue();
+
+                                String insertRoomPriceQuery = "INSERT INTO room_prices (hotel_id, room_type, date, price) VALUES (?, ?, ?, ?)";
+                                try (PreparedStatement roomStmt = conn.prepareStatement(insertRoomPriceQuery)) {
+                                    roomStmt.setLong(1, hotelId);
+                                    roomStmt.setString(2, roomType);
+                                    roomStmt.setString(3, date);
+                                    roomStmt.setDouble(4, price);
+                                    roomStmt.executeUpdate();
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                TimeUnit.SECONDS.sleep(1);
+                page++;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static byte[] downloadImage(String imageUrl) throws Exception {
+        URL url = new URL(imageUrl);
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("GET");
+        try (InputStream inputStream = connection.getInputStream();
+             ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            
+            byte[] buffer = new byte[1024];
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                outputStream.write(buffer, 0, bytesRead);
+            }
+            return outputStream.toByteArray();
+        }
+    }
+}

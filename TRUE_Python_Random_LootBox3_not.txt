@@ -1,0 +1,340 @@
+import asyncio
+import json
+import mysql.connector
+import hashlib
+from datetime import datetime
+
+db_config = {
+    "host": "localhost",
+    "database": "game_db",
+    "user": "game_user",
+    "password": "secure_pwd"
+}
+
+with open("game_config.json", "r") as f:
+    config = json.load(f)
+
+class User:
+    def __init__(self, id, username, currency):
+        self.id = id
+        self.username = username
+        self.currency = currency
+
+class Item:
+    def __init__(self, id, name, price, is_prob):
+        self.id = id
+        self.name = name
+        self.price = price
+        self.is_prob = is_prob
+
+class Inventory:
+    def __init__(self, user_id, item_id, quantity):
+        self.user_id = user_id
+        self.item_id = item_id
+        self.quantity = quantity
+
+class Transaction:
+    def __init__(self, id, user_id, item_id, time, amount):
+        self.id = id
+        self.user_id = user_id
+        self.item_id = item_id
+        self.time = time
+        self.amount = amount
+
+class ProbAttempt:
+    def __init__(self, user_id, item_id, points, attempts):
+        self.user_id = user_id
+        self.item_id = item_id
+        self.points = points
+        self.attempts = attempts
+
+async def init_db():
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) UNIQUE,
+            password_hash VARCHAR(256),
+            currency INT DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100),
+            price DOUBLE,
+            is_prob BOOLEAN
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            user_id INT,
+            item_id INT,
+            quantity INT,
+            PRIMARY KEY (user_id, item_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (item_id) REFERENCES items(id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT,
+            item_id INT,
+            time DATETIME,
+            amount DOUBLE,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (item_id) REFERENCES items(id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prob_attempts (
+            user_id INT,
+            item_id INT,
+            points INT DEFAULT 0,
+            attempts INT DEFAULT 0,
+            PRIMARY KEY (user_id, item_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (item_id) REFERENCES items(id)
+        )
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+async def run_server():
+    while True:
+        print("1: Register, 2: Login, 3: Shop, 4: Inventory, 5: Search, 6: History, 7: Use Item")
+        choice = input()
+        if choice == "1":
+            await register_user()
+        elif choice == "2":
+            await login_user()
+        elif choice == "3":
+            await shop_menu()
+        elif choice == "4":
+            await view_inventory()
+        elif choice == "5":
+            await search_items()
+        elif choice == "6":
+            await view_history()
+        elif choice == "7":
+            await use_item()
+
+async def register_user():
+    username = input("Username: ")
+    password = input("Password: ")
+    pwd_hash = hash_password(password)
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (username, password_hash, currency) VALUES (%s, %s, 1000)", (username, pwd_hash))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("User registered.")
+
+async def login_user():
+    username = input("Username: ")
+    password = input("Password: ")
+    pwd_hash = hash_password(password)
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, currency FROM users WHERE username = %s AND password_hash = %s", (username, pwd_hash))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if result:
+        user = User(result[0], result[1], result[2])
+        print(f"Logged in as {user.username}. Currency: {user.currency}")
+        return user
+    print("Invalid credentials.")
+    return None
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+async def shop_menu():
+    user = await login_user()
+    if not user:
+        return
+    items = await get_items()
+    print("Shop Items:")
+    for item in items:
+        print(f"ID: {item.id}, Name: {item.name}, Price: {item.price}, Probabilistic: {item.is_prob}")
+    item_id = input("Enter item ID to purchase: ")
+    try:
+        item_id = int(item_id)
+    except ValueError:
+        return
+    selected_item = next((i for i in items if i.id == item_id), None)
+    if not selected_item:
+        print("Invalid item ID.")
+        return
+    if user.currency < selected_item.price:
+        print("Insufficient currency.")
+        return
+    await purchase_item(user, selected_item)
+
+async def get_items():
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, price, is_prob FROM items")
+    items = [Item(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return items
+
+async def purchase_item(user, item):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE users SET currency = currency - %s WHERE id = %s", (item.price, user.id))
+        cursor.execute("INSERT INTO inventory (user_id, item_id, quantity) VALUES (%s, %s, 1) ON DUPLICATE KEY UPDATE quantity = quantity + 1", (user.id, item.id))
+        cursor.execute("INSERT INTO transactions (user_id, item_id, time, amount) VALUES (%s, %s, %s, %s)", (user.id, item.id, datetime.now(), item.price))
+        conn.commit()
+        print(f"Purchased {item.name}.")
+    finally:
+        cursor.close()
+        conn.close()
+
+async def view_inventory():
+    user = await login_user()
+    if not user:
+        return
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = %s", (user.id,))
+    print("Inventory:")
+    for row in cursor.fetchall():
+        print(f"Item: {row[0]}, Quantity: {row[1]}")
+    cursor.close()
+    conn.close()
+
+async def search_items():
+    keyword = input("Search keyword: ")
+    print("Sort by: 1: Price Asc, 2: Price Desc, 3: Name Asc, 4: Name Desc")
+    sort_choice = input()
+    sort_sql = {
+        "1": "ORDER BY price ASC",
+        "2": "ORDER BY price DESC",
+        "3": "ORDER BY name ASC",
+        "4": "ORDER BY name DESC"
+    }.get(sort_choice, "")
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT id, name, price, is_prob FROM items WHERE name LIKE %s {sort_sql}", (f"%{keyword}%",))
+    print("Search Results:")
+    for row in cursor.fetchall():
+        print(f"ID: {row[0]}, Name: {row[1]}, Price: {row[2]}, Probabilistic: {row[3]}")
+    cursor.close()
+    conn.close()
+
+async def view_history():
+    user = await login_user()
+    if not user:
+        return
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT i.name, t.time, t.amount FROM transactions t JOIN items i ON t.item_id = i.id WHERE t.user_id = %s ORDER BY t.time DESC", (user.id,))
+    print("Transaction History:")
+    for row in cursor.fetchall():
+        print(f"Item: {row[0]}, Time: {row[1]}, Amount: {row[2]}")
+    cursor.close()
+    conn.close()
+
+async def use_item():
+    user = await login_user()
+    if not user:
+        return
+    inv_items = await get_inventory_items(user.id)
+    print("Your Items:")
+    for item in inv_items:
+        print(f"ID: {item.item_id}, Name: {item.name}, Quantity: {item.quantity}")
+    item_id = input("Enter item ID to use: ")
+    try:
+        item_id = int(item_id)
+    except ValueError:
+        return
+    selected_item = next((i for i in inv_items if i.item_id == item_id), None)
+    if not selected_item or selected_item.quantity == 0:
+        print("Invalid item or insufficient quantity.")
+        return
+    item_details = await get_item_details(item_id)
+    if item_details.is_prob:
+        await process_prob_item(user, item_details)
+    else:
+        await process_regular_item(user, item_details)
+
+async def get_inventory_items(user_id):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT inv.item_id, i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = %s", (user_id,))
+    items = [Inventory(user_id, row[0], row[2]) for row in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return items
+
+async def get_item_details(item_id):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, price, is_prob FROM items WHERE id = %s", (item_id,))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if result:
+        return Item(result[0], result[1], result[2], result[3])
+    return None
+
+async def process_regular_item(user, item):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE inventory SET quantity = quantity - 1 WHERE user_id = %s AND item_id = %s AND quantity > 0", (user.id, item.id))
+        if cursor.rowcount == 0:
+            print("Failed to use item.")
+            return
+        conn.commit()
+        print(f"Used {item.name}. Effect applied.")
+    finally:
+        cursor.close()
+        conn.close()
+
+async def process_prob_item(user, item):
+    import random
+    attempt = await get_or_create_attempt(user.id, item.id)
+    attempt.attempts += 1
+    attempt.points += random.randint(1, 10)
+    req_points = config["ItemPointReqs"].get(item.name, 50)
+    success = attempt.points >= req_points
+    if not success and attempt.attempts >= config["MaxAttempts"]:
+        success = random.random() < config["BaseProb"]
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE inventory SET quantity = quantity - 1 WHERE user_id = %s AND item_id = %s AND quantity > 0", (user.id, item.id))
+        if cursor.rowcount == 0:
+            print("Failed to use item.")
+            return
+        cursor.execute("INSERT INTO prob_attempts (user_id, item_id, points, attempts) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE points = %s, attempts = %s",
+                       (user.id, item.id, attempt.points, attempt.attempts, attempt.points, attempt.attempts))
+        conn.commit()
+        print(f"Success! {item.name} unlocked reward." if success else "Failed to unlock reward.")
+    finally:
+        cursor.close()
+        conn.close()
+
+async def get_or_create_attempt(user_id, item_id):
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT points, attempts FROM prob_attempts WHERE user_id = %s AND item_id = %s", (user_id, item_id))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if result:
+        return ProbAttempt(user_id, item_id, result[0], result[1])
+    return ProbAttempt(user_id, item_id, 0, 0)
+
+if __name__ == "__main__":
+    asyncio.run(init_db())
+    asyncio.run(run_server())

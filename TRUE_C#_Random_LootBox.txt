@@ -1,0 +1,534 @@
+using UnityEngine;
+using System.Collections.Generic;
+using System.Linq;
+using System;
+using System.Data.SQLite;
+using Newtonsoft.Json;
+using System.IO;
+
+public class GameBackendUnity : MonoBehaviour
+{
+    private DatabaseManager dbManager;
+    private ConfigManager configManager;
+    private LootBoxManager lootBoxManager;
+    private ItemService itemService;
+    private CartService cartService;
+    private TransactionService transactionService;
+
+    void Start()
+    {
+        dbManager = new DatabaseManager();
+        configManager = new ConfigManager();
+        lootBoxManager = new LootBoxManager(dbManager, configManager);
+        itemService = new ItemService(dbManager);
+        cartService = new CartService(dbManager);
+        transactionService = new TransactionService(dbManager);
+    }
+
+    public class Item
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public string Rarity { get; set; }
+        public double Price { get; set; }
+        public double BaseProbability { get; set; }
+        public int Popularity { get; set; }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public double Balance { get; set; }
+        public int TotalSpent { get; set; }
+        public int PurchaseCount { get; set; }
+    }
+
+    public class Cart
+    {
+        public int UserId { get; set; }
+        public List<CartItem> Items { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class Transaction
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int ItemId { get; set; }
+        public double Amount { get; set; }
+        public string Timestamp { get; set; }
+    }
+
+    public class ProbabilityConfig
+    {
+        public Dictionary<string, double> RarityWeights { get; set; }
+        public Dictionary<string, double> SpendingModifiers { get; set; }
+    }
+
+    public class DatabaseManager
+    {
+        private string connectionString;
+
+        public DatabaseManager()
+        {
+            string dbPath = Path.Combine(Application.persistentDataPath, "game.db");
+            connectionString = $"Data Source={dbPath};Version=3;";
+            InitializeDatabase();
+        }
+
+        private void InitializeDatabase()
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand(conn);
+
+                cmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS Items (
+                        Id INTEGER PRIMARY KEY,
+                        Name TEXT,
+                        Rarity TEXT,
+                        Price REAL,
+                        BaseProbability REAL,
+                        Popularity INTEGER
+                    )";
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS Users (
+                        Id INTEGER PRIMARY KEY,
+                        Username TEXT,
+                        Balance REAL,
+                        TotalSpent INTEGER,
+                        PurchaseCount INTEGER
+                    )";
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS Carts (
+                        UserId INTEGER,
+                        ItemId INTEGER,
+                        Quantity INTEGER
+                    )";
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS Transactions (
+                        Id INTEGER PRIMARY KEY,
+                        UserId INTEGER,
+                        ItemId INTEGER,
+                        Amount REAL,
+                        Timestamp TEXT
+                    )";
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+                    INSERT OR IGNORE INTO Items (Id, Name, Rarity, Price, BaseProbability, Popularity)
+                    VALUES
+                        (1, 'Common Sword', 'Common', 10.0, 0.5, 100),
+                        (2, 'Rare Armor', 'Rare', 50.0, 0.3, 50),
+                        (3, 'Epic Staff', 'Epic', 100.0, 0.15, 25),
+                        (4, 'Legendary Crown', 'Legendary', 500.0, 0.05, 10)";
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+                    INSERT OR IGNORE INTO Users (Id, Username, Balance, TotalSpent, PurchaseCount)
+                    VALUES
+                        (1, 'player1', 1000.0, 0, 0),
+                        (2, 'player2', 500.0, 100, 2)";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public List<Item> GetItems()
+        {
+            var items = new List<Item>();
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand("SELECT * FROM Items", conn);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        items.Add(new Item
+                        {
+                            Id = reader.GetInt32(0),
+                            Name = reader.GetString(1),
+                            Rarity = reader.GetString(2),
+                            Price = reader.GetDouble(3),
+                            BaseProbability = reader.GetDouble(4),
+                            Popularity = reader.GetInt32(5)
+                        });
+                    }
+                }
+            }
+            return items;
+        }
+
+        public User GetUser(int userId)
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand("SELECT * FROM Users WHERE Id = @id", conn);
+                cmd.Parameters.AddWithValue("@id", userId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        return new User
+                        {
+                            Id = reader.GetInt32(0),
+                            Username = reader.GetString(1),
+                            Balance = reader.GetDouble(2),
+                            TotalSpent = reader.GetInt32(3),
+                            PurchaseCount = reader.GetInt32(4)
+                        };
+                    }
+                }
+            }
+            return null;
+        }
+
+        public void UpdateUser(User user)
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand(
+                    "UPDATE Users SET Balance = @balance, TotalSpent = @totalSpent, PurchaseCount = @purchaseCount WHERE Id = @id", conn);
+                cmd.Parameters.AddWithValue("@balance", user.Balance);
+                cmd.Parameters.AddWithValue("@totalSpent", user.TotalSpent);
+                cmd.Parameters.AddWithValue("@purchaseCount", user.PurchaseCount);
+                cmd.Parameters.AddWithValue("@id", user.Id);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public Cart GetCart(int userId)
+        {
+            var cart = new Cart { UserId = userId, Items = new List<CartItem>() };
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand("SELECT * FROM Carts WHERE UserId = @userId", conn);
+                cmd.Parameters.AddWithValue("@userId", userId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        cart.Items.Add(new CartItem
+                        {
+                            ItemId = reader.GetInt32(1),
+                            Quantity = reader.GetInt32(2)
+                        });
+                    }
+                }
+            }
+            return cart;
+        }
+
+        public void AddToCart(int userId, int itemId, int quantity)
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand(
+                    "INSERT INTO Carts (UserId, ItemId, Quantity) VALUES (@userId, @itemId, @quantity)", conn);
+                cmd.Parameters.AddWithValue("@userId", userId);
+                cmd.Parameters.AddWithValue("@itemId", itemId);
+                cmd.Parameters.AddWithValue("@quantity", quantity);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public void ClearCart(int userId)
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand("DELETE FROM Carts WHERE UserId = @userId", conn);
+                cmd.Parameters.AddWithValue("@userId", userId);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public void LogTransaction(int userId, int itemId, double amount)
+        {
+            using (var conn = new SQLiteConnection(connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand(
+                    "INSERT INTO Transactions (UserId, ItemId, Amount, Timestamp) VALUES (@userId, @itemId, @amount, @timestamp)", conn);
+                cmd.Parameters.AddWithValue("@userId", userId);
+                cmd.Parameters.AddWithValue("@itemId", itemId);
+                cmd.Parameters.AddWithValue("@amount", amount);
+                cmd.Parameters.AddWithValue("@timestamp", DateTime.UtcNow.ToString("o"));
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    public class ConfigManager
+    {
+        public ProbabilityConfig LoadProbabilityConfig()
+        {
+            TextAsset jsonAsset = Resources.Load<TextAsset>("probability_config");
+            return JsonConvert.DeserializeObject<ProbabilityConfig>(jsonAsset.text);
+        }
+    }
+
+    public class LootBoxManager
+    {
+        private DatabaseManager dbManager;
+        private ConfigManager configManager;
+        private System.Random random;
+
+        public LootBoxManager(DatabaseManager db, ConfigManager cfg)
+        {
+            dbManager = db;
+            configManager = cfg;
+            random = new System.Random();
+        }
+
+        public Item DrawItem(int userId)
+        {
+            var user = dbManager.GetUser(userId);
+            var items = dbManager.GetItems();
+            var config = configManager.LoadProbabilityConfig();
+
+            var totalWeight = 0.0;
+            var weights = new List<(Item, double)>();
+
+            foreach (var item in items)
+            {
+                var weight = item.BaseProbability;
+                weight *= config.RarityWeights[item.Rarity];
+
+                if (user.TotalSpent > 1000)
+                {
+                    weight *= config.SpendingModifiers["HighSpender"];
+                }
+                else if (user.TotalSpent < 100)
+                {
+                    weight *= config.SpendingModifiers["LowSpender"];
+                }
+
+                weights.Add((item, weight));
+                totalWeight += weight;
+            }
+
+            var roll = random.NextDouble() * totalWeight;
+            var current = 0.0;
+
+            foreach (var (item, weight) in weights)
+            {
+                current += weight;
+                if (roll <= current)
+                {
+                    return item;
+                }
+            }
+
+            return items[items.Count - 1];
+        }
+    }
+
+    public class ItemService
+    {
+        private DatabaseManager dbManager;
+
+        public ItemService(DatabaseManager db)
+        {
+            dbManager = db;
+        }
+
+        public List<Item> SearchItems(string keyword, string sortBy)
+        {
+            var items = dbManager.GetItems();
+
+            if (!string.IsNullOrEmpty(keyword))
+            {
+                items = items.Where(i => i.Name.ToLower().Contains(keyword.ToLower())).ToList();
+            }
+
+            switch (sortBy.ToLower())
+            {
+                case "price":
+                    items = items.OrderBy(i => i.Price).ToList();
+                    break;
+                case "rarity":
+                    items = items.OrderBy(i => GetRarityValue(i.Rarity)).ToList();
+                    break;
+                case "popularity":
+                    items = items.OrderByDescending(i => i.Popularity).ToList();
+                    break;
+                default:
+                    break;
+            }
+
+            return items;
+        }
+
+        private int GetRarityValue(string rarity)
+        {
+            return rarity switch
+            {
+                "Common" => 1,
+                "Rare" => 2,
+                "Epic" => 3,
+                "Legendary" => 4,
+                _ => 0
+            };
+        }
+    }
+
+    public class CartService
+    {
+        private DatabaseManager dbManager;
+
+        public CartService(DatabaseManager db)
+        {
+            dbManager = db;
+        }
+
+        public Cart GetCart(int userId)
+        {
+            return dbManager.GetCart(userId);
+        }
+
+        public void AddToCart(int userId, int itemId, int quantity)
+        {
+            dbManager.AddToCart(userId, itemId, quantity);
+        }
+
+        public string Checkout(int userId)
+        {
+            var cart = dbManager.GetCart(userId);
+            var user = dbManager.GetUser(userId);
+            var items = dbManager.GetItems();
+
+            double totalCost = 0;
+            foreach (var cartItem in cart.Items)
+            {
+                var item = items.Find(i => i.Id == cartItem.ItemId);
+                totalCost += item.Price * cartItem.Quantity;
+            }
+
+            if (user.Balance >= totalCost)
+            {
+                user.Balance -= totalCost;
+                user.TotalSpent += (int)totalCost;
+                user.PurchaseCount += 1;
+                dbManager.UpdateUser(user);
+
+                foreach (var cartItem in cart.Items)
+                {
+                    dbManager.LogTransaction(userId, cartItem.ItemId, items.Find(i => i.Id == cartItem.ItemId).Price * cartItem.Quantity);
+                }
+
+                dbManager.ClearCart(userId);
+                return "Checkout successful";
+            }
+
+            return "Insufficient balance";
+        }
+    }
+
+    public class TransactionService
+    {
+        private DatabaseManager dbManager;
+
+        public TransactionService(DatabaseManager db)
+        {
+            dbManager = db;
+        }
+
+        public List<Transaction> GetUserTransactions(int userId)
+        {
+            var transactions = new List<Transaction>();
+            using (var conn = new SQLiteConnection(dbManager.connectionString))
+            {
+                conn.Open();
+                var cmd = new SQLiteCommand("SELECT * FROM Transactions WHERE UserId = @userId", conn);
+                cmd.Parameters.AddWithValue("@userId", userId);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        transactions.Add(new Transaction
+                        {
+                            Id = reader.GetInt32(0),
+                            UserId = reader.GetInt32(1),
+                            ItemId = reader.GetInt32(2),
+                            Amount = reader.GetDouble(3),
+                            Timestamp = reader.GetString(4)
+                        });
+                    }
+                }
+            }
+            return transactions;
+        }
+    }
+
+    public Item DrawItem(int userId)
+    {
+        return lootBoxManager.DrawItem(userId);
+    }
+
+    public List<Item> SearchItems(string keyword, string sortBy)
+    {
+        return itemService.SearchItems(keyword, sortBy);
+    }
+
+    public Cart GetCart(int userId)
+    {
+        return cartService.GetCart(userId);
+    }
+
+    public void AddToCart(int userId, int itemId, int quantity)
+    {
+        cartService.AddToCart(userId, itemId, quantity);
+    }
+
+    public string Checkout(int userId)
+    {
+        return cartService.Checkout(userId);
+    }
+
+    public List<Transaction> GetTransactions(int userId)
+    {
+        return transactionService.GetUserTransactions(userId);
+    }
+
+    public class DrawRequest
+    {
+        public int UserId { get; set; }
+    }
+
+    public class AddToCartRequest
+    {
+        public int UserId { get; set; }
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class CheckoutRequest
+    {
+        public int UserId { get; set; }
+    }
+
+    public class DrawResponse
+    {
+        public int ItemId { get; set; }
+        public string ItemName { get; set; }
+        public string Rarity { get; set; }
+    }
+}

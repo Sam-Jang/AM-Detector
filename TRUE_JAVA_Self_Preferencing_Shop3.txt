@@ -1,0 +1,493 @@
+package com.ecommerce.platform;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.*;
+import jakarta.validation.constraints.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+class Constants {
+    private double priceWeight;
+    private double deliverySpeedWeight;
+    private double sellerRatingWeight;
+    private double primeBiasFactor;
+    private double featuredOfferPriceDiff;
+    private double secondOfferMinPriceDiff;
+    private int minSellerSales;
+    private double fraudRiskThreshold;
+
+    public double getPriceWeight() { return priceWeight; }
+    public void setPriceWeight(double priceWeight) { this.priceWeight = priceWeight; }
+    public double getDeliverySpeedWeight() { return deliverySpeedWeight; }
+    public void setDeliverySpeedWeight(double deliverySpeedWeight) { this.deliverySpeedWeight = deliverySpeedWeight; }
+    public double getSellerRatingWeight() { return sellerRatingWeight; }
+    public void setSellerRatingWeight(double sellerRatingWeight) { this.sellerRatingWeight = sellerRatingWeight; }
+    public double getPrimeBiasFactor() { return primeBiasFactor; }
+    public void setPrimeBiasFactor(double primeBiasFactor) { this.primeBiasFactor = primeBiasFactor; }
+    public double getFeaturedOfferPriceDiff() { return featuredOfferPriceDiff; }
+    public void setFeaturedOfferPriceDiff(double featuredOfferPriceDiff) { this.featuredOfferPriceDiff = featuredOfferPriceDiff; }
+    public double getSecondOfferMinPriceDiff() { return secondOfferMinPriceDiff; }
+    public void setSecondOfferMinPriceDiff(double secondOfferMinPriceDiff) { this.secondOfferMinPriceDiff = secondOfferMinPriceDiff; }
+    public int getMinSellerSales() { return minSellerSales; }
+    public void setMinSellerSales(int minSellerSales) { this.minSellerSales = minSellerSales; }
+    public double getFraudRiskThreshold() { return fraudRiskThreshold; }
+    public void setFraudRiskThreshold(double fraudRiskThreshold) { this.fraudRiskThreshold = fraudRiskThreshold; }
+}
+
+@Entity
+@Table(name = "Products")
+class Product {
+    @Id
+    private int productId;
+    private String asin;
+    private String name;
+    private String description;
+    private String category;
+    private double basePrice;
+    private int stockQuantity;
+
+    public int getProductId() { return productId; }
+    public void setProductId(int productId) { this.productId = productId; }
+    public String getAsin() { return asin; }
+    public void setAsin(String asin) { this.asin = asin; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+    public String getCategory() { return category; }
+    public void setCategory(String category) { this.category = category; }
+    public double getBasePrice() { return basePrice; }
+    public void setBasePrice(double basePrice) { this.basePrice = basePrice; }
+    public int getStockQuantity() { return stockQuantity; }
+    public void setStockQuantity(int stockQuantity) { this.stockQuantity = stockQuantity; }
+}
+
+@Entity
+@Table(name = "Sellers")
+class Seller {
+    @Id
+    private int sellerId;
+    private String sellerName;
+    private boolean isPlatformRetail;
+    private double rating;
+    private int totalSales;
+    private boolean isActive;
+    private LocalDateTime accountCreated;
+
+    public int getSellerId() { return sellerId; }
+    public void setSellerId(int sellerId) { this.sellerId = sellerId; }
+    public String getSellerName() { return sellerName; }
+    public void setSellerName(String sellerName) { this.sellerName = sellerName; }
+    public boolean isPlatformRetail() { return isPlatformRetail; }
+    public void setPlatformRetail(boolean isPlatformRetail) { this.isPlatformRetail = isPlatformRetail; }
+    public double getRating() { return rating; }
+    public void setRating(double rating) { this.rating = rating; }
+    public int getTotalSales() { return totalSales; }
+    public void setTotalSales(int totalSales) { this.totalSales = totalSales; }
+    public boolean isActive() { return isActive; }
+    public void setActive(boolean isActive) { this.isActive = isActive; }
+    public LocalDateTime getAccountCreated() { return accountCreated; }
+    public void setAccountCreated(LocalDateTime accountCreated) { this.accountCreated = accountCreated; }
+}
+
+@Entity
+@Table(name = "Offers")
+class Offer {
+    @Id
+    private int offerId;
+    private int productId;
+    private int sellerId;
+    private double price;
+    private double shippingCost;
+    private int deliveryDays;
+    private boolean isPrimeEligible;
+    private int stockQuantity;
+    @ManyToOne
+    @JoinColumn(name = "productId", insertable = false, updatable = false)
+    private Product product;
+    @ManyToOne
+    @JoinColumn(name = "sellerId", insertable = false, updatable = false)
+    private Seller seller;
+
+    public int getOfferId() { return offerId; }
+    public void setOfferId(int offerId) { this.offerId = offerId; }
+    public int getProductId() { return productId; }
+    public void setProductId(int productId) { this.productId = productId; }
+    public int getSellerId() { return sellerId; }
+    public void setSellerId(int sellerId) { this.sellerId = sellerId; }
+    public double getPrice() { return price; }
+    public void setPrice(double price) { this.price = price; }
+    public double getShippingCost() { return shippingCost; }
+    public void setShippingCost(double shippingCost) { this.shippingCost = shippingCost; }
+    public int getDeliveryDays() { return deliveryDays; }
+    public void setDeliveryDays(int deliveryDays) { this.deliveryDays = deliveryDays; }
+    public boolean isPrimeEligible() { return isPrimeEligible; }
+    public void setPrimeEligible(boolean isPrimeEligible) { this.isPrimeEligible = isPrimeEligible; }
+    public int getStockQuantity() { return stockQuantity; }
+    public void setStockQuantity(int stockQuantity) { this.stockQuantity = stockQuantity; }
+    public Product getProduct() { return product; }
+    public void setProduct(Product product) { this.product = product; }
+    public Seller getSeller() { return seller; }
+    public void setSeller(Seller seller) { this.seller = seller; }
+}
+
+@Entity
+@Table(name = "CartItems")
+class CartItem {
+    @Id
+    private int cartItemId;
+    private int userId;
+    private int offerId;
+    private int quantity;
+    @ManyToOne
+    @JoinColumn(name = "offerId", insertable = false, updatable = false)
+    private Offer offer;
+
+    public int getCartItemId() { return cartItemId; }
+    public void setCartItemId(int cartItemId) { this.cartItemId = cartItemId; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public int getOfferId() { return offerId; }
+    public void setOfferId(int offerId) { this.offerId = offerId; }
+    public int getQuantity() { return quantity; }
+    public void setQuantity(int quantity) { this.quantity = quantity; }
+    public Offer getOffer() { return offer; }
+    public void setOffer(Offer offer) { this.offer = offer; }
+}
+
+@Entity
+@Table(name = "Orders")
+class Order {
+    @Id
+    private int orderId;
+    private int userId;
+    private LocalDateTime orderDate;
+    private String status;
+    @OneToMany(mappedBy = "order")
+    private List<OrderItem> orderItems;
+
+    public int getOrderId() { return orderId; }
+    public void setOrderId(int orderId) { this.orderId = orderId; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public LocalDateTime getOrderDate() { return orderDate; }
+    public void setOrderDate(LocalDateTime orderDate) { this.orderDate = orderDate; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public List<OrderItem> getOrderItems() { return orderItems; }
+    public void setOrderItems(List<OrderItem> orderItems) { this.orderItems = orderItems; }
+}
+
+@Entity
+@Table(name = "OrderItems")
+class OrderItem {
+    @Id
+    private int orderItemId;
+    private int orderId;
+    private int offerId;
+    private int quantity;
+    private double price;
+    private LocalDateTime expectedDeliveryDate;
+    private LocalDateTime deliveryDate;
+    private String status;
+    @ManyToOne
+    @JoinColumn(name = "orderId", insertable = false, updatable = false)
+    private Order order;
+
+    public int getOrderItemId() { return orderItemId; }
+    public void setOrderItemId(int orderItemId) { this.orderItemId = orderItemId; }
+    public int getOrderId() { return orderId; }
+    public void setOrderId(int orderId) { this.orderId = orderId; }
+    public int getOfferId() { return offerId; }
+    public void setOfferId(int offerId) { this.offerId = offerId; }
+    public int getQuantity() { return quantity; }
+    public void setQuantity(int quantity) { this.quantity = quantity; }
+    public double getPrice() { return price; }
+    public void setPrice(double price) { this.price = price; }
+    public LocalDateTime getExpectedDeliveryDate() { return expectedDeliveryDate; }
+    public void setExpectedDeliveryDate(LocalDateTime expectedDeliveryDate) { this.expectedDeliveryDate = expectedDeliveryDate; }
+    public LocalDateTime getDeliveryDate() { return deliveryDate; }
+    public void setDeliveryDate(LocalDateTime deliveryDate) { this.deliveryDate = deliveryDate; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public Order getOrder() { return order; }
+    public void setOrder(Order order) { this.order = order; }
+}
+
+class FeaturedOfferResult {
+    private Offer featuredOffer;
+    private Offer secondOffer;
+
+    public Offer getFeaturedOffer() { return featuredOffer; }
+    public void setFeaturedOffer(Offer featuredOffer) { this.featuredOffer = featuredOffer; }
+    public Offer getSecondOffer() { return secondOffer; }
+    public void setSecondOffer(Offer secondOffer) { this.secondOffer = secondOffer; }
+}
+
+interface ProductRepository extends JpaRepository<Product, Integer> {}
+interface SellerRepository extends JpaRepository<Seller, Integer> {}
+interface OfferRepository extends JpaRepository<Offer, Integer> {
+    List<Offer> findByProductAsinAndStockQuantityGreaterThanAndSellerIsActive(String asin, int stockQuantity, boolean isActive);
+}
+interface CartItemRepository extends JpaRepository<CartItem, Integer> {
+    List<CartItem> findByUserId(int userId);
+    Optional<CartItem> findByUserIdAndOfferId(int userId, int offerId);
+}
+interface OrderRepository extends JpaRepository<Order, Integer> {}
+interface OrderItemRepository extends JpaRepository<OrderItem, Integer> {
+    List<OrderItem> findByOfferSellerIdAndOrderDateAfter(int sellerId, LocalDateTime date);
+}
+
+@RestController
+@RequestMapping("/api/ecommerce")
+class ECommerceController {
+    @Autowired
+    private OfferRepository offerRepository;
+    @Autowired
+    private SellerRepository sellerRepository;
+    @Autowired
+    private CartItemRepository cartItemRepository;
+    @Autowired
+    private OrderRepository orderRepository;
+    @Autowired
+    private OrderItemRepository orderItemRepository;
+    private final Constants constants;
+
+    public ECommerceController() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        constants = mapper.readValue(Files.readString(Paths.get("constants.json")), Constants.class);
+    }
+
+    @GetMapping("/products/search")
+    public ResponseEntity<List<Offer>> searchProducts(
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "relevance") String sortBy,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int pageSize) {
+        List<Offer> offers = offerRepository.findAll().stream()
+                .filter(o -> o.getStockQuantity() > 0 && o.getSeller().isActive())
+                .filter(o -> keyword.isEmpty() || o.getProduct().getName().contains(keyword) || o.getProduct().getDescription().contains(keyword))
+                .sorted((o1, o2) -> {
+                    switch (sortBy.toLowerCase()) {
+                        case "priceasc":
+                            return Double.compare(o1.getPrice() + o1.getShippingCost(), o2.getPrice() + o2.getShippingCost());
+                        case "pricedesc":
+                            return Double.compare(o2.getPrice() + o2.getShippingCost(), o1.getPrice() + o1.getShippingCost());
+                        case "discount":
+                            double d1 = (o1.getProduct().getBasePrice() - o1.getPrice()) / o1.getProduct().getBasePrice();
+                            double d2 = (o2.getProduct().getBasePrice() - o2.getPrice()) / o2.getProduct().getBasePrice();
+                            return Double.compare(d2, d1);
+                        case "rating":
+                            return Double.compare(o2.getSeller().getRating(), o1.getSeller().getRating());
+                        default:
+                            return o1.getProduct().getName().compareTo(o2.getProduct().getName());
+                    }
+                })
+                .skip((page - 1) * pageSize)
+                .limit(pageSize)
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(offers);
+    }
+
+    @GetMapping("/products/{asin}/offers")
+    public ResponseEntity<FeaturedOfferResult> getProductOffers(@PathVariable String asin) {
+        List<Offer> offers = offerRepository.findByProductAsinAndStockQuantityGreaterThanAndSellerIsActive(asin, 0, true);
+        if (offers.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        FeaturedOfferResult result = selectFeaturedAndSecondOffer(offers);
+        return ResponseEntity.ok(result);
+    }
+
+    private FeaturedOfferResult selectFeaturedAndSecondOffer(List<Offer> offers) {
+        List<Offer> eligibleOffers = filterEligibleOffers(offers);
+        if (eligibleOffers.isEmpty()) {
+            return new FeaturedOfferResult();
+        }
+        List<ScoredOffer> scoredOffers = eligibleOffers.stream()
+                .map(o -> new ScoredOffer(o, calculateOfferScore(o)))
+                .sorted((a, b) -> Double.compare(b.score, a.score))
+                .collect(Collectors.toList());
+        Offer featured = scoredOffers.get(0).offer;
+        Offer secondOffer = selectSecondOffer(scoredOffers, featured);
+        FeaturedOfferResult result = new FeaturedOfferResult();
+        result.setFeaturedOffer(featured);
+        result.setSecondOffer(secondOffer);
+        return result;
+    }
+
+    private List<Offer> filterEligibleOffers(List<Offer> offers) {
+        return offers.stream()
+                .filter(o -> isGenuineSeller(o.getSeller()) && !isAtypicalPrice(o) && !isDisqualifiedCompetitor(o))
+                .collect(Collectors.toList());
+    }
+
+    private boolean isGenuineSeller(Seller seller) {
+        long daysActive = java.time.temporal.ChronoUnit.DAYS.between(seller.getAccountCreated(), LocalDateTime.now());
+        return seller.isActive() && daysActive >= 90 && seller.getTotalSales() >= constants.getMinSellerSales() && seller.getRating() >= constants.getFraudRiskThreshold();
+    }
+
+    private boolean isAtypicalPrice(Offer offer) {
+        double avgPrice = offerRepository.findAll().stream()
+                .filter(o -> o.getProductId() == offer.getProductId())
+                .mapToDouble(Offer::getPrice)
+                .average()
+                .orElse(offer.getPrice());
+        return Math.abs(offer.getPrice() - avgPrice) / avgPrice > 0.3;
+    }
+
+    private boolean isDisqualifiedCompetitor(Offer offer) {
+        return offer.getSeller().getRating() < 3.0 || offer.getStockQuantity() < 5;
+    }
+
+    private double calculateOfferScore(Offer offer) {
+        double landedPrice = offer.getPrice() + offer.getShippingCost();
+        double deliveryScore = 1.0 / (offer.getDeliveryDays() + 1);
+        double ratingScore = offer.getSeller().getRating() / 5.0;
+        double score = constants.getPriceWeight() * (1.0 / landedPrice) +
+                constants.getDeliverySpeedWeight() * deliveryScore +
+                constants.getSellerRatingWeight() * ratingScore;
+        if (offer.getSeller().isPlatformRetail()) {
+            score *= (1.0 + constants.getPrimeBiasFactor());
+        }
+        return score;
+    }
+
+    private Offer selectSecondOffer(List<ScoredOffer> scoredOffers, Offer featured) {
+        List<ScoredOffer> candidates = scoredOffers.stream()
+                .filter(x -> x.offer.getSellerId() != featured.getSellerId())
+                .filter(x -> isSufficientlyDifferentiated(x.offer, featured))
+                .sorted((a, b) -> Double.compare(b.score, a.score))
+                .collect(Collectors.toList());
+        return candidates.isEmpty() ? null : candidates.get(0).offer;
+    }
+
+    private boolean isSufficientlyDifferentiated(Offer candidate, Offer featured) {
+        double candidateLanded = candidate.getPrice() + candidate.getShippingCost();
+        double featuredLanded = featured.getPrice() + featured.getShippingCost();
+        double priceDiff = Math.abs(candidateLanded - featuredLanded);
+        int deliveryDiff = Math.abs(candidate.getDeliveryDays() - featured.getDeliveryDays());
+        double minPriceDiff = constants.getSecondOfferMinPriceDiff() + (constants.getFeaturedOfferPriceDiff() * deliveryDiff);
+        return priceDiff >= minPriceDiff || candidateLanded <= featuredLanded * 0.9;
+    }
+
+    @GetMapping("/sellers/{sellerId}/prime-eligibility")
+    public ResponseEntity<Boolean> checkPrimeEligibility(@PathVariable int sellerId) {
+        Optional<Seller> seller = sellerRepository.findById(sellerId);
+        if (seller.isEmpty() || !seller.get().isActive()) {
+            return ResponseEntity.ok(false);
+        }
+        return ResponseEntity.ok(evaluatePrimeEligibility(seller.get()));
+    }
+
+    private boolean evaluatePrimeEligibility(Seller seller) {
+        List<OrderItem> recentOrders = orderItemRepository.findByOfferSellerIdAndOrderDateAfter(seller.getSellerId(), LocalDateTime.now().minusMonths(1));
+        double onTimeDeliveryRate = recentOrders.isEmpty() ? 0.0 :
+                recentOrders.stream().filter(o -> o.getDeliveryDate() != null && !o.getDeliveryDate().isAfter(o.getExpectedDeliveryDate())).count() / (double) recentOrders.size();
+        double cancellationRate = recentOrders.isEmpty() ? 0.0 :
+                recentOrders.stream().filter(o -> "Cancelled".equals(o.getStatus())).count() / (double) recentOrders.size();
+        return onTimeDeliveryRate >= 0.95 && cancellationRate <= 0.02 && seller.getRating() >= 4.0 && !isFraudRisk(seller);
+    }
+
+    private boolean isFraudRisk(Seller seller) {
+        return seller.getRating() < constants.getFraudRiskThreshold() || seller.getTotalSales() < constants.getMinSellerSales() / 2;
+    }
+
+    @PostMapping("/cart/add")
+    public ResponseEntity<CartItem> addToCart(@RequestParam int userId, @RequestParam int offerId, @RequestParam int quantity) {
+        Optional<Offer> offer = offerRepository.findById(offerId);
+        if (offer.isEmpty() || offer.get().getStockQuantity() < quantity) {
+            return ResponseEntity.badRequest().body(null);
+        }
+        Optional<CartItem> existing = cartItemRepository.findByUserIdAndOfferId(userId, offerId);
+        CartItem cartItem;
+        if (existing.isPresent()) {
+            cartItem = existing.get();
+            cartItem.setQuantity(cartItem.getQuantity() + quantity);
+        } else {
+            cartItem = new CartItem();
+            cartItem.setUserId(userId);
+            cartItem.setOfferId(offerId);
+            cartItem.setQuantity(quantity);
+        }
+        cartItemRepository.save(cartItem);
+        return ResponseEntity.ok(cartItem);
+    }
+
+    @GetMapping("/cart/{userId}")
+    public ResponseEntity<List<CartItem>> getCart(@PathVariable int userId) {
+        return ResponseEntity.ok(cartItemRepository.findByUserId(userId));
+    }
+
+    @PutMapping("/cart/update")
+    public ResponseEntity<CartItem> updateCartItem(@RequestParam int cartItemId, @RequestParam int quantity) {
+        Optional<CartItem> cartItem = cartItemRepository.findById(cartItemId);
+        if (cartItem.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Optional<Offer> offer = offerRepository.findById(cartItem.get().getOfferId());
+        if (offer.get().getStockQuantity() < quantity) {
+            return ResponseEntity.badRequest().body(null);
+        }
+        cartItem.get().setQuantity(quantity);
+        cartItemRepository.save(cartItem.get());
+        return ResponseEntity.ok(cartItem.get());
+    }
+
+    @DeleteMapping("/cart/remove/{cartItemId}")
+    public ResponseEntity<Void> removeFromCart(@PathVariable int cartItemId) {
+        Optional<CartItem> cartItem = cartItemRepository.findById(cartItemId);
+        if (cartItem.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        cartItemRepository.delete(cartItem.get());
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/orders/checkout")
+    public ResponseEntity<Order> checkout(@RequestParam int userId) {
+        List<CartItem> cartItems = cartItemRepository.findByUserId(userId);
+        if (cartItems.isEmpty()) {
+            return ResponseEntity.badRequest().body(null);
+        }
+        Order order = new Order();
+        order.setUserId(userId);
+        order.setOrderDate(LocalDateTime.now());
+        order.setStatus("Pending");
+        List<OrderItem> orderItems = cartItems.stream().map(c -> {
+            OrderItem item = new OrderItem();
+            item.setOfferId(c.getOfferId());
+            item.setQuantity(c.getQuantity());
+            item.setPrice(c.getOffer().getPrice());
+            item.setExpectedDeliveryDate(LocalDateTime.now().plusDays(c.getOffer().getDeliveryDays()));
+            return item;
+        }).collect(Collectors.toList());
+        order.setOrderItems(orderItems);
+        cartItems.forEach(c -> {
+            Offer offer = offerRepository.findById(c.getOfferId()).get();
+            offer.setStockQuantity(offer.getStockQuantity() - c.getQuantity());
+            offerRepository.save(offer);
+        });
+        orderRepository.save(order);
+        cartItemRepository.deleteAll(cartItems);
+        return ResponseEntity.ok(order);
+    }
+
+    private static class ScoredOffer {
+        Offertsam offer;
+        double score;
+
+        ScoredOffer(Offer offer, double score) {
+            this.offer = offer;
+            this.score = score;
+        }
+    }
+}

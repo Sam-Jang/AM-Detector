@@ -1,0 +1,463 @@
+#include <iostream>
+#include <vector>
+#include <map>
+#include <string>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <crow.h>
+#include <random>
+#include <openssl/sha.h>
+#include <iomanip>
+#include <sstream>
+#include <fstream>
+#include <ctime>
+
+using json = nlohmann::json;
+
+struct User {
+    int id;
+    std::string username;
+    std::string password_hash;
+    double balance;
+    int total_spent;
+};
+
+struct Character {
+    int id;
+    int user_id;
+    std::string name;
+    int level;
+    int experience;
+};
+
+struct Item {
+    int id;
+    std::string name;
+    std::string type;
+    int rarity;
+    double price;
+    double base_drop_rate;
+};
+
+struct InventoryItem {
+    int id;
+    int user_id;
+    int item_id;
+    int quantity;
+};
+
+struct PurchaseHistory {
+    int id;
+    int user_id;
+    double amount;
+    std::string timestamp;
+};
+
+struct DropRateConfig {
+    std::map<int, double> item_drop_rates;
+    double high_spender_bonus;
+    double low_spender_bonus;
+};
+
+class GameServer {
+private:
+    std::string db_path;
+    DropRateConfig drop_config;
+    sqlite3* db;
+
+    void initialize_database() {
+        sqlite3_open(db_path.c_str(), &db);
+        const char* sql = 
+            "CREATE TABLE IF NOT EXISTS Users ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "Username TEXT UNIQUE,"
+            "PasswordHash TEXT,"
+            "Balance REAL,"
+            "TotalSpent INTEGER);"
+            "CREATE TABLE IF NOT EXISTS Characters ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "UserId INTEGER,"
+            "Name TEXT,"
+            "Level INTEGER,"
+            "Experience INTEGER);"
+            "CREATE TABLE IF NOT EXISTS Items ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "Name TEXT,"
+            "Type TEXT,"
+            "Rarity INTEGER,"
+            "Price REAL,"
+            "BaseDropRate REAL);"
+            "CREATE TABLE IF NOT EXISTS Inventory ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "UserId INTEGER,"
+            "ItemId INTEGER,"
+            "Quantity INTEGER);"
+            "CREATE TABLE IF NOT EXISTS PurchaseHistory ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "UserId INTEGER,"
+            "Amount REAL,"
+            "Timestamp TEXT);";
+        sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+    }
+
+    DropRateConfig load_drop_config(const std::string& path) {
+        std::ifstream file(path);
+        json j;
+        file >> j;
+        DropRateConfig config;
+        config.item_drop_rates = j["ItemDropRates"].get<std::map<int, double>>();
+        config.high_spender_bonus = j["HighSpenderBonus"].get<double>();
+        config.low_spender_bonus = j["LowSpenderPenalty"].get<double>();
+        return config;
+    }
+
+    std::string hash_password(const std::string& password) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256((unsigned char*)password.c_str(), password.length(), hash);
+        std::stringstream ss;
+        for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        }
+        return ss.str();
+    }
+
+    std::map<int, double> adjust_drop_rates(const std::vector<Item>& items, int total_spent) {
+        std::map<int, double> adjusted;
+        double modifier = total_spent > 10000 ? drop_config.high_spender_bonus : drop_config.low_spender_bonus;
+        for(const auto& item : items) {
+            auto it = drop_config.item_drop_rates.find(item.id);
+            double rate = it != drop_config.item_drop_rates.end() ? it->second : item.base_drop_rate;
+            adjusted[item.id] = rate * modifier;
+        }
+        return adjusted;
+    }
+
+public:
+    GameServer(const std::string& db_path, const std::string& config_path) : db_path(db_path) {
+        drop_config = load_drop_config(config_path);
+        initialize_database();
+    }
+
+    ~GameServer() {
+        sqlite3_close(db);
+    }
+
+    void run() {
+        crow::SimpleApp app;
+
+        CROW_ROUTE(app, "/api/register").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            std::string username = j["Username"];
+            std::string password = j["Password"];
+            std::string hash = hash_password(password);
+
+            sqlite3_stmt* stmt;
+            std::string sql = "INSERT INTO Users (Username, PasswordHash, Balance, TotalSpent) VALUES (?, ?, ?, ?)";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 2, hash Mecry.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_double(stmt, 3, 1000.0);
+                sqlite3_bind_int(stmt, 4, 0);
+                if(sqlite3_step(stmt) == SQLITE_DONE) {
+                    sqlite3_finalize(stmt);
+                    return crow::response(200, json{{"Message", "Registration successful"}}.dump());
+                }
+                sqlite3_finalize(stmt);
+            }
+            return crow::response(400, json{{"Error", "Username already exists"}}.dump());
+        });
+
+        CROW_ROUTE(app, "/api/login").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            std::string username = j["Username"];
+            std::string password = j["Password"];
+            std::string hash = hash_password(password);
+
+            sqlite3_stmt* stmt;
+            std::string sql = "SELECT Id, PasswordHash FROM Users WHERE Username = ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+                if(sqlite3_step(stmt) == SQLITE_ROW) {
+                    int id = sqlite3_column_int(stmt, 0);
+                    std::string stored_hash = (const char*)sqlite3_column_text(stmt, 1);
+                    if(stored_hash == hash) {
+                        std::string token = std::to_string(std::rand());
+                        sqlite3_finalize(stmt);
+                        return crow::response(200, json{{"Token", token}, {"UserId", id}}.dump());
+                    }
+                }
+                sqlite3_finalize(stmt);
+            }
+            return crow::response(401, json{{"Error", "Invalid credentials"}}.dump());
+        });
+
+        CROW_ROUTE(app, "/api/characters").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            int user_id = j["UserId"];
+            std::string name = j["Name"];
+
+            sqlite3_stmt* stmt;
+            std::string sql = "INSERT INTO Characters (UserId, Name, Level, Experience) VALUES (?, ?, ?, ?)";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, user_id);
+                sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int(stmt, 3, 1);
+                sqlite3_bind_int(stmt, 4, 0);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+                return crow::response(200, json{{"Message", "Character created"}}.dump());
+            }
+            return crow::response(400);
+        });
+
+        CROW_ROUTE(app, "/api/characters/<int>")(this, &GameServer::get_characters);
+
+        CROW_ROUTE(app, "/api/items")(this, &GameServer::get_items);
+
+        CROW_ROUTE(app, "/api/cart/add").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            int user_id = j["UserId"];
+            int item_id = j["ItemId"];
+            int quantity = j["Quantity"];
+
+            double price;
+            sqlite3_stmt* stmt;
+            std::string sql = "SELECT Price FROM Items WHERE Id = ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, item_id);
+                if(sqlite3_step(stmt) == SQLITE_ROW) {
+                    price = sqlite3_column_double(stmt, 0);
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            double amount = price * quantity;
+            sql = "UPDATE Users SET Balance = Balance - ?, TotalSpent = TotalSpent + ? WHERE Id = ? AND Balance >= ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_double(stmt, 1, amount);
+                sqlite3_bind_double(stmt, 2, amount);
+                sqlite3_bind_int(stmt, 3, user_id);
+                sqlite3_bind_double(stmt, 4, amount);
+                if(sqlite3_step(stmt) != SQLITE_DONE) {
+                    sqlite3_finalize(stmt);
+                    return crow::response(400, json{{"Error", "Insufficient balance"}}.dump());
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            sql = "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES (?, ?, ?) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, user_id);
+                sqlite3_bind_int(stmt, 2, item_id);
+                sqlite3_bind_int(stmt, 3, quantity);
+                sqlite3_bind_int(stmt, 4, quantity);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+
+            auto now = std::time(nullptr);
+            std::stringstream ss;
+            ss << std::put_time(std::gmtime(&now), "%Y-%m-%dT%H:%M:%SZ");
+            sql = "INSERT INTO PurchaseHistory (UserId, Amount, Timestamp) VALUES (?, ?, ?)";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, user_id);
+                sqlite3_bind_double(stmt, 2, amount);
+                sqlite3_bind_text(stmt, 3, ss.str().c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+
+            return crow::response(200, json{{"Message", "Item added to inventory"}}.dump());
+        });
+
+        CROW_ROUTE(app, "/api/inventory/<int>")(this, &GameServer::get_inventory);
+
+        CROW_ROUTE(app, "/api/gacha").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            int user_id = j["UserId"];
+
+            int total_spent;
+            sqlite3_stmt* stmt;
+            std::string sql = "SELECT TotalSpent FROM Users WHERE Id = ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, user_id);
+                if(sqlite3_step(stmt) == SQLITE_ROW) {
+                    total_spent = sqlite3_column_int(stmt, 0);
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            std::vector<Item> items;
+            sql = "SELECT Id, BaseDropRate FROM Items WHERE Type = 'Premium'";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                while(sqlite3_step(stmt) == SQLITE_ROW) {
+                    items.push_back({sqlite3_column_int(stmt, 0), "", "", 0, 0.0, sqlite3_column_double(stmt, 1)});
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            auto adjusted_rates = adjust_drop_rates(items, total_spent);
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> dis(0.0, 1.0);
+            double roll = dis(gen) * std::accumulate(adjusted_rates.begin(), adjusted_rates.end(), 0.0,
+                [](double sum, const auto& pair) { return sum + pair.second; });
+            double cumulative = 0.0;
+            int selected_item_id = 0;
+            for(const auto& rate : adjusted_rates) {
+                cumulative += rate.second;
+                if(roll <= cumulative) {
+                    selected_item_id = rate.first;
+                    break;
+                }
+            }
+
+            sql = "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES (?, ?, ?) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, user_id);
+                sqlite3_bind_int(stmt, 2, selected_item_id);
+                sqlite3_bind_int(stmt, 3, 1);
+                sqlite3_bind_int(stmt, 4, 1);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+
+            sql = "UPDATE Users SET Balance = Balance - ? WHERE Id = ? AND Balance >= ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_double(stmt, 1, 100.0);
+                sqlite3_bind_int(stmt, 2, user_id);
+                sqlite3_bind_double(stmt, 3, 100.0);
+                if(sqlite3_step(stmt) != SQLITE_DONE) {
+                    sqlite3_finalize(stmt);
+                    return crow::response(400, json{{"Error", "Insufficient balance for gacha"}}.dump());
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            return crow::response(200, json{{"ItemId", selected_item_id}}.dump());
+        });
+
+        CROW_ROUTE(app, "/api/leaderboard")(this, &GameServer::get_leaderboard);
+
+        CROW_ROUTE(app, "/api/deposit").methods("POST"_method)([this](const crow::request& req) {
+            auto j = json::parse(req.body);
+            int user_id = j["UserId"];
+            double amount = j["Amount"];
+
+            sqlite3_stmt* stmt;
+            std::string sql = "UPDATE Users SET Balance = Balance + ? WHERE Id = ?";
+            if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_double(stmt, 1, amount);
+                sqlite3_bind_int(stmt, 2, user_id);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+                return crow::response(200, json{{"Message", "Deposit successful"}}.dump());
+            }
+            return crow::response(400);
+        });
+
+        app.port(8080).multithreaded().run();
+    }
+
+private:
+    crow::response get_characters(int user_id) {
+        std::vector<Character> characters;
+        sqlite3_stmt* stmt;
+        std::string sql = "SELECT Id, Name, Level, Experience FROM Characters WHERE UserId = ?";
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, user_id);
+            while(sqlite3_step(stmt) == SQLITE_ROW) {
+                characters.push_back({
+                    sqlite3_column_int(stmt, 0),
+                    user_id,
+                    (const char*)sqlite3_column_text(stmt, 1),
+                    sqlite3_column_int(stmt, 2),
+                    sqlite3_column_int(stmt, 3)
+                });
+            }
+            sqlite3_finalize(stmt);
+        }
+        return crow::response(json(characters).dump());
+    }
+
+    crow::response get_items(const crow::request& req) {
+        std::string keyword = req.url_params.get("keyword") ? req.url_params.get("keyword") : "";
+        std::string sort = req.url_params.get("sort") ? req.url_params.get("sort") : "name";
+
+        std::vector<Item> items;
+        std::string sql = "SELECT Id, Name, Type, Rarity, Price, BaseDropRate FROM Items";
+        if(!keyword.empty()) {
+            sql += " WHERE Name LIKE ?";
+        }
+        if(sort == "price") sql += " ORDER BY Price ASC";
+        else if(sort == "rarity") sql += " ORDER BY Rarity DESC";
+        else sql += " ORDER BY Name ASC";
+
+        sqlite3_stmt* stmt;
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            if(!keyword.empty()) {
+                std::string like = "%" + keyword + "%";
+                sqlite3_bind_text(stmt, 1, like.c_str(), -1, SQLITE_STATIC);
+            }
+            while(sqlite3_step(stmt) == SQLITE_ROW) {
+                items.push_back({
+                    sqlite3_column_int(stmt, 0),
+                    (const char*)sqlite3_column_text(stmt, 1),
+                    (const char*)sqlite3_column_text(stmt, 2),
+                    sqlite3_column_int(stmt, 3),
+                    sqlite3_column_double(stmt, 4),
+                    sqlite3_column_double(stmt, 5)
+                });
+            }
+            sqlite3_finalize(stmt);
+        }
+        return crow::response(json(items).dump());
+    }
+
+    crow::response get_inventory(int user_id) {
+        std::vector<json> inventory;
+        sqlite3_stmt* stmt;
+        std::string sql = "SELECT i.Id, i.ItemId, i.Quantity, it.Name, it.Type, it.Rarity, it.Price "
+                         "FROM Inventory i JOIN Items it ON i.ItemId = it.Id WHERE i.UserId = ?";
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, user_id);
+            while(sqlite3_step(stmt) == SQLITE_ROW) {
+                inventory.push_back({
+                    {"Id", sqlite3_column_int(stmt, 0)},
+                    {"ItemId", sqlite3_column_int(stmt, 1)},
+                    {"Quantity", sqlite3_column_int(stmt, 2)},
+                    {"ItemName", (const char*)sqlite3_column_text(stmt, 3)},
+                    {"ItemType", (const char*)sqlite3_column_text(stmt, 4)},
+                    {"Rarity", sqlite3_column_int(stmt, 5)},
+                    {"Price", sqlite3_column_double(stmt, 6)}
+                });
+            }
+            sqlite3_finalize(stmt);
+        }
+        return crow::response(json(inventory).dump());
+    }
+
+    crow::response get_leaderboard() {
+        std::vector<json> leaderboard;
+        sqlite3_stmt* stmt;
+        std::string sql = "SELECT u.Username, MAX(c.Level) as TopLevel "
+                         "FROM Users u JOIN Characters c ON u.Id = c.UserId "
+                         "GROUP BY u.Id ORDER BY TopLevel DESC LIMIT 10";
+        if(sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            while(sqlite3_step(stmt) == SQLITE_ROW) {
+                leaderboard.push_back({
+                    {"Username", (const char*)sqlite3_column_text(stmt, 0)},
+                    {"TopLevel", sqlite3_column_int(stmt, 1)}
+                });
+            }
+            sqlite3_finalize(stmt);
+        }
+        return crow::response(json(leaderboard).dump());
+    }
+};
+
+int main() {
+    GameServer server("game.db", "drop_config.json");
+    server.run();
+    return 0;
+}

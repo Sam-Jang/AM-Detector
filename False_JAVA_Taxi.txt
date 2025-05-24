@@ -1,0 +1,72 @@
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.PriorityQueue;
+
+class Taxi {
+    String taxiId;
+    double[] location;
+    boolean available;
+
+    Taxi(String taxiId, double x, double y) {
+        this.taxiId = taxiId;
+        this.location = new double[] {x, y};
+        this.available = true;
+    }
+
+    double distanceToRequest(double[] requestLocation) {
+        return Math.sqrt(Math.pow(this.location[0] - requestLocation[0], 2) + Math.pow(this.location[1] - requestLocation[1], 2));
+    }
+}
+
+class Request {
+    String requestId;
+    double[] location;
+
+    Request(String requestId, double x, double y) {
+        this.requestId = requestId;
+        this.location = new double[] {x, y};
+    }
+}
+
+class TaxiDispatchSystem {
+    List<Taxi> taxis = new ArrayList<>();
+    List<Request> requests = new ArrayList<>();
+
+    void addTaxi(Taxi taxi) {
+        taxis.add(taxi);
+    }
+
+    void addRequest(Request request) {
+        requests.add(request);
+        dispatchRequest(request);
+    }
+
+    void dispatchRequest(Request request) {
+        if (taxis.isEmpty()) {
+            System.out.println("No taxis available for request " + request.requestId);
+            return;
+        }
+
+        PriorityQueue<Taxi> availableTaxis = new PriorityQueue<>(Comparator.comparingDouble(taxi -> taxi.distanceToRequest(request.location)));
+        for (Taxi taxi : taxis) {
+            if (taxi.available) {
+                availableTaxis.add(taxi);
+            }
+        }
+
+        if (availableTaxis.isEmpty()) {
+            System.out.println("No available taxis for request " + request.requestId);
+            return;
+        }
+
+        Taxi closestTaxi = availableTaxis.poll();
+        closestTaxi.available = false;
+
+        System.out.println("Request " + request.requestId + " dispatched to Taxi " + closestTaxi.taxiId);
+    }
+
+    public static void main(String[] args) {
+        TaxiDispatchSystem system = new TaxiDispatchSystem();
+    }
+}

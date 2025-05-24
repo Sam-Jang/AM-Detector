@@ -1,0 +1,162 @@
+#include <iostream>
+#include <vector>
+#include <ncurses.h>
+#include <unistd.h> // for usleep
+
+using namespace std;
+
+vector<vector<int>> grid(20, vector<int>(10, 0));
+vector<vector<int>> tetromino;
+int tetrominoRow = 0;
+int tetrominoCol = 4;
+
+void spawnTetromino();
+void moveTetromino(int dx, int dy);
+bool isValidMove(int row, int col);
+void mergeTetromino();
+void clearFullRows();
+void rotateTetromino();
+void drawGrid();
+
+int main() {
+    initscr();          
+    cbreak();            
+    noecho();           
+    nodelay(stdscr, TRUE);
+    keypad(stdscr, TRUE); 
+    curs_set(0);         
+
+    spawnTetromino();
+
+    while (true) {
+        int ch = getch();
+
+        switch (ch) {
+            case KEY_LEFT:
+                moveTetromino(-1, 0);
+                break;
+            case KEY_RIGHT:
+                moveTetromino(1, 0);
+                break;
+            case KEY_DOWN:
+                moveTetromino(0, 1);
+                break;
+            case ' ':
+                rotateTetromino();
+                break;
+            default:
+                break;
+        }
+
+        usleep(500000);
+        moveTetromino(0, 1);
+        drawGrid();
+        refresh();
+    }
+
+    endwin(); // End ncurses mode
+    return 0;
+}
+
+void spawnTetromino() {
+    tetromino = {
+        {1, 1, 1, 1}
+    };
+    tetrominoRow = 0;
+    tetrominoCol = 3;
+}
+
+void moveTetromino(int dx, int dy) {
+    int newRow = tetrominoRow + dy;
+    int newCol = tetrominoCol + dx;
+    if (isValidMove(newRow, newCol)) {
+        tetrominoRow = newRow;
+        tetrominoCol = newCol;
+    } else if (dy == 1) {
+        mergeTetromino();
+        clearFullRows();
+        spawnTetromino();
+    }
+}
+
+bool isValidMove(int row, int col) {
+    for (int r = 0; r < tetromino.size(); r++) {
+        for (int c = 0; c < tetromino[0].size(); c++) {
+            if (tetromino[r][c] == 1) {
+                int newRow = row + r;
+                int newCol = col + c;
+                if (newRow < 0 || newRow >= grid.size() || newCol < 0 || newCol >= grid[0].size() || grid[newRow][newCol] == 1) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void mergeTetromino() {
+    for (int r = 0; r < tetromino.size(); r++) {
+        for (int c = 0; c < tetromino[0].size(); c++) {
+            if (tetromino[r][c] == 1) {
+                grid[tetrominoRow + r][tetrominoCol + c] = 1;
+            }
+        }
+    }
+}
+
+void clearFullRows() {
+    for (int r = 0; r < grid.size(); r++) {
+        bool fullRow = true;
+        for (int c = 0; c < grid[0].size(); c++) {
+            if (grid[r][c] == 0) {
+                fullRow = false;
+                break;
+            }
+        }
+        if (fullRow) {
+            for (int row = r; row > 0; row--) {
+                grid[row] = grid[row - 1];
+            }
+            grid[0] = vector<int>(10, 0);
+        }
+    }
+}
+
+void rotateTetromino() {
+    vector<vector<int>> rotated(tetromino[0].size(), vector<int>(tetromino.size(), 0));
+    for (int r = 0; r < tetromino.size(); r++) {
+        for (int c = 0; c < tetromino[0].size(); c++) {
+            rotated[c][tetromino.size() - 1 - r] = tetromino[r][c];
+        }
+    }
+
+    if (isValidMove(tetrominoRow, tetrominoCol)) {
+        tetromino = rotated;
+    }
+}
+
+void drawGrid() {
+    clear();
+    for (int r = 0; r < grid.size(); r++) {
+        for (int c = 0; c < grid[0].size(); c++) {
+            if (grid[r][c] == 1) {
+                mvaddch(r, c, '#');
+            } else {
+                bool isTetrominoPart = false;
+                for (int tr = 0; tr < tetromino.size(); tr++) {
+                    for (int tc = 0; tc < tetromino[0].size(); tc++) {
+                        if (tetromino[tr][tc] == 1 && tetrominoRow + tr == r && tetrominoCol + tc == c) {
+                            mvaddch(r, c, '#');
+                            isTetrominoPart = true;
+                            break;
+                        }
+                    }
+                    if (isTetrominoPart) break;
+                }
+                if (!isTetrominoPart) {
+                    mvaddch(r, c, '.');
+                }
+            }
+        }
+    }
+}

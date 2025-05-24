@@ -1,0 +1,332 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi.middleware.cors import CORSMiddleware
+import json
+import os
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/ecommerce")
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 1
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    description = Column(String)
+    price = Column(Float)
+    discount = Column(Float)
+    stock = Column(Integer)
+    keywords = Column(String)
+
+class CartItem(Base):
+    __tablename__ = "cart_items"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Integer)
+    product = relationship("Product")
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    order_date = Column(DateTime)
+    total_amount = Column(Float)
+    status = Column(String)
+    items = relationship("OrderItem")
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("orders.id"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Integer)
+    price = Column(Float)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True)
+    password_hash = Column(String)
+    email = Column(String)
+
+class CompetitorPrice(Base):
+    __tablename__ = "competitor_prices"
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("products.id"))
+    price = Column(Float)
+    source = Column(String)
+    last_updated = Column(DateTime)
+
+Base.metadata.create_all(bind=engine)
+
+class PricingConfig:
+    def __init__(self):
+        with open("pricing_config.json", "r") as f:
+            data = json.load(f)
+            self.min_price = data["MinPrice"]
+            self.max_price = data["MaxPrice"]
+            self.adjustment_factor = data["AdjustmentFactor"]
+            self.weight_competitor = data["WeightCompetitor"]
+            self.weight_base = data["WeightBase"]
+
+class ProductResponse(BaseModel):
+    id: int
+    name: str
+    description: str
+    price: float
+    discount: float
+    stock: int
+    keywords: str
+
+class CartItemResponse(BaseModel):
+    id: int
+    user_id: int
+    product_id: int
+    quantity: int
+    product: ProductResponse
+
+class OrderItemResponse(BaseModel):
+    id: int
+    order_id: int
+    product_id: int
+    quantity: int
+    price: float
+
+class OrderResponse(BaseModel):
+    id: int
+    user_id: int
+    order_date: datetime
+    total_amount: float
+    status: str
+    items: List[OrderItemResponse]
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    email: str
+
+class CartItemCreate(BaseModel):
+    product_id: int
+    quantity: int
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+pricing_config = PricingConfig()
+
+@app.get("/api/products", response_model=dict)
+async def get_products(
+    keyword: Optional[str] = None,
+    sort_by: str = "price_asc",
+    page: int = 1,
+    page_size: int = 10,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Product)
+    if keyword:
+        query = query.filter(Product.keywords.contains(keyword) | Product.name.contains(keyword))
+    if sort_by == "price_asc":
+        query = query.order_by(Product.price)
+    elif sort_by == "price_desc":
+        query = query.order_by(Product.price.desc())
+    elif sort_by == "discount":
+        query = query.order_by(Product.discount.desc())
+    elif sort_by == "recommend":
+        query = query.order_by((Product.stock / (Product.price + 1)).desc())
+    else:
+        query = query.order_by(Product.id)
+    total = query.count()
+    products = query.offset((page - 1) * page_size).limit(page_size).all()
+    return {"Total": total, "Products": products}
+
+@app.get("/api/products/{id}", response_model=ProductResponse)
+async def get_product(id: int, db: Session = Depends(get_db)):
+    product = db.query(Product).filter(Product.id == id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
+
+@app.post("/api/products/adjust-prices")
+async def adjust_prices(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if "Admin" not in [claim["value"] for claim in jwt.decode(current_user.token, SECRET_KEY, algorithms=[ALGORITHM]).get("roles", [])]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    products = db.query(Product).all()
+    for product in products:
+        comp_prices = db.query(CompetitorPrice).filter(
+            CompetitorPrice.product_id == product.id,
+            CompetitorPrice.last_updated > datetime.utcnow() - timedelta(days=7)
+        ).all()
+        if comp_prices:
+            avg_comp_price = sum(cp.price for cp in comp_prices) / len(comp_prices)
+            base_price = product.price
+            new_price = (
+                pricing_config.weight_competitor * avg_comp_price +
+                pricing_config.weight_base * base_price
+            ) / (pricing_config.weight_competitor + pricing_config.weight_base)
+            new_price *= pricing_config.adjustment_factor
+            new_price = max(pricing_config.min_price, min(pricing_config.max_price, new_price))
+            product.price = round(new_price, 2)
+            db.add(product)
+    db.commit()
+    return {"Message": "Prices adjusted successfully"}
+
+@app.get("/api/cart", response_model=List[CartItemResponse])
+async def get_cart(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    cart_items = db.query(CartItem).filter(CartItem.user_id == current_user.id).all()
+    return cart_items
+
+@app.post("/api/cart", response_model=CartItemResponse)
+async def add_to_cart(item: CartItemCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    product = db.query(Product).filter(Product.id == item.product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if product.stock < item.quantity:
+        raise HTTPException(status_code=400, detail="Insufficient stock")
+    cart_item = db.query(CartItem).filter(
+        CartItem.user_id == current_user.id,
+        CartItem.product_id == item.product_id
+    ).first()
+    if not cart_item:
+        cart_item = CartItem(
+            user_id=current_user.id,
+            product_id=item.product_id,
+            quantity=item.quantity
+        )
+        db.add(cart_item)
+    else:
+        cart_item.quantity += item.quantity
+        db.add(cart_item)
+    product.stock -= item.quantity
+    db.add(product)
+    db.commit()
+    db.refresh(cart_item)
+    return cart_item
+
+@app.delete("/api/cart/{id}")
+async def remove_from_cart(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    cart_item = db.query(CartItem).filter(CartItem.id == id, CartItem.user_id == current_user W.id).first()
+    if not cart_item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+    product = db.query(Product).filter(Product.id == cart_item.product_id).first()
+    product.stock += cart_item.quantity
+    db.add(product)
+    db.delete(cart_item)
+    db.commit()
+    return {"Message": "Item removed from cart"}
+
+@app.post("/api/orders", response_model=OrderResponse)
+async def create_order(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    cart_items = db.query(CartItem).filter(CartItem.user_id == current_user.id).all()
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+    order = Order(
+        user_id=current_user.id,
+        order_date=datetime.utcnow(),
+        status="Pending",
+        total_amount=0
+    )
+    db.add(order)
+    db.flush()
+    total_amount = 0
+    for cart_item in cart_items:
+        product = db.query(Product).filter(Product.id == cart_item.product_id).first()
+        order_item = OrderItem(
+            order_id=order.id,
+            product_id=cart_item.product_id,
+            quantity=cart_item.quantity,
+            price=product.price - product.discount
+        )
+        db.add(order_item)
+        total_amount += order_item.price * order_item.quantity
+    order.total_amount = total_amount
+    db.add(order)
+    db.query(CartItem).filter(CartItem.user_id == current_user.id).delete()
+    db.commit()
+    db.refresh(order)
+    return order
+
+@app.get("/api/orders", response_model=List[OrderResponse])
+async def get_orders(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    orders = db.query(Order).filter(Order.user_id == current_user.id).all()
+    return orders
+
+@app.post("/api/auth/register")
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == user.username).first():
+        raise HTTPException(status_code=400, detail="Username already exists")
+    hashed_password = pwd_context.hash(user.password)
+    db_user = User(
+        username=user.username,
+        password_hash=hashed_password,
+        email=user.email
+    )
+    db.add(db_user)
+    db.commit()
+    return {"Message": "User registered successfully"}
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not pwd_context.verify(form_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    access_token = create_access_token(data={"sub": str(user.id), "roles": ["User"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

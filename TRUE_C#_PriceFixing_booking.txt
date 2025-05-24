@@ -1,0 +1,602 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using System.Text.Json;
+using System.IO;
+using BCrypt.Net;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace RentalManagementApp
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            CreateHostBuilder(args).Build().Run();
+        }
+
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+            Host.CreateDefaultBuilder(args)
+                .ConfigureWebHostDefaults(webBuilder =>
+                {
+                    webBuilder.UseStartup<Startup>();
+                });
+    }
+
+    public class Startup
+    {
+        public IConfiguration Configuration { get; }
+
+        public Startup(IConfiguration configuration)
+        {
+            Configuration = configuration;
+        }
+
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.AddDbContext<RentalDbContext>(options =>
+                options.UseMySql(Configuration.GetConnectionString("MariaDB"), 
+                    new MySqlServerVersion(new Version(10, 5, 9))));
+            services.AddControllers();
+            services.AddCors(options =>
+            {
+                options.AddPolicy("AllowAll", builder =>
+                    builder.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
+            });
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+            app.UseCors("AllowAll");
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllers();
+            });
+        }
+    }
+
+    public class RentalDbContext : DbContext
+    {
+        public DbSet<User> Users { get; set; }
+        public DbSet<Property> Properties { get; set; }
+        public DbSet<Lease> Leases { get; set; }
+        public DbSet<Booking> Bookings { get; set; }
+        public DbSet<PeerProperty> PeerProperties { get; set; }
+
+        public RentalDbContext(DbContextOptions<RentalDbContext> options)
+            : base(options)
+        {
+        }
+    }
+
+    public class User
+    {
+        [Key]
+        public int UserId { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public string Role { get; set; }
+        public string Email { get; set; }
+    }
+
+    public class Property
+    {
+        [Key]
+        public int PropertyId { get; set; }
+        public string Name { get; set; }
+        public string Address { get; set; }
+        public string Submarket { get; set; }
+        public int Bedrooms { get; set; }
+        public double SquareFootage { get; set; }
+        public double CurrentRent { get; set; }
+        public double OccupancyRate { get; set; }
+        public int AvailableUnits { get; set; }
+        public string Amenities { get; set; }
+    }
+
+    public class Lease
+    {
+        [Key]
+        public int LeaseId { get; set; }
+        public int PropertyId { get; set; }
+        public double EffectiveRent { get; set; }
+        public int TermMonths { get; set; }
+        public DateTime StartDate { get; set; }
+        public double Discount { get; set; }
+    }
+
+    public class Booking
+    {
+        [Key]
+        public int BookingId { get; set; }
+        public int UserId { get; set; }
+        public int PropertyId { get; set; }
+        public DateTime BookingDate { get; set; }
+        public string Status { get; set; }
+    }
+
+    public class PeerProperty
+    {
+        [Key]
+        public int PeerId { get; set; }
+        public int PropertyId { get; set; }
+        public string PeerSubmarket { get; set; }
+        public double PeerRent { get; set; }
+        public double PeerOccupancy { get; set; }
+        public int PeerBedrooms { get; set; }
+    }
+
+    public class PricingConfig
+    {
+        public double WeightMarketTrend { get; set; }
+        public double WeightOccupancy { get; set; }
+        public double WeightPeerRent { get; set; }
+        public double AutoAcceptThresholdDaily { get; set; }
+        public double AutoAcceptThresholdWeekly { get; set; }
+        public double MinRentMultiplier { get; set; }
+        public double MaxRentMultiplier { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class AuthController : ControllerBase
+    {
+        private readonly RentalDbContext _context;
+
+        public AuthController(RentalDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] RegisterDto dto)
+        {
+            if (_context.Users.Any(u => u.Username == dto.Username))
+                return BadRequest("Username already exists");
+
+            var user = new User
+            {
+                Username = dto.Username,
+                PasswordHash = BCrypt.HashPassword(dto.Password),
+                Role = "Landlord",
+                Email = dto.Email
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+            return Ok(new { UserId = user.UserId, Username = user.Username });
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginDto dto)
+        {
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Username == dto.Username);
+
+            if (user == null || !BCrypt.Verify(dto.Password, user.PasswordHash))
+                return Unauthorized("Invalid credentials");
+
+            return Ok(new { UserId = user.UserId, Username = user.Username, Role = user.Role });
+        }
+    }
+
+    public class RegisterDto
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string Email { get; set; }
+    }
+
+    public class LoginDto
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PropertiesController : ControllerBase
+    {
+        private readonly RentalDbContext _context;
+        private readonly PricingConfig _config;
+
+        public PropertiesController(RentalDbContext context)
+        {
+            _context = context;
+            var configPath = Path.Combine(Directory.GetCurrentDirectory(), "pricing_config.json");
+            var json = File.ReadAllText(configPath);
+            _config = JsonSerializer.Deserialize<PricingConfig>(json);
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetProperties(
+            string submarket = null,
+            int? bedrooms = null,
+            string sortBy = "price",
+            string sortOrder = "asc",
+            int page = 1,
+            int pageSize = 10)
+        {
+            var query = _context.Properties.AsQueryable();
+
+            if (!string.IsNullOrEmpty(submarket))
+                query = query.Where(p => p.Submarket == submarket);
+
+            if (bedrooms.HasValue)
+                query = query.Where(p => p.Bedrooms == bedrooms.Value);
+
+            query = sortBy.ToLower() switch
+            {
+                "price" => sortOrder == "asc" ? query.OrderBy(p => p.CurrentRent) : query.OrderByDescending(p => p.CurrentRent),
+                "occupancy" => sortOrder == "asc" ? query.OrderBy(p => p.OccupancyRate) : query.OrderByDescending(p => p.OccupancyRate),
+                "bedrooms" => sortOrder == "asc" ? query.OrderBy(p => p.Bedrooms) : query.OrderByDescending(p => p.Bedrooms),
+                _ => query.OrderBy(p => p.CurrentRent)
+            };
+
+            var total = await query.CountAsync();
+            var properties = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return Ok(new { Total = total, Properties = properties });
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> AddProperty([FromBody] PropertyDto dto)
+        {
+            var property = new Property
+            {
+                Name = dto.Name,
+                Address = dto.Address,
+                Submarket = dto.Submarket,
+                Bedrooms = dto.Bedrooms,
+                SquareFootage = dto.SquareFootage,
+                CurrentRent = dto.CurrentRent,
+                OccupancyRate = dto.OccupancyRate,
+                AvailableUnits = dto.AvailableUnits,
+                Amenities = dto.Amenities
+            };
+
+            _context.Properties.Add(property);
+            await _context.SaveChangesAsync();
+            return Ok(property);
+        }
+
+        [HttpGet("recommendations/{propertyId}")]
+        public async Task<IActionResult> GetPriceRecommendation(int propertyId)
+        {
+            var property = await _context.Properties
+                .FirstOrDefaultAsync(p => p.PropertyId == propertyId);
+
+            if (property == null)
+                return NotFound("Property not found");
+
+            var recommendation = await GeneratePriceRecommendation(property);
+            return Ok(recommendation);
+        }
+        
+        private async Task<PriceRecommendation> GeneratePriceRecommendation(Property property)
+        {
+            var peers = await _context.PeerProperties
+                .Where(pp => pp.PropertyId == property.PropertyId)
+                .ToListAsync();
+
+            var marketTrend = CalculateMarketTrend(peers);
+            var occupancyAdjustment = CalculateOccupancyAdjustment(property);
+            var peerRentAdjustment = CalculatePeerRentAdjustment(peers, property);
+
+            var baseRent = property.CurrentRent;
+            var recommendedRent = baseRent * (
+                _config.WeightMarketTrend * marketTrend +
+                _config.WeightOccupancy * occupancyAdjustment +
+                _config.WeightPeerRent * peerRentAdjustment
+            );
+
+            recommendedRent = Math.Max(
+                baseRent * _config.MinRentMultiplier,
+                Math.Min(recommendedRent, baseRent * _config.MaxRentMultiplier)
+            );
+
+            var isAutoAccepted = CheckAutoAccept(baseRent, recommendedRent);
+            var leaseExpirations = await ManageLeaseExpirations(property);
+
+            return new PriceRecommendation
+            {
+                PropertyId = property.PropertyId,
+                RecommendedRent = Math.Round(recommendedRent, 2),
+                BaseRent = baseRent,
+                IsAutoAccepted = isAutoAccepted,
+                LeaseExpirationAdjustments = leaseExpirations,
+                MarketTrendFactor = marketTrend,
+                OccupancyFactor = occupancyAdjustment,
+                PeerRentFactor = peerRentAdjustment
+            };
+        }
+
+        private double CalculateMarketTrend(List<PeerProperty> peers)
+        {
+            if (!peers.Any())
+                return 1.0;
+
+            var avgPeerRentChange = peers
+                .Average(pp => pp.PeerRent / _context.Properties
+                    .Where(p => p.Submarket == pp.PeerSubmarket)
+                    .Average(p => p.CurrentRent));
+
+            return avgPeerRentChange > 1.0 ? 1.02 : avgPeerRentChange < 1.0 ? 0.98 : 1.0;
+        }
+
+        private double CalculateOccupancyAdjustment(Property property)
+        {
+            var targetOccupancy = 0.95;
+            var adjustment = property.OccupancyRate < targetOccupancy
+                ? 0.95
+                : property.OccupancyRate > targetOccupancy
+                    ? 1.05
+                    : 1.0;
+            return adjustment;
+        }
+
+        private double CalculatePeerRentAdjustment(List<PeerProperty> peers, Property property)
+        {
+            if (!peers.Any())
+                return 1.0;
+
+            var avgPeerRent = peers.Average(pp => pp.PeerRent);
+            var rentRatio = avgPeerRent / property.CurrentRent;
+            return rentRatio > 1.0 ? 1.03 : rentRatio < 1.0 ? 0.97 : 1.0;
+        }
+
+        private bool CheckAutoAccept(double baseRent, double recommendedRent)
+        {
+            var dailyChange = Math.Abs((recommendedRent - baseRent) / baseRent);
+            var weeklyChange = dailyChange * 7;
+            return dailyChange <= _config.AutoAcceptThresholdDaily &&
+                   weeklyChange <= _config.AutoAcceptThresholdWeekly;
+        }
+
+        private async Task<Dictionary<int, double>> ManageLeaseExpirations(Property property)
+        {
+            var leases = await _context.Leases
+                .Where(l => l.PropertyId == property.PropertyId)
+                .ToListAsync();
+
+            var expirations = new Dictionary<int, double>();
+            var futureSupply = leases
+                .GroupBy(l => l.StartDate.AddMonths(l.TermMonths).Month)
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            for (int month = 1; month <= 12; month++)
+            {
+                var supply = futureSupply.ContainsKey(month) ? futureSupply[month] : 0;
+                var adjustment = supply > 5 ? 1.05 : supply < 2 ? 0.95 : 1.0;
+                expirations[month] = adjustment;
+            }
+
+            return expirations;
+        }
+    }
+
+    public class PropertyDto
+    {
+        public string Name { get; set; }
+        public string Address { get; set; }
+        public string Submarket { get; set; }
+        public int Bedrooms { get; set; }
+        public double SquareFootage { get; set; }
+        public double CurrentRent { get; set; }
+        public double OccupancyRate { get; set; }
+        public int AvailableUnits { get; set; }
+        public string Amenities { get; set; }
+    }
+
+    public class PriceRecommendation
+    {
+        public int PropertyId { get; set; }
+        public double RecommendedRent { get; set; }
+        public double BaseRent { get; set; }
+        public bool IsAutoAccepted { get; set; }
+        public Dictionary<int, double> LeaseExpirationAdjustments { get; set; }
+        public double MarketTrendFactor { get; set; }
+        public double OccupancyFactor { get; set; }
+        public double PeerRentFactor { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class BookingsController : ControllerBase
+    {
+        private readonly RentalDbContext _context;
+
+        public BookingsController(RentalDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> AddBooking([FromBody] BookingDto dto)
+        {
+            var property = await _context.Properties
+                .FirstOrDefaultAsync(p => p.PropertyId == dto.PropertyId);
+
+            if (property == null || property.AvailableUnits <= 0)
+                return BadRequest("Property not available");
+
+            var booking = new Booking
+            {
+                UserId = dto.UserId,
+                PropertyId = dto.PropertyId,
+                BookingDate = DateTime.UtcNow,
+                Status = "Pending"
+            };
+
+            property.AvailableUnits--;
+            _context.Bookings.Add(booking);
+            await _context.SaveChangesAsync();
+            return Ok(booking);
+        }
+
+        [HttpGet("user/{userId}")]
+        public async Task<IActionResult> GetUserBookings(int userId)
+        {
+            var bookings = await _context.Bookings
+                .Where(b => b.UserId == userId)
+                .Include(b => b.Property)
+                .ToListAsync();
+
+            return Ok(bookings);
+        }
+
+        [HttpPut("{bookingId}/confirm")]
+        public async Task<IActionResult> ConfirmBooking(int bookingId)
+        {
+            var booking = await _context.Bookings
+                .FirstOrDefaultAsync(b => b.BookingId == bookingId);
+
+            if (booking == null)
+                return NotFound("Booking not found");
+
+            booking.Status = "Confirmed";
+            await _context.SaveChangesAsync();
+            return Ok(booking);
+        }
+
+        [HttpDelete("{bookingId}")]
+        public async Task<IActionResult> CancelBooking(int bookingId)
+        {
+            var booking = await _context.Bookings
+                .FirstOrDefaultAsync(b => b.BookingId == bookingId);
+
+            if (booking == null)
+                return NotFound("Booking not found");
+
+            var property = await _context.Properties
+                .FirstOrDefaultAsync(p => p.PropertyId == booking.PropertyId);
+
+            if (property != null)
+                property.AvailableUnits++;
+
+            _context.Bookings.Remove(booking);
+            await _context.SaveChangesAsync();
+            return Ok();
+        }
+    }
+
+    public class BookingDto
+    {
+        public int UserId { get; set; }
+        public int PropertyId { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class LeasesController : ControllerBase
+    {
+        private readonly RentalDbContext _context;
+
+        public LeasesController(RentalDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> AddLease([FromBody] LeaseDto dto)
+        {
+            var lease = new Lease
+            {
+                PropertyId = dto.PropertyId,
+                EffectiveRent = dto.EffectiveRent,
+                TermMonths = dto.TermMonths,
+                StartDate = dto.StartDate,
+                Discount = dto.Discount
+            };
+
+            _context.Leases.Add(lease);
+            await _context.SaveChangesAsync();
+            return Ok(lease);
+        }
+
+        [HttpGet("property/{propertyId}")]
+        public async Task<IActionResult> GetPropertyLeases(int propertyId)
+        {
+            var leases = await _context.Leases
+                .Where(l => l.PropertyId == propertyId)
+                .ToListAsync();
+
+            return Ok(leases);
+        }
+    }
+
+    public class LeaseDto
+    {
+        public int PropertyId { get; set; }
+        public double EffectiveRent { get; set; }
+        public int TermMonths { get; set; }
+        public DateTime StartDate { get; set; }
+        public double Discount { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PeerPropertiesController : ControllerBase
+    {
+        private readonly RentalDbContext _context;
+
+        public PeerPropertiesController(RentalDbContext context)
+        {
+            _context = context;
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> AddPeerProperty([FromBody] PeerPropertyDto dto)
+        {
+            var peer = new PeerProperty
+            {
+                PropertyId = dto.PropertyId,
+                PeerSubmarket = dto.PeerSubmarket,
+                PeerRent = dto.PeerRent,
+                PeerOccupancy = dto.PeerOccupancy,
+                PeerBedrooms = dto.PeerBedrooms
+            };
+
+            _context.PeerProperties.Add(peer);
+            await _context.SaveChangesAsync();
+            return Ok(peer);
+        }
+
+        [HttpGet("property/{propertyId}")]
+        public async Task<IActionResult> GetPeerProperties(int propertyId)
+        {
+            var peers = await _context.PeerProperties
+                .Where(pp => pp.PropertyId == propertyId)
+                .ToListAsync();
+
+            return Ok(peers);
+        }
+    }
+
+    public class PeerPropertyDto
+    {
+        public int PropertyId { get; set; }
+        public string PeerSubmarket { get; set; }
+        public double PeerRent { get; set; }
+        public double PeerOccupancy { get; set; }
+        public int PeerBedrooms { get; set; }
+    }
+}

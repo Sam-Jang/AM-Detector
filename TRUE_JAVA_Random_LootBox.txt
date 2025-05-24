@@ -1,0 +1,504 @@
+package com.game.backend;
+
+import jakarta.persistence.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.stream.Collectors;
+import jakarta.annotation.PostConstruct;
+
+@Entity
+@Table(name = "Items")
+class Item {
+    @Id
+    private int id;
+    private String name;
+    private String rarity;
+    private double price;
+    private double baseProbability;
+    private int popularity;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getRarity() { return rarity; }
+    public void setRarity(String rarity) { this.rarity = rarity; }
+    public double getPrice() { return price; }
+    public void setPrice(double price) { this.price = price; }
+    public double getBaseProbability() { return baseProbability; }
+    public void setBaseProbability(double baseProbability) { this.baseProbability = baseProbability; }
+    public int getPopularity() { return popularity; }
+    public void setPopularity(int popularity) { this.popularity = popularity; }
+}
+
+@Entity
+@Table(name = "Users")
+class User {
+    @Id
+    private int id;
+    private String username;
+    private double balance;
+    private int totalSpent;
+    private int purchaseCount;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+    public double getBalance() { return balance; }
+    public void setBalance(double balance) { this.balance = balance; }
+    public int getTotalSpent() { return totalSpent; }
+    public void setTotalSpent(int totalSpent) { this.totalSpent = totalSpent; }
+    public int getPurchaseCount() { return purchaseCount; }
+    public void setPurchaseCount(int purchaseCount) { this.purchaseCount = purchaseCount; }
+}
+
+class Cart {
+    private int userId;
+    private List<CartItem> items = new ArrayList<>();
+
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public List<CartItem> getItems() { return items; }
+    public void setItems(List<CartItem> items) { this.items = items; }
+}
+
+class CartItem {
+    private int itemId;
+    private int quantity;
+
+    public int getItemId() { return itemId; }
+    public void setItemId(int itemId) { this.itemId = itemId; }
+    public int getQuantity() { return quantity; }
+    public void setQuantity(int quantity) { this.quantity = quantity; }
+}
+
+@Entity
+@Table(name = "Transactions")
+class Transaction {
+    @Id
+    private int id;
+    private int userId;
+    private int itemId;
+    private double amount;
+    private String timestamp;
+
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public int getUserId() { return userId; }
+    public void setUserId(int userId) { this.userId = userId; }
+    public int getItemId() { return itemId; }
+    public void setItemId(int itemId) { this.itemId = itemId; }
+    public double getAmount() { return amount; }
+    public void setAmount(double amount) { this.amount = amount; }
+    public String getTimestamp() { return timestamp; }
+    public void setTimestamp(String timestamp) { this.timestamp = timestamp; }
+}
+
+class ProbabilityConfig {
+    private Map<String, Double> rarityWeights;
+    private Map<String, Double> spendingModifiers;
+
+    public Map<String, Double> getRarityWeights() { return rarityWeights; }
+    public void setRarityWeights(Map<String, Double> rarityWeights) { this.rarityWeights = rarityWeights; }
+    public Map<String, Double> getSpendingModifiers() { return spendingModifiers; }
+    public void setSpendingModifiers(Map<String, Double> spendingModifiers) { this.spendingModifiers = spendingModifiers; }
+}
+
+@Service
+class DatabaseManager {
+    @PersistenceUnit
+    private EntityManagerFactory emf;
+    private String dbPath;
+
+    @PostConstruct
+    public void init() {
+        dbPath = Paths.get(System.getProperty("user.home"), "game.db").toString();
+        initializeDatabase();
+    }
+
+    private void initializeDatabase() {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            em.createNativeQuery(
+                "CREATE TABLE IF NOT EXISTS Items (" +
+                "Id INTEGER PRIMARY KEY, Name TEXT, Rarity TEXT, Price REAL, BaseProbability REAL, Popularity INTEGER)"
+            ).executeUpdate();
+            em.createNativeQuery(
+                "CREATE TABLE IF NOT EXISTS Users (" +
+                "Id INTEGER PRIMARY KEY, Username TEXT, Balance REAL, TotalSpent INTEGER, PurchaseCount INTEGER)"
+            ).executeUpdate();
+            em.createNativeQuery(
+                "CREATE TABLE IF NOT EXISTS Carts (" +
+                "UserId INTEGER, ItemId INTEGER, Quantity INTEGER)"
+            ).executeUpdate();
+            em.createNativeQuery(
+                "CREATE TABLE IF NOT EXISTS Transactions (" +
+                "Id INTEGER PRIMARY KEY, UserId INTEGER, ItemId INTEGER, Amount REAL, Timestamp TEXT)"
+            ).executeUpdate();
+            em.createNativeQuery(
+                "INSERT OR IGNORE INTO Items (Id, Name, Rarity, Price, BaseProbability, Popularity) VALUES " +
+                "(1, 'Common Sword', 'Common', 10.0, 0.5, 100), " +
+                "(2, 'Rare Armor', 'Rare', 50.0, 0.3, 50), " +
+                "(3, 'Epic Staff', 'Epic', 100.0, 0.15, 25), " +
+                "(4, 'Legendary Crown', 'Legendary', 500.0, 0.05, 10)"
+            ).executeUpdate();
+            em.createNativeQuery(
+                "INSERT OR IGNORE INTO Users (Id, Username, Balance, TotalSpent, PurchaseCount) VALUES " +
+                "(1, 'player1', 1000.0, 0, 0), " +
+                "(2, 'player2', 500.0, 100, 2)"
+            ).executeUpdate();
+            tx.commit();
+        } finally {
+            em.close();
+        }
+    }
+
+    public List<Item> getItems() {
+        EntityManager em = emf.createEntityManager();
+        try {
+            return em.createQuery("SELECT i FROM Item i", Item.class).getResultList();
+        } finally {
+            em.close();
+        }
+    }
+
+    public User getUser(int userId) {
+        EntityManager em = emf.createEntityManager();
+        try {
+            return em.find(User.class, userId);
+        } finally {
+            em.close();
+        }
+    }
+
+    public void updateUser(User user) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            em.merge(user);
+            tx.commit();
+        } finally {
+            em.close();
+        }
+    }
+
+    public Cart getCart(int userId) {
+        EntityManager em = emf.createEntityManager();
+        try {
+            Cart cart = new Cart();
+            cart.setUserId(userId);
+            List<Object[]> results = em.createNativeQuery(
+                "SELECT ItemId, Quantity FROM Carts WHERE UserId = :userId"
+            ).setParameter("userId", userId).getResultList();
+            for (Object[] row : results) {
+                CartItem item = new CartItem();
+                item.setItemId((Integer) row[0]);
+                item.setQuantity((Integer) row[1]);
+                cart.getItems().add(item);
+            }
+            return cart;
+        } finally {
+            em.close();
+        }
+    }
+
+    public void addToCart(int userId, int itemId, int quantity) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            em.createNativeQuery(
+                "INSERT INTO Carts (UserId, ItemId, Quantity) VALUES (:userId, :itemId, :quantity)"
+            ).setParameter("userId", userId).setParameter("itemId", itemId).setParameter("quantity", quantity).executeUpdate();
+            tx.commit();
+        } finally {
+            em.close();
+        }
+    }
+
+    public void clearCart(int userId) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            em.createNativeQuery("DELETE FROM Carts WHERE UserId = :userId")
+                .setParameter("userId", userId).executeUpdate();
+            tx.commit();
+        } finally {
+            em.close();
+        }
+    }
+
+    public void logTransaction(int userId, int itemId, double amount) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            em.createNativeQuery(
+                "INSERT INTO Transactions (UserId, ItemId, Amount, Timestamp) VALUES (:userId, :itemId, :amount, :timestamp)"
+            ).setParameter("userId", userId).setParameter("itemId", itemId).setParameter("amount", amount)
+             .setParameter("timestamp", new Timestamp(System.currentTimeMillis()).toString()).executeUpdate();
+            tx.commit();
+        } finally {
+            em.close();
+        }
+    }
+}
+
+@Service
+class ConfigManager {
+    @Autowired
+    private ResourceLoader resourceLoader;
+
+    public ProbabilityConfig loadProbabilityConfig() throws IOException {
+        Resource resource = resourceLoader.getResource("classpath:probability_config.json");
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.readValue(resource.getInputStream(), ProbabilityConfig.class);
+    }
+}
+
+@Service
+class LootBoxManager {
+    private DatabaseManager dbManager;
+    private ConfigManager configManager;
+    private Random random = new Random();
+
+    @Autowired
+    public LootBoxManager(DatabaseManager dbManager, ConfigManager configManager) {
+        this.dbManager = dbManager;
+        this.configManager = configManager;
+    }
+
+    public Item drawItem(int userId) throws IOException {
+        User user = dbManager.getUser(userId);
+        List<Item> items = dbManager.getItems();
+        ProbabilityConfig config = configManager.loadProbabilityConfig();
+
+        double totalWeight = 0.0;
+        List<Map.Entry<Item, Double>> weights = new ArrayList<>();
+
+        for (Item item : items) {
+            double weight = item.getBaseProbability();
+            weight *= config.getRarityWeights().get(item.getRarity());
+            if (user.getTotalSpent() > 1000) {
+                weight *= config.getSpendingModifiers().get("HighSpender");
+            } else if (user.getTotalSpent() < 100) {
+                weight *= config.getSpendingModifiers().get("LowSpender");
+            }
+            weights.add(new AbstractMap.SimpleEntry<>(item, weight));
+            totalWeight += weight;
+        }
+
+        double roll = random.nextDouble() * totalWeight;
+        double current = 0.0;
+
+        for (Map.Entry<Item, Double> entry : weights \"\"Item item = entry.getKey();
+                return item;
+            }
+        }
+        return items.get(items.size() - 1);
+    }
+}
+
+@Service
+class ItemService {
+    private DatabaseManager dbManager;
+
+    @Autowired
+    public ItemService(DatabaseManager dbManager) {
+        this.dbManager = dbManager;
+    }
+
+    public List<Item> searchItems(String keyword, String sortBy) {
+        List<Item> items = dbManager.getItems();
+        if (keyword != null && !keyword.isEmpty()) {
+            items = items.stream()
+                .filter(i -> i.getName().toLowerCase().contains(keyword.toLowerCase()))
+                .collect(Collectors.toList());
+        }
+        switch (sortBy.toLowerCase()) {
+            case "price":
+                items.sort(Comparator.comparingDouble(Item::getPrice));
+                break;
+            case "rarity":
+                items.sort(Comparator.comparingInt(i -> getRarityValue(i.getRarity())));
+                break;
+            case "popularity":
+                items.sort((a, b) -> Integer.compare(b.getPopularity(), a.getPopularity()));
+                break;
+        }
+        return items;
+    }
+
+    private int getRarityValue(String rarity) {
+        switch (rarity) {
+            case "Common": return 1;
+            case "Rare": return 2;
+            case "Epic": return 3;
+            case "Legendary": return 4;
+            default: return 0;
+        }
+    }
+}
+
+@Service
+class CartService {
+    private DatabaseManager dbManager;
+
+    @Autowired
+    public CartService(DatabaseManager dbManager) {
+        this.dbManager = dbManager;
+    }
+
+    public Cart getCart(int userId) {
+        return dbManager.getCart(userId);
+    }
+
+    public void addToCart(int userId, int itemId, int quantity) {
+        dbManager.addToCart(userId, itemId, quantity);
+    }
+
+    public String checkout(int userId) {
+        Cart cart = dbManager.getCart(userId);
+        User user = dbManager.getUser(userId);
+        List<Item> items = dbManager.getItems();
+
+        double totalCost = cart.getItems().stream()
+            .mapToDouble(cartItem -> {
+                Item item = items.stream().filter(i -> i.getId() == cartItem.getItemId()).findFirst().orElse(null);
+                return item != null ? item.getPrice() * cartItem.getQuantity() : 0;
+            }).sum();
+
+        if (user.getBalance() >= totalCost) {
+            user.setBalance(user.getBalance() - totalCost);
+            user.setTotalSpent(user.getTotalSpent() + (int) totalCost);
+            user.setPurchaseCount(user.getPurchaseCount() + 1);
+            dbManager.updateUser(user);
+            cart.getItems().forEach(cartItem -> {
+                Item item = items.stream().filter(i -> i.getId() == cartItem.getItemId()).findFirst().orElse(null);
+                if (item != null) {
+                    dbManager.logTransaction(userId, cartItem.getItemId(), item.getPrice() * cartItem.getQuantity());
+                }
+            });
+            dbManager.clearCart(userId);
+            return "Checkout successful";
+        }
+        return "Insufficient balance";
+    }
+}
+
+@Service
+class TransactionService {
+    private DatabaseManager dbManager;
+
+    @Autowired
+    public TransactionService(DatabaseManager dbManager) {
+        this.dbManager = dbManager;
+    }
+
+    public List<Transaction> getUserTransactions(int userId) {
+        EntityManager em = dbManager.emf.createEntityManager();
+        try {
+            return em.createQuery("SELECT t FROM Transaction t WHERE t.userId = :userId", Transaction.class)
+                .setParameter("userId", userId).getResultList();
+        } finally {
+            em.close();
+        }
+    }
+}
+
+@Service
+public class GameBackendJava {
+    private DatabaseManager dbManager;
+    private ConfigManager configManager;
+    private LootBoxManager lootBoxManager;
+    private ItemService itemService;
+    private CartService cartService;
+    private TransactionService transactionService;
+
+    @Autowired
+    public GameBackendJava(DatabaseManager dbManager, ConfigManager configManager, LootBoxManager lootBoxManager,
+                           ItemService itemService, CartService cartService, TransactionService transactionService) {
+        this.dbManager = dbManager;
+        this.configManager = configManager;
+        this.lootBoxManager = lootBoxManager;
+        this.itemService = itemService;
+        this.cartService = cartService;
+        this.transactionService = transactionService;
+    }
+
+    public Item drawItem(int userId) throws IOException {
+        return lootBoxManager.drawItem(userId);
+    }
+
+    public List<Item> searchItems(String keyword, String sortBy) {
+        return itemService.searchItems(keyword, sortBy);
+    }
+
+    public Cart getCart(int userId) {
+        return cartService.getCart(userId);
+    }
+
+    public void addToCart(int userId, int itemId, int quantity) {
+        cartService.addToCart(userId, itemId, quantity);
+    }
+
+    public String checkout(int userId) {
+        return cartService.checkout(userId);
+    }
+
+    public List<Transaction> getTransactions(int userId) {
+        return transactionService.getUserTransactions(userId);
+    }
+
+    public static class DrawRequest {
+        private int userId;
+
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+    }
+
+    public static class AddToCartRequest {
+        private int userId;
+        private int itemId;
+        private int quantity;
+
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+        public int getItemId() { return itemId; }
+        public void setItemId(int itemId) { this.itemId = itemId; }
+        public int getQuantity() { return quantity; }
+        public void setQuantity(int quantity) { this.quantity = quantity; }
+    }
+
+    public static class CheckoutRequest {
+        private int userId;
+
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+    }
+
+    public static class DrawResponse {
+        private int itemId;
+        private String itemName;
+        private String rarity;
+
+        public int getItemId() { return itemId; }
+        public void setItemId(int itemId) { this.itemId = itemId; }
+        public String getItemName() { return itemName; }
+        public void setItemName(String itemName) { this.itemName = itemName; }
+        public String getRarity() { return rarity; }
+        public void setRarity(String rarity) { this.rarity = rarity; }
+    }
+}

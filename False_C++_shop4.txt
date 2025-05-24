@@ -1,0 +1,324 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <mysql/mysql.h>
+
+using namespace std;
+
+class Customer {
+public:
+    string username;
+    string password;
+    string address;
+
+    Customer(string username, string password, string address) : username(username), password(password), address(address) {}
+};
+
+class ProductCategory {
+public:
+    string name;
+    string description;
+
+    ProductCategory(string name, string description) : name(name), description(description) {}
+};
+
+class Item {
+public:
+    string name;
+    string description;
+    double price;
+    string category;
+    int stock;
+    vector<string> likedBy;
+
+    Item(string name, string description, double price, string category, int stock)
+        : name(name), description(description), price(price), category(category), stock(stock) {}
+};
+
+class Purchase {
+public:
+    Customer buyer;
+    Item product;
+    int quantity;
+
+    Purchase(Customer buyer, Item product, int quantity) : buyer(buyer), product(product), quantity(quantity) {}
+};
+
+class PromotionBanner {
+public:
+    string title;
+    string image;
+    string url;
+
+    PromotionBanner(string title, string image, string url) : title(title), image(image), url(url) {}
+};
+
+class OnlineStore {
+private:
+    vector<Customer> customers;
+    vector<ProductCategory> categories;
+    vector<Item> items;
+    vector<PromotionBanner> banners;
+    vector<Purchase> cart;
+    Customer* currentCustomer = nullptr;
+
+    const string connectionString = "localhost";
+
+    void loadCustomers() {
+        MYSQL* conn;
+        MYSQL_RES* res;
+        MYSQL_ROW row;
+
+        conn = mysql_init(NULL);
+        mysql_real_connect(conn, connectionString.c_str(), "root", "yourpassword", "everythingforsale", 3306, NULL, 0);
+
+        string sql = "SELECT username, password, address FROM customers";
+        mysql_query(conn, sql.c_str());
+        res = mysql_store_result(conn);
+
+        while ((row = mysql_fetch_row(res)) != NULL) {
+            customers.push_back(Customer(row[0], row[1], row[2]));
+        }
+
+        mysql_free_result(res);
+        mysql_close(conn);
+    }
+
+    void loadCategories() {
+        MYSQL* conn;
+        MYSQL_RES* res;
+        MYSQL_ROW row;
+
+        conn = mysql_init(NULL);
+        mysql_real_connect(conn, connectionString.c_str(), "root", "yourpassword", "everythingforsale", 3306, NULL, 0);
+
+        string sql = "SELECT name, description FROM categories";
+        mysql_query(conn, sql.c_str());
+        res = mysql_store_result(conn);
+
+        while ((row = mysql_fetch_row(res)) != NULL) {
+            categories.push_back(ProductCategory(row[0], row[1]));
+        }
+
+        mysql_free_result(res);
+        mysql_close(conn);
+    }
+
+    void loadItems() {
+        MYSQL* conn;
+        MYSQL_RES* res;
+        MYSQL_ROW row;
+
+        conn = mysql_init(NULL);
+        mysql_real_connect(conn, connectionString.c_str(), "root", "yourpassword", "everythingforsale", 3306, NULL, 0);
+
+        string sql = "SELECT name, description, price, category, stock FROM items";
+        mysql_query(conn, sql.c_str());
+        res = mysql_store_result(conn);
+
+        while ((row = mysql_fetch_row(res)) != NULL) {
+            items.push_back(Item(row[0], row[1], stod(row[2]), row[3], stoi(row[4])));
+        }
+
+        mysql_free_result(res);
+        mysql_close(conn);
+    }
+
+    void loadBanners() {
+        MYSQL* conn;
+        MYSQL_RES* res;
+        MYSQL_ROW row;
+
+        conn = mysql_init(NULL);
+        mysql_real_connect(conn, connectionString.c_str(), "root", "yourpassword", "everythingforsale", 3306, NULL, 0);
+
+        string sql = "SELECT title, image, url FROM banners";
+        mysql_query(conn, sql.c_str());
+        res = mysql_store_result(conn);
+
+        while ((row = mysql_fetch_row(res)) != NULL) {
+            banners.push_back(PromotionBanner(row[0], row[1], row[2]));
+        }
+
+        mysql_free_result(res);
+        mysql_close(conn);
+    }
+
+public:
+    OnlineStore() {
+        loadCustomers();
+        loadCategories();
+        loadItems();
+        loadBanners();
+    }
+
+    bool login(string username, string password) {
+        for (Customer& customer : customers) {
+            if (customer.username == username && customer.password == password) {
+                currentCustomer = &customer;
+                cout << "Logged in as " << username << endl;
+                return true;
+            }
+        }
+        cout << "Login failed" << endl;
+        return false;
+    }
+
+    void registerCustomer(string username, string password, string address) {
+        MYSQL* conn;
+        conn = mysql_init(NULL);
+        mysql_real_connect(conn, connectionString.c_str(), "root", "yourpassword", "everythingforsale", 3306, NULL, 0);
+
+        string sql = "INSERT INTO customers (username, password, address) VALUES ('" + username + "', '" + password + "', '" + address + "')";
+        mysql_query(conn, sql.c_str());
+
+        customers.push_back(Customer(username, password, address));
+        cout << "Customer registered successfully!" << endl;
+
+        mysql_close(conn);
+    }
+
+    void searchItems(string query) {
+        cout << "Search results for '" << query << "':" << endl;
+        for (Item& item : items) {
+            if (item.name.find(query) != string::npos || item.description.find(query) != string::npos) {
+                cout << item.name << " - " << item.price << " USD" << endl;
+            }
+        }
+    }
+
+    void filterItemsByCategory(string category) {
+        cout << "Items in category '" << category << "':" << endl;
+        for (Item& item : items) {
+            if (item.category == category) {
+                cout << item.name << " - " << item.price << " USD" << endl;
+            }
+        }
+    }
+
+    void toggleWishlistItem(string productName) {
+        if (currentCustomer == nullptr) {
+            cout << "Please login first." << endl;
+            return;
+        }
+        auto it = find_if(items.begin(), items.end(), [&](Item& item) { return item.name == productName; });
+        if (it != items.end()) {
+            if (find(it->likedBy.begin(), it->likedBy.end(), currentCustomer->username) != it->likedBy.end()) {
+                it->likedBy.erase(remove(it->likedBy.begin(), it->likedBy.end(), currentCustomer->username), it->likedBy.end());
+                cout << "Item removed from wishlist." << endl;
+            } else {
+                it->likedBy.push_back(currentCustomer->username);
+                cout << "Item added to wishlist." << endl;
+            }
+        } else {
+            cout << "Item not found." << endl;
+        }
+    }
+
+    void addToCart(string productName, int quantity) {
+        if (currentCustomer == nullptr) {
+            cout << "Please login first." << endl;
+            return;
+        }
+        auto it = find_if(items.begin(), items.end(), [&](Item& item) { return item.name == productName; });
+        if (it != items.end()) {
+            cart.push_back(Purchase(*currentCustomer, *it, quantity));
+            cout << productName << " added to cart." << endl;
+        } else {
+            cout << "Item not found." << endl;
+        }
+    }
+
+    void viewCart() {
+        if (currentCustomer == nullptr) {
+            cout << "Please login first." << endl;
+            return;
+        }
+        cout << "Your Cart:" << endl;
+        for (Purchase& purchase : cart) {
+            if (purchase.buyer.username == currentCustomer->username) {
+                cout << purchase.product.name << " - " << purchase.quantity << " units - " << purchase.product.price * purchase.quantity << " USD" << endl;
+            }
+        }
+    }
+
+    void checkout() {
+        if (currentCustomer == nullptr) {
+            cout << "Please login first." << endl;
+            return;
+        }
+        double total = 0;
+        for (Purchase& purchase : cart) {
+            if (purchase.buyer.username == currentCustomer->username) {
+                total += purchase.product.price * purchase.quantity;
+            }
+        }
+        cout << "Total amount to pay: " << total << " USD" << endl;
+        cout << "Order placed successfully!" << endl;
+        cart.erase(remove_if(cart.begin(), cart.end(), [&](Purchase& purchase) { return purchase.buyer.username == currentCustomer->username; }), cart.end());
+    }
+
+    void run() {
+        string command;
+        while (true) {
+            cout << "\nEnter a command (register, login, search, category, wishlist, add, cart, checkout, exit): ";
+            cin >> command;
+
+            if (command == "register") {
+                string username, password, address;
+                cout << "Username: ";
+                cin >> username;
+                cout << "Password: ";
+                cin >> password;
+                cout << "Address: ";
+                cin >> address;
+                registerCustomer(username, password, address);
+            } else if (command == "login") {
+                string username, password;
+                cout << "Username: ";
+                cin >> username;
+                cout << "Password: ";
+                cin >> password;
+                login(username, password);
+            } else if (command == "search") {
+                string query;
+                cout << "Query: ";
+                cin >> query;
+                searchItems(query);
+            } else if (command == "category") {
+                string category;
+                cout << "Category: ";
+                cin >> category;
+                filterItemsByCategory(category);
+            } else if (command == "wishlist") {
+                string productName;
+                cout << "Product Name: ";
+                cin >> productName;
+                toggleWishlistItem(productName);
+            } else if (command == "add") {
+                string productName;
+                int quantity;
+                cout << "Product Name: ";
+                cin >> productName;
+                cout << "Quantity: ";
+                cin >> quantity;
+                addToCart(productName, quantity);
+            } else if (command == "cart") {
+                viewCart();
+            } else if (command == "checkout") {
+                checkout();
+            } else if (command == "exit") {
+                break;
+            } else {
+                cout << "Invalid command." << endl;
+            }
+        }
+    }
+};
+
+int main() {
+    OnlineStore store;
+    store.run();
+    return 0;
+}

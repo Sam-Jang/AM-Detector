@@ -1,0 +1,341 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+public class Product
+{
+    public long Id { get; set; }
+    public string Name { get; set; }
+    public double Price { get; set; }
+    public string Description { get; set; }
+    public string Image { get; set; }
+    public int Stock { get; set; }
+
+    public override string ToString()
+    {
+        return Name;
+    }
+}
+
+public class Order
+{
+    public long Id { get; set; }
+    public User User { get; set; }
+    public Product Product { get; set; }
+    public int Quantity { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+    public bool Shipped { get; set; } = false;
+
+    public override string ToString()
+    {
+        return $"Order {Id} by {User.Username}";
+    }
+}
+
+public class CartItem
+{
+    public long Id { get; set; }
+    public User User { get; set; }
+    public Product Product { get; set; }
+    public int Quantity { get; set; } = 1;
+
+    public override string ToString()
+    {
+        return $"{Product.Name} ({Quantity})";
+    }
+}
+
+public class Review
+{
+    public long Id { get; set; }
+    public Product Product { get; set; }
+    public User User { get; set; }
+    public int Rating { get; set; }
+    public string Comment { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+
+    public override string ToString()
+    {
+        return $"{Rating} by {User.Username} on {Product.Name}";
+    }
+}
+
+public class SupportTicket
+{
+    public long Id { get; set; }
+    public User User { get; set; }
+    public string Subject { get; set; }
+    public string Message { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+    public bool Resolved { get; set; } = false;
+
+    public override string ToString()
+    {
+        return $"Ticket {Id} by {User.Username}";
+    }
+}
+
+public class User
+{
+    public long Id { get; set; }
+    public string Username { get; set; }
+}
+
+public class ApplicationDbContext : DbContext
+{
+    public DbSet<Product> Products { get; set; }
+    public DbSet<Order> Orders { get; set; }
+    public DbSet<CartItem> CartItems { get; set; }
+    public DbSet<Review> Reviews { get; set; }
+    public DbSet<SupportTicket> SupportTickets { get; set; }
+}
+
+[Route("/")]
+public class MainController : Controller
+{
+    private readonly ApplicationDbContext _context;
+
+    public MainController(ApplicationDbContext context)
+    {
+        _context = context;
+    }
+
+    [HttpGet("products")]
+    public async Task<IActionResult> ProductList(string q, string sort_by, int pageSize = 10, int page = 1)
+    {
+        var products = await _context.Products.AsNoTracking().ToListAsync();
+
+        if (!string.IsNullOrEmpty(q))
+        {
+            products = products.Where(p => p.Name.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        if (sort_by == "price")
+        {
+            products = products.OrderBy(p => p.Price).ToList();
+        }
+        else if (sort_by == "name")
+        {
+            products = products.OrderBy(p => p.Name).ToList();
+        }
+
+        var paginatedProducts = products.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+
+        ViewBag.TotalPages = Math.Ceiling((double)products.Count / pageSize);
+        ViewBag.CurrentPage = page;
+
+        return View("ProductList", paginatedProducts);
+    }
+
+    [HttpGet("products/{id}")]
+    public async Task<IActionResult> ProductDetail(long id)
+    {
+        var product = await _context.Products.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id);
+        if (product == null)
+        {
+            return NotFound($"Invalid product Id: {id}");
+        }
+        return View("ProductDetail", product);
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("purchase/{productId}")]
+    public async Task<IActionResult> PurchaseProduct(long productId, int quantity, [FromServices] User user)
+    {
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+        {
+            return BadRequest($"Invalid product Id: {productId}");
+        }
+
+        if (product.Stock >= quantity)
+        {
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            try
+            {
+                product.Stock -= quantity;
+                _context.Products.Update(product);
+                await _context.SaveChangesAsync();
+
+                var order = new Order
+                {
+                    User = user,
+                    Product = product,
+                    Quantity = quantity
+                };
+                await _context.Orders.AddAsync(order);
+                await _context.SaveChangesAsync();
+
+                await transaction.CommitAsync();
+
+                return RedirectToAction("OrderSuccess");
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                return BadRequest("An error occurred during the purchase.");
+            }
+        }
+
+        return BadRequest("Not enough stock");
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpGet("order_history")]
+    public async Task<IActionResult> OrderHistory([FromServices] User user)
+    {
+        var orders = await _context.Orders
+            .Where(o => o.User.Id == user.Id)
+            .Include(o => o.Product)
+            .AsNoTracking()
+            .ToListAsync();
+
+        return View("OrderHistory", orders);
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("cart/add/{productId}")]
+    public async Task<IActionResult> AddToCart(long productId, [FromServices] User user)
+    {
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+        {
+            return BadRequest($"Invalid product Id: {productId}");
+        }
+
+        var cartItem = await _context.CartItems
+            .FirstOrDefaultAsync(c => c.User.Id == user.Id && c.Product.Id == productId);
+
+        if (cartItem == null)
+        {
+            cartItem = new CartItem
+            {
+                User = user,
+                Product = product
+            };
+            await _context.CartItems.AddAsync(cartItem);
+        }
+        else
+        {
+            cartItem.Quantity++;
+            _context.CartItems.Update(cartItem);
+        }
+
+        await _context.SaveChangesAsync();
+
+        return RedirectToAction("CartDetail");
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpGet("cart")]
+    public async Task<IActionResult> CartDetail([FromServices] User user)
+    {
+        var cartItems = await _context.CartItems
+            .Where(c => c.User.Id == user.Id)
+            .Include(c => c.Product)
+            .AsNoTracking()
+            .ToListAsync();
+
+        return View("CartDetail", cartItems);
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("cart/cleanup")]
+    public async Task<IActionResult> CleanupCart([FromServices] User user)
+    {
+        var cartItems = await _context.CartItems
+            .Where(c => c.User.Id == user.Id && c.Product.Stock < c.Quantity)
+            .ToListAsync();
+
+        if (cartItems.Any())
+        {
+            _context.CartItems.RemoveRange(cartItems);
+            await _context.SaveChangesAsync();
+        }
+
+        return RedirectToAction("CartDetail");
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("order/cancel/{orderId}")]
+    public async Task<IActionResult> CancelOrder(long orderId, [FromServices] User user)
+    {
+        var order = await _context.Orders
+            .Include(o => o.Product)
+            .FirstOrDefaultAsync(o => o.Id == orderId && o.User.Id == user.Id);
+
+        if (order == null)
+        {
+            return NotFound($"Invalid order Id: {orderId}");
+        }
+
+        if (order.Shipped)
+        {
+            return BadRequest("Order has already been shipped and cannot be cancelled.");
+        }
+
+        var product = order.Product;
+        product.Stock += order.Quantity;
+
+        _context.Orders.Remove(order);
+        _context.Products.Update(product);
+        await _context.SaveChangesAsync();
+
+        return RedirectToAction("OrderHistory");
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("review/add/{productId}")]
+    public async Task<IActionResult> AddReview(long productId, int rating, string comment, [FromServices] User user)
+    {
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+        {
+            return BadRequest($"Invalid product Id: {productId}");
+        }
+
+        var review = new Review
+        {
+            User = user,
+            Product = product,
+            Rating = rating,
+            Comment = comment
+        };
+        await _context.Reviews.AddAsync(review);
+        await _context.SaveChangesAsync();
+
+        return RedirectToAction("ProductDetail", new { id = productId });
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpGet("support")]
+    public async Task<IActionResult> SupportTickets([FromServices] User user)
+    {
+        var tickets = await _context.SupportTickets
+            .Where(t => t.User.Id == user.Id)
+            .AsNoTracking()
+            .ToListAsync();
+
+        return View("SupportTickets", tickets);
+    }
+
+    [Authorize(Roles = "User")]
+    [HttpPost("support/create")]
+    public async Task<IActionResult> CreateTicket(string subject, string message, [FromServices] User user)
+    {
+        var ticket = new SupportTicket
+        {
+            User = user,
+            Subject = subject,
+            Message = message
+        };
+        await _context.SupportTickets.AddAsync(ticket);
+        await _context.SaveChangesAsync();
+
+        return RedirectToAction("SupportTickets");
+    }
+}

@@ -1,0 +1,738 @@
+package com.rentalmanagement;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.CorsFilter;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@SpringBootApplication
+public class RentalManagementApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RentalManagementApplication.class, args);
+    }
+
+    @Configuration
+    public class AppConfig {
+        @Bean
+        public PasswordEncoder passwordEncoder() {
+            return new BCryptPasswordEncoder();
+        }
+
+        @Bean
+        public CorsFilter corsFilter() {
+            UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+            CorsConfiguration config = new CorsConfiguration();
+            config.setAllowCredentials(true);
+            config.addAllowedOriginPattern("*");
+            config.addAllowedHeader("*");
+            config.addAllowedMethod("*");
+            source.registerCorsConfiguration("/**", config);
+            return new CorsFilter(source);
+        }
+    }
+
+    @Entity
+    public class User {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private int userId;
+
+        @NotNull
+        private String username;
+
+        @NotNull
+        private String passwordHash;
+
+        @NotNull
+        private String role;
+
+        @NotNull
+        private String email;
+
+        // Getters and Setters
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+        public String getPasswordHash() { return passwordHash; }
+        public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+        public String getRole() { return role; }
+        public void setRole(String role) { this.role = role; }
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+    }
+
+    @Entity
+    public class Property {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private int propertyId;
+
+        private String name;
+        private String address;
+        private String submarket;
+        private int bedrooms;
+        private double squareFootage;
+        private double currentRent;
+        private double occupancyRate;
+        private int availableUnits;
+        private String amenities;
+
+        // Getters and Setters
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public String getName() { return name; }
+        public void setName(String name) { this.name = name; }
+        public String getAddress() { return address; }
+        public void setAddress(String address) { this.address = address; }
+        public String getSubmarket() { return submarket; }
+        public void setSubmarket(String submarket) { this.submarket = submarket; }
+        public int getBedrooms() { return bedrooms; }
+        public void setBedrooms(int bedrooms) { this.bedrooms = bedrooms; }
+        public double getSquareFootage() { return squareFootage; }
+        public void setSquareFootage(double squareFootage) { this.squareFootage = squareFootage; }
+        public double getCurrentRent() { return currentRent; }
+        public void setCurrentRent(double currentRent) { this.currentRent = currentRent; }
+        public double getOccupancyRate() { return occupancyRate; }
+        public void setOccupancyRate(double occupancyRate) { this.occupancyRate = occupancyRate; }
+        public int getAvailableUnits() { return availableUnits; }
+        public void setAvailableUnits(int availableUnits) { this.availableUnits = availableUnits; }
+        public String getAmenities() { return amenities; }
+        public void setAmenities(String amenities) { this.amenities = amenities; }
+    }
+
+    @Entity
+    public class Lease {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private int leaseId;
+
+        private int propertyId;
+        private double effectiveRent;
+        private int termMonths;
+        private LocalDateTime startDate;
+        private double discount;
+
+        // Getters and Setters
+        public int getLeaseId() { return leaseId; }
+        public void setLeaseId(int leaseId) { this.leaseId = leaseId; }
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public double getEffectiveRent() { return effectiveRent; }
+        public void setEffectiveRent(double effectiveRent) { this.effectiveRent = effectiveRent; }
+        public int getTermMonths() { return termMonths; }
+        public void setTermMonths(int termMonths) { this.termMonths = termMonths; }
+        public LocalDateTime getStartDate() { return startDate; }
+        public void setStartDate(LocalDateTime startDate) { this.startDate = startDate; }
+        public double getDiscount() { return discount; }
+        public void setDiscount(double discount) { this.discount = discount; }
+    }
+
+    @Entity
+    public class Booking {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private int bookingId;
+
+        private int userId;
+        private int propertyId;
+        private LocalDateTime bookingDate;
+        private String status;
+
+        @ManyToOne
+        @JoinColumn(name = "propertyId", insertable = false, updatable = false)
+        private Property property;
+
+        // Getters and Setters
+        public int getBookingId() { return bookingId; }
+        public void setBookingId(int bookingId) { this.bookingId = bookingId; }
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public LocalDateTime getBookingDate() { return bookingDate; }
+        public void setBookingDate(LocalDateTime bookingDate) { this.bookingDate = bookingDate; }
+        public String getStatus() { return status; }
+        public void setStatus(String status) { this.status = status; }
+        public Property getProperty() { return property; }
+        public void setProperty(Property property) { this.property = property; }
+    }
+
+    @Entity
+    public class PeerProperty {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private int peerId;
+
+        private int propertyId;
+        private String peerSubmarket;
+        private double peerRent;
+        private double peerOccupancy;
+        private int peerBedrooms;
+
+        public int getPeerId() { return peerId; }
+        public void setPeerId(int peerId) { this.peerId = peerId; }
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public String getPeerSubmarket() { return peerSubmarket; }
+        public void setPeerSubmarket(String peerSubmarket) { this.peerSubmarket = peerSubmarket; }
+        public double getPeerRent() { return peerRent; }
+        public void setPeerRent(double peerRent) { this.peerRent = peerRent; }
+        public double getPeerOccupancy() { return peerOccupancy; }
+        public void setPeerOccupancy(double peerOccupancy) { this.peerOccupancy = peerOccupancy; }
+        public int getPeerBedrooms() { return peerBedrooms; }
+        public void setPeerBedrooms(int peerBedrooms) { this.peerBedrooms = peerBedrooms; }
+    }
+
+    public class PricingConfig {
+        private double weightMarketTrend;
+        private double weightOccupancy;
+        private double weightPeerRent;
+        private double autoAcceptThresholdDaily;
+        private double autoAcceptThresholdWeekly;
+        private double minRentMultiplier;
+        private double maxRentMultiplier;
+
+        public double getWeightMarketTrend() { return weightMarketTrend; }
+        public void setWeightMarketTrend(double weightMarketTrend) { this.weightMarketTrend = weightMarketTrend; }
+        public double getWeightOccupancy() { return weightOccupancy; }
+        public void setWeightOccupancy(double weightOccupancy) { this.weightOccupancy = weightOccupancy; }
+        public double getWeightPeerRent() { return weightPeerRent; }
+        public void setWeightPeerRent(double weightPeerRent) { this.weightPeerRent = weightPeerRent; }
+        public double getAutoAcceptThresholdDaily() { return autoAcceptThresholdDaily; }
+        public void setAutoAcceptThresholdDaily(double autoAcceptThresholdDaily) { this.autoAcceptThresholdDaily = autoAcceptThresholdDaily; }
+        public double getAutoAcceptThresholdWeekly() { return autoAcceptThresholdWeekly; }
+        public void setAutoAcceptThresholdWeekly(double autoAcceptThresholdWeekly) { this.autoAcceptThresholdWeekly = autoAcceptThresholdWeekly; }
+        public double getMinRentMultiplier() { return minRentMultiplier; }
+        public void setMinRentMultiplier(double minRentMultiplier) { this.minRentMultiplier = minRentMultiplier; }
+        public double getMaxRentMultiplier() { return maxRentMultiplier; }
+        public void setMaxRentMultiplier(double maxRentMultiplier) { this.maxRentMultiplier = maxRentMultiplier; }
+    }
+
+    public class RegisterDto {
+        private String username;
+        private String password;
+        private String email;
+
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+        public String getPassword() { return password; }
+        public void setPassword(String password) { this.password = password; }
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+    }
+
+    public class LoginDto {
+        private String username;
+        private String password;
+
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+        public String getPassword() { return password; }
+        public void setPassword(String password) { this.password = password; }
+    }
+
+    public class PropertyDto {
+        private String name;
+        private String address;
+        private String submarket;
+        private int bedrooms;
+        private double squareFootage;
+        private double currentRent;
+        private double occupancyRate;
+        private int availableUnits;
+        private String amenities;
+
+        public String getName() { return name; }
+        public void setName(String name) { this.name = name; }
+        public String getAddress() { return address; }
+        public void setAddress(String address) { this.address = address; }
+        public String getSubmarket() { return submarket; }
+        public void setSubmarket(String submarket) { this.submarket = submarket; }
+        public int getBedrooms() { return bedrooms; }
+        public void setBedrooms(int bedrooms) { this.bedrooms = bedrooms; }
+        public double getSquareFootage() { return squareFootage; }
+        public void setSquareFootage(double squareFootage) { this.squareFootage = squareFootage; }
+        public double getCurrentRent() { return currentRent; }
+        public void setCurrentRent(double currentRent) { this.currentRent = currentRent; }
+        public double getOccupancyRate() { return occupancyRate; }
+        public void setOccupancyRate(double occupancyRate) { this.occupancyRate = occupancyRate; }
+        public int getAvailableUnits() { return availableUnits; }
+        public void setAvailableUnits(int availableUnits) { this.availableUnits = availableUnits; }
+        public String getAmenities() { return amenities; }
+        public void setAmenities(String amenities) { this.amenities = amenities; }
+    }
+
+    public class PriceRecommendation {
+        private int propertyId;
+        private double recommendedRent;
+        private double baseRent;
+        private boolean isAutoAccepted;
+        private Map<Integer, Double> leaseExpirationAdjustments;
+        private double marketTrendFactor;
+        private double occupancyFactor;
+        private double peerRentFactor;
+
+        // Getters and Setters
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public double getRecommendedRent() { return recommendedRent; }
+        public void setRecommendedRent(double recommendedRent) { this.recommendedRent = recommendedRent; }
+        public double getBaseRent() { return baseRent; }
+        public void setBaseRent(double baseRent) { this.baseRent = baseRent; }
+        public boolean isAutoAccepted() { return isAutoAccepted; }
+        public void setAutoAccepted(boolean autoAccepted) { isAutoAccepted = autoAccepted; }
+        public Map<Integer, Double> getLeaseExpirationAdjustments() { return leaseExpirationAdjustments; }
+        public void setLeaseExpirationAdjustments(Map<Integer, Double> leaseExpirationAdjustments) { this.leaseExpirationAdjustments = leaseExpirationAdjustments; }
+        public double getMarketTrendFactor() { return marketTrendFactor; }
+        public void setMarketTrendFactor(double marketTrendFactor) { this.marketTrendFactor = marketTrendFactor; }
+        public double getOccupancyFactor() { return occupancyFactor; }
+        public void setOccupancyFactor(double occupancyFactor) { this.occupancyFactor = occupancyFactor; }
+        public double getPeerRentFactor() { return peerRentFactor; }
+        public void setPeerRentFactor(double peerRentFactor) { this.peerRentFactor = peerRentFactor; }
+    }
+
+    public class BookingDto {
+        private int userId;
+        private int propertyId;
+
+        public int getUserId() { return userId; }
+        public void setUserId(int userId) { this.userId = userId; }
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+    }
+
+    public class LeaseDto {
+        private int propertyId;
+        private double effectiveRent;
+        private int termMonths;
+        private LocalDateTime startDate;
+        private double discount;
+
+        // Getters and Setters
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public double getEffectiveRent() { return effectiveRent; }
+        public void setEffectiveRent(double effectiveRent) { this.effectiveRent = effectiveRent; }
+        public int getTermMonths() { return termMonths; }
+        public void setTermMonths(int termMonths) { this.termMonths = termMonths; }
+        public LocalDateTime getStartDate() { return startDate; }
+        public void setStartDate(LocalDateTime startDate) { this.startDate = start mulher; }
+        public double getDiscount() { return discount; }
+        public void setDiscount(double discount) { this.discount = discount; }
+    }
+
+    public class PeerPropertyDto {
+        private int propertyId;
+        private String peerSubmarket;
+        private double peerRent;
+        private double peerOccupancy;
+        private int peerBedrooms;
+
+        // Getters and Setters
+        public int getPropertyId() { return propertyId; }
+        public void setPropertyId(int propertyId) { this.propertyId = propertyId; }
+        public String getPeerSubmarket() { return peerSubmarket; }
+        public void setPeerSubmarket(String peerSubmarket) { this.peerSubmarket = peerSubmarket; }
+        public double getPeerRent() { return peerRent; }
+        public void setPeerRent(double peerRent) { this.peerRent = peerRent; }
+        public double getPeerOccupancy() { return peerOccupancy; }
+        public void setPeerOccupancy(double peerOccupancy) { this.peerOccupancy = peerOccupancy; }
+        public int getPeerBedrooms() { return peerBedrooms; }
+        public void setPeerBedrooms(int peerBedrooms) { this.peerBedrooms = peerBedrooms; }
+    }
+
+    public interface UserRepository extends JpaRepository<User, Integer> {
+        Optional<User> findByUsername(String username);
+    }
+
+    public interface PropertyRepository extends JpaRepository<Property, Integer> {
+        List<Property> findBySubmarket(String submarket);
+        List<Property> findByBedrooms(int bedrooms);
+    }
+
+    public interface LeaseRepository extends JpaRepository<Lease, Integer> {
+        List<Lease> findByPropertyId(int propertyId);
+    }
+
+    public interface BookingRepository extends JpaRepository<Booking, Integer> {
+        List<Booking> findByUserId(int userId);
+    }
+
+    public interface PeerPropertyRepository extends JpaRepository<PeerProperty, Integer> {
+        List<PeerProperty> findByPropertyId(int propertyId);
+    }
+
+    @RestController
+    @RequestMapping("/api/auth")
+    public class AuthController {
+        @Autowired
+        private UserRepository userRepository;
+
+        @Autowired
+        private PasswordEncoder passwordEncoder;
+
+        @PostMapping("/register")
+        public ResponseEntity<?> register(@Valid @RequestBody RegisterDto dto) {
+            if (userRepository.findByUsername(dto.getUsername()).isPresent()) {
+                return ResponseEntity.badRequest().body("Username already exists");
+            }
+
+            User user = new User();
+            user.setUsername(dto.getUsername());
+            user.setPasswordHash(passwordEncoder.encode(dto.getPassword()));
+            user.setRole("Landlord");
+            user.setEmail(dto.getEmail());
+
+            userRepository.save(user);
+            Map<String, Object> response = new HashMap<>();
+            response.put("userId", user.getUserId());
+            response.put("username", user.getUsername());
+            return ResponseEntity.ok(response);
+        }
+
+        @PostMapping("/login")
+        public ResponseEntity<?> login(@Valid @RequestBody LoginDto dto) {
+            Optional<User> userOpt = userRepository.findByUsername(dto.getUsername());
+            if (userOpt.isEmpty() || !passwordEncoder.matches(dto.getPassword(), userOpt.get().getPasswordHash())) {
+                return ResponseEntity.status(401).body("Invalid credentials");
+            }
+
+            User user = userOpt.get();
+            Map<String, Object> response = new HashMap<>();
+            response.put("userId", user.getUserId());
+            response.put("username", user.getUsername());
+            response.put("role", user.getRole());
+            return ResponseEntity.ok(response);
+        }
+    }
+
+    @RestController
+    @RequestMapping("/api/properties")
+    public class PropertiesController {
+        @Autowired
+        private PropertyRepository propertyRepository;
+
+        @Autowired
+        private PeerPropertyRepository peerPropertyRepository;
+
+        @Autowired
+        private LeaseRepository leaseRepository;
+
+        private final PricingConfig config;
+
+        public PropertiesController() throws IOException {
+            ObjectMapper mapper = new ObjectMapper();
+            config = mapper.readValue(new ClassPathResource("pricing_config.json").getFile(), PricingConfig.class);
+        }
+
+        @GetMapping
+        public ResponseEntity<?> getProperties(
+                @RequestParam(required = false) String submarket,
+                @RequestParam(required = false) Integer bedrooms,
+                @RequestParam(defaultValue = "price") String sortBy,
+                @RequestParam(defaultValue = "asc") String sortOrder,
+                @RequestParam(defaultValue = "1") int page,
+                @RequestParam(defaultValue = "10") int pageSize) {
+            List<Property> properties = propertyRepository.findAll();
+            if (submarket != null) {
+                properties = propertyRepository.findBySubmarket(submarket);
+            }
+            if (bedrooms != null) {
+                properties = properties.stream()
+                        .filter(p -> p.getBedrooms() == bedrooms)
+                        .collect(Collectors.toList());
+            }
+
+            properties.sort((p1, p2) -> {
+                int result;
+                switch (sortBy.toLowerCase()) {
+                    case "occupancy":
+                        result = Double.compare(p1.getOccupancyRate(), p2.getOccupancyRate());
+                        break;
+                    case "bedrooms":
+                        result = Integer.compare(p1.getBedrooms(), p2.getBedrooms());
+                        break;
+                    default:
+                        result = Double.compare(p1.getCurrentRent(), p2.getCurrentRent());
+                }
+                return sortOrder.equalsIgnoreCase("asc") ? result : -result;
+            });
+
+            int total = properties.size();
+            int start = (page - 1) * pageSize;
+            int end = Math.min(start + pageSize, properties.size());
+            List<Property> paginated = properties.subList(start, end);
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("total", total);
+            response.put("properties", paginated);
+            return ResponseEntity.ok(response);
+        }
+
+        @PostMapping
+        public ResponseEntity<?> addProperty(@Valid @RequestBody PropertyDto dto) {
+            Property property = new Property();
+            property.setName(dto.getName());
+            property.setAddress(dto.getAddress());
+            property.setSubmarket(dto.getSubmarket());
+            property.setBedrooms(dto.getBedrooms());
+            property.setSquareFootage(dto.getSquareFootage());
+            property.setCurrentRent(dto.getCurrentRent());
+            property.setOccupancyRate(dto.getOccupancyRate());
+            property.setAvailableUnits(dto.getAvailableUnits());
+            property.setAmenities(dto.getAmenities());
+
+            propertyRepository.save(property);
+            return ResponseEntity.ok(property);
+        }
+
+        @GetMapping("/recommendations/{propertyId}")
+        public ResponseEntity<?> getPriceRecommendation(@PathVariable int propertyId) {
+            Optional<Property> propertyOpt = propertyRepository.findById(propertyId);
+            if (propertyOpt.isEmpty()) {
+                return ResponseEntity.status(404).body("Property not found");
+            }
+
+            PriceRecommendation recommendation = generatePriceRecommendation(propertyOpt.get());
+            return ResponseEntity.ok(recommendation);
+        }
+
+        private PriceRecommendation generatePriceRecommendation(Property property) {
+            List<PeerProperty> peers = peerPropertyRepository.findByPropertyId(property.getPropertyId());
+
+            double marketTrend = calculateMarketTrend(peers);
+            double occupancyAdjustment = calculateOccupancyAdjustment(property);
+            double peerRentAdjustment = calculatePeerRentAdjustment(peers, property);
+
+            double baseRent = property.getCurrentRent();
+            double recommendedRent = baseRent * (
+                    config.getWeightMarketTrend() * marketTrend +
+                    config.getWeightOccupancy() * occupancyAdjustment +
+                    config.getWeightPeerRent() * peerRentAdjustment
+            );
+
+            recommendedRent = Math.max(
+                    baseRent * config.getMinRentMultiplier(),
+                    Math.min(recommendedRent, baseRent * config.getMaxRentMultiplier())
+            );
+
+            boolean isAutoAccepted = checkAutoAccept(baseRent, recommendedRent);
+            Map<Integer, Double> leaseExpirations = manageLeaseExpirations(property);
+
+            PriceRecommendation recommendation = new PriceRecommendation();
+            recommendation.setPropertyId(property.getPropertyId());
+            recommendation.setRecommendedRent(Math.round(recommendedRent * 100.0) / 100.0);
+            recommendation.setBaseRent(baseRent);
+            recommendation.setAutoAccepted(isAutoAccepted);
+            recommendation.setLeaseExpirationAdjustments(leaseExpirations);
+            recommendation.setMarketTrendFactor(marketTrend);
+            recommendation.setOccupancyFactor(occupancyAdjustment);
+            recommendation.setPeerRentFactor(peerRentAdjustment);
+
+            return recommendation;
+        }
+
+        private double calculateMarketTrend(List<PeerProperty> peers) {
+            if (peers.isEmpty()) {
+                return 1.0;
+            }
+
+            double avgPeerRentChange = peers.stream()
+                    .mapToDouble(pp -> {
+                        double avgSubmarketRent = propertyRepository.findBySubmarket(pp.getPeerSubmarket())
+                                .stream()
+                                .mapToDouble(Property::getCurrentRent)
+                                .average()
+                                .orElse(1.0);
+                        return pp.getPeerRent() / avgSubmarketRent;
+                    })
+                    .average()
+                    .orElse(1.0);
+
+            return avgPeerRentChange > 1.0 ? 1.02 : avgPeerRentChange < 1.0 ? 0.98 : 1.0;
+        }
+
+        private double calculateOccupancyAdjustment(Property property) {
+            double targetOccupancy = 0.95;
+            return property.getOccupancyRate() < targetOccupancy ? 0.95 :
+                    property.getOccupancyRate() > targetOccupancy ? 1.05 : 1.0;
+        }
+
+        private double calculatePeerRentAdjustment(List<PeerProperty> peers, Property property) {
+            if (peers.isEmpty()) {
+                return 1.0;
+            }
+
+            double avgPeerRent = peers.stream()
+                    .mapToDouble(PeerProperty::getPeerRent)
+                    .average()
+                    .orElse(1.0);
+            double rentRatio = avgPeerRent / property.getCurrentRent();
+            return rentRatio > 1.0 ? 1.03 : rentRatio < 1.0 ? 0.97 : 1.0;
+        }
+
+        private boolean checkAutoAccept(double baseRent, double recommendedRent) {
+            double dailyChange = Math.abs((recommendedRent - baseRent) / baseRent);
+            double weeklyChange = dailyChange * 7;
+            return dailyChange <= config.getAutoAcceptThresholdDaily() &&
+                    weeklyChange <= config.getAutoAcceptThresholdWeekly();
+        }
+
+        private Map<Integer, Double> manageLeaseExpirations(Property property) {
+            List<Lease> leases = leaseRepository.findByPropertyId(property.getPropertyId());
+            Map<Integer, Integer> futureSupply = leases.stream()
+                    .collect(Collectors.groupingBy(
+                            l -> l.getStartDate().plusMonths(l.getTermMonths()).getMonthValue(),
+                            Collectors.summingInt(l -> 1)
+                    ));
+
+            Map<Integer, Double> expirations = new HashMap<>();
+            for (int month = 1; month <= 12; month++) {
+                int supply = futureSupply.getOrDefault(month, 0);
+                double adjustment = supply > 5 ? 1.05 : supply < 2 ? 0.95 : 1.0;
+                expirations.put(month, adjustment);
+            }
+            return expirations;
+        }
+    }
+
+    @RestController
+    @RequestMapping("/api/bookings")
+    public class BookingsController {
+        @Autowired
+        private BookingRepository bookingRepository;
+
+        @Autowired
+        private PropertyRepository propertyRepository;
+
+        @PostMapping
+        public ResponseEntity<?> addBooking(@Valid @RequestBody BookingDto dto) {
+            Optional<Property> propertyOpt = propertyRepository.findById(dto.getPropertyId());
+            if (propertyOpt.isEmpty() || propertyOpt.get().getAvailableUnits() <= 0) {
+                return ResponseEntity.badRequest().body("Property not available");
+            }
+
+            Property property = propertyOpt.get();
+            Booking booking = new Booking();
+            booking.setUserId(dto.getUserId());
+            booking.setPropertyId(dto.getPropertyId());
+            booking.setBookingDate(LocalDateTime.now());
+            booking.setStatus("Pending");
+
+            property.setAvailableUnits(property.getAvailableUnits() - 1);
+            bookingRepository.save(booking);
+            propertyRepository.save(property);
+            return ResponseEntity.ok(booking);
+        }
+
+        @GetMapping("/user/{userId}")
+        public ResponseEntity<?> getUserBookings(@PathVariable int userId) {
+            List<Booking> bookings = bookingRepository.findByUserId(userId);
+            return ResponseEntity.ok(bookings);
+        }
+
+        @PutMapping("/{bookingId}/confirm")
+        public ResponseEntity<?> confirmBooking(@PathVariable int bookingId) {
+            Optional<Booking> bookingOpt = bookingRepository.findById(bookingId);
+            if (bookingOpt.isEmpty()) {
+                return ResponseEntity.status(404).body("Booking not found");
+            }
+
+            Booking booking = bookingOpt.get();
+            booking.setStatus("Confirmed");
+            bookingRepository.save(booking);
+            return ResponseEntity.ok(booking);
+        }
+
+        @DeleteMapping("/{bookingId}")
+        public ResponseEntity<?> cancelBooking(@PathVariable int bookingId) {
+            Optional<Booking> bookingOpt = bookingRepository.findById(bookingId);
+            if (bookingOpt.isEmpty()) {
+                return ResponseEntity.status(404).body("Booking not found");
+            }
+
+            Booking booking = bookingOpt.get();
+            Optional<Property> propertyOpt = propertyRepository.findById(booking.getPropertyId());
+            if (propertyOpt.isPresent()) {
+                Property property = propertyOpt.get();
+                property.setAvailableUnits(property.getAvailableUnits() + 1);
+                propertyRepository.save(property);
+            }
+
+            bookingRepository.delete(booking);
+            return ResponseEntity.ok().build();
+        }
+    }
+
+    @RestController
+    @RequestMapping("/api/leases")
+    public class LeasesController {
+        @Autowired
+        private LeaseRepository leaseRepository;
+
+        @PostMapping
+        public ResponseEntity<?> addLease(@Valid @RequestBody LeaseDto dto) {
+            Lease lease = new Lease();
+            lease.setPropertyId(dto.getPropertyId());
+            lease.setEffectiveRent(dto.getEffectiveRent());
+            lease.setTermMonths(dto.getTermMonths());
+            lease.setStartDate(dto.getStartDate());
+            lease.setDiscount(dto.getDiscount());
+
+            leaseRepository.save(lease);
+            return ResponseEntity.ok(lease);
+        }
+
+        @GetMapping("/property/{propertyId}")
+        public ResponseEntity<?> getPropertyLeases(@PathVariable int propertyId) {
+            List<Lease> leases = leaseRepository.findByPropertyId(propertyId);
+            return ResponseEntity.ok(leases);
+        }
+    }
+
+    @RestController
+    @RequestMapping("/api/peerproperties")
+    public class PeerPropertiesController {
+        @Autowired
+        private PeerPropertyRepository peerPropertyRepository;
+
+        @PostMapping
+        public ResponseEntity<?> addPeerProperty(@Valid @RequestBody PeerPropertyDto dto) {
+            PeerProperty peer = new PeerProperty();
+            peer.setPropertyId(dto.getPropertyId());
+            peer.setPeerSubmarket(dto.getPeerSubmarket());
+            peer.setPeerRent(dto.getPeerRent());
+            peer.setPeerOccupancy(dto.getPeerOccupancy());
+            peer.setPeerBedrooms(dto.getPeerBedrooms());
+
+            peerPropertyRepository.save(peer);
+            return ResponseEntity.ok(peer);
+        }
+
+        @GetMapping("/property/{propertyId}")
+        public ResponseEntity<?> getPeerProperties(@PathVariable int propertyId) {
+            List<PeerProperty> peers = peerPropertyRepository.findByPropertyId(propertyId);
+            return ResponseEntity.ok(peers);
+        }
+    }
+}

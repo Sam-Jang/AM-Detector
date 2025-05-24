@@ -1,0 +1,74 @@
+#include <crow.h>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <mutex>
+
+std::vector<std::pair<std::string, std::string>> comments;
+std::mutex comments_mutex;
+
+int main()
+{
+    crow::SimpleApp app;
+
+    CROW_ROUTE(app, "/")([]() {
+        return crow::response(200, "<html><body><h1>Welcome to the Home Page</h1></body></html>");
+    });
+
+    CROW_ROUTE(app, "/form1").methods(crow::HTTPMethod::GET)([](const crow::request& req) {
+        auto name = req.url_params.get("name");
+        std::ostringstream body;
+        body << "<html><body><h1>Hello, " << (name ? name : "Guest") << "</h1></body></html>";
+        return crow::response(200, body.str());
+    });
+
+    CROW_ROUTE(app, "/form2").methods(crow::HTTPMethod::GET)([]() {
+        return crow::response(200, "<html><body><form action='/submit2' method='post'>
+                                    Username: <input name='username'><br>
+                                    Comment: <input name='comment'><br>
+                                    <input type='submit'>
+                                </form></body></html>");
+    });
+
+    CROW_ROUTE(app, "/submit2").methods(crow::HTTPMethod::POST)([](const crow::request& req) {
+        auto body = req.body;
+        auto username = req.url_params.get("username");
+        auto comment = req.url_params.get("comment");
+
+        if (username && comment) {
+            std::lock_guard<std::mutex> lock(comments_mutex);
+            comments.emplace_back(username, comment);
+        }
+        return crow::response(303, "<html><head><meta http-equiv='refresh' content='0; url=/comments'></head></html>");
+    });
+
+    CROW_ROUTE(app, "/comments").methods(crow::HTTPMethod::GET)([]() {
+        std::ostringstream body;
+        body << "<html><body><h1>Comments</h1><ul>";
+        {
+            std::lock_guard<std::mutex> lock(comments_mutex);
+            for (const auto& comment : comments) {
+                body << "<li>" << comment.first << ": " << comment.second << "</li>";
+            }
+        }
+        body << "</ul></body></html>";
+        return crow::response(200, body.str());
+    });
+
+    CROW_ROUTE(app, "/upload").methods(crow::HTTPMethod::POST)([](const crow::request& req) {
+        auto content_type = req.get_header_value("Content-Type");
+        if (content_type.find("multipart/form-data") == std::string::npos) {
+            return crow::response(400, "Invalid Content-Type. Expected multipart/form-data");
+        }
+
+        std::ofstream file("uploaded_file", std::ios::binary);
+        if (!file) {
+            return crow::response(500, "Failed to open file for writing");
+        }
+        file.write(req.body.c_str(), req.body.size());
+        return crow::response(200, "Upload success");
+    });
+
+    app.port(8080).multithreaded().run();
+}

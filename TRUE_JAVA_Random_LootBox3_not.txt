@@ -1,0 +1,525 @@
+package com.gameserver;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.File;
+import java.security.MessageDigest;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.UUID;
+import java.time.LocalDateTime;
+
+public class GameServer {
+    private static final String DB_URL = "jdbc:mysql://localhost:3306/game_db?user=game_user&password=secure_pwd";
+    private static final String CONFIG_PATH = "game_config.json";
+    private static GameConfig config;
+
+    static class GameConfig {
+        Map<String, Double> itemPrices;
+        Map<String, Integer> itemPointReqs;
+        double baseProb;
+        int maxAttempts;
+    }
+
+    static class User {
+        int id;
+        String username;
+        String passwordHash;
+        int currency;
+    }
+
+    static class Item {
+        int id;
+        String name;
+        double price;
+        boolean isProb;
+    }
+
+    static class Inventory {
+        int userId;
+        int itemId;
+        int quantity;
+    }
+
+    static class Transaction {
+        int id;
+        int userId;
+        int itemId;
+        LocalDateTime time;
+        double amount;
+    }
+
+    static class ProbAttempt {
+        int userId;
+        int itemId;
+        int points;
+        int attempts;
+    }
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        config = mapper.readValue(new File(CONFIG_PATH), GameConfig.class);
+        initDb();
+        runServer();
+    }
+
+    private static void initDb() throws Exception {
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE,
+                    password_hash VARCHAR(256),
+                    currency INT DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS items (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(100),
+                    price DOUBLE,
+                    is_prob BOOLEAN
+                );
+                CREATE TABLE IF NOT EXISTS inventory (
+                    user_id INT,
+                    item_id INT,
+                    quantity INT,
+                    PRIMARY KEY (user_id, item_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (item_id) REFERENCES items(id)
+                );
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT,
+                    item_id INT,
+                    time DATETIME,
+                    amount DOUBLE,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (item_id) REFERENCES items(id)
+                );
+                CREATE TABLE IF NOT EXISTS prob_attempts (
+                    user_id INT,
+                    item_id INT,
+                    points INT DEFAULT 0,
+                    attempts INT DEFAULT 0,
+                    PRIMARY KEY (user_id, item_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (item_id) REFERENCES items(id)
+                );
+                """;
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.execute();
+            }
+        }
+    }
+
+    private static void runServer() throws Exception {
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.println("1: Register, 2: Login, 3: Shop, 4: Inventory, 5: Search, 6: History, 7: Use Item");
+            String choice = scanner.nextLine();
+            switch (choice) {
+                case "1": registerUser(); break;
+                case "2": loginUser(); break;
+                case "3": shopMenu(); break;
+                case "4": viewInventory(); break;
+                case "5": searchItems(); break;
+                case "6": viewHistory(); break;
+                case "7": useItem(); break;
+            }
+        }
+    }
+
+    private static void registerUser() throws Exception {
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Username: ");
+        String username = scanner.nextLine();
+        System.out.print("Password: ");
+        String password = scanner.nextLine();
+        String pwdHash = hashPassword(password);
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "INSERT INTO users (username, password_hash, currency) VALUES (?, ?, 1000)";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, username);
+                stmt.setString(2, pwdHash);
+                stmt.executeUpdate();
+                System.out.println("User registered.");
+            }
+        }
+    }
+
+    private static User loginUser() throws Exception {
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Username: ");
+        String username = scanner.nextLine();
+        System.out.print("Password: ");
+        String password = scanner.nextLine();
+        String pwdHash = hashPassword(password);
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT id, username, currency FROM users WHERE username = ? AND password_hash = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, username);
+                stmt.setString(2, pwdHash);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        User user = new User();
+                        user.id = rs.getInt("id");
+                        user.username = rs.getString("username");
+                        user.currency = rs.getInt("currency");
+                        System.out.println("Logged in as " + user.username + ". Currency: " + user.currency);
+                        return user;
+                    }
+                    System.out.println("Invalid credentials.");
+                    return null;
+                }
+            }
+        }
+    }
+
+    private static String hashPassword(String password) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] hash = digest.digest(password.getBytes("UTF-8"));
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : hash) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) hexString.append('0');
+            hexString.append(hex);
+        }
+        return hexString.toString();
+    }
+
+    private static void shopMenu() throws Exception {
+        User user = loginUser();
+        if (user == null) return;
+
+        List<Item> items = getItems();
+        System.out.println("Shop Items:");
+        for (Item item : items) {
+            System.out.println("ID: " + item.id + ", Name: " + item.name + ", Price: " + item.price + ", Probabilistic: " + item.isProb);
+        }
+
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Enter item ID to purchase: ");
+        String input = scanner.nextLine();
+        int itemId;
+        try {
+            itemId = Integer.parseInt(input);
+        } catch (NumberFormatException e) {
+            return;
+        }
+
+        Item selectedItem = items.stream().filter(i -> i.id == itemId).findFirst().orElse(null);
+        if (selectedItem == null) {
+            System.out.println("Invalid item ID.");
+            return;
+        }
+
+        if (user.currency < selectedItem.price) {
+            System.out.println("Insufficient currency.");
+            return;
+        }
+
+        purchaseItem(user, selectedItem);
+    }
+
+    private static List<Item> getItems() throws Exception {
+        List<Item> items = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT id, name, price, is_prob FROM items";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        Item item = new Item();
+                        item.id = rs.getInt("id");
+                        item.name = rs.getString("name");
+                        item.price = rs.getDouble("price");
+                        item.isProb = rs.getBoolean("is_prob");
+                        items.add(item);
+                    }
+                }
+            }
+        }
+        return items;
+    }
+
+    private static void purchaseItem(User user, Item item) throws Exception {
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            conn.setAutoCommit(false);
+            try {
+                String sql1 = "UPDATE users SET currency = currency - ? WHERE id = ?";
+                try (PreparedStatement stmt1 = conn.prepareStatement(sql1)) {
+                    stmt1.setDouble(1, item.price);
+                    stmt1.setInt(2, user.id);
+                    stmt1.executeUpdate();
+                }
+
+                String sql2 = "INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE quantity = quantity + 1";
+                try (PreparedStatement stmt2 = conn.prepareStatement(sql2)) {
+                    stmt2.setInt(1, user.id);
+                    stmt2.setInt(2, item.id);
+                    stmt2.executeUpdate();
+                }
+
+                String sql3 = "INSERT INTO transactions (user_id, item_id, time, amount) VALUES (?, ?, ?, ?)";
+                try (PreparedStatement stmt3 = conn.prepareStatement(sql3)) {
+                    stmt3.setInt(1, user.id);
+                    stmt3.setInt(2, item.id);
+                    stmt3.setTimestamp(3, java.sql.Timestamp.valueOf(LocalDateTime.now()));
+                    stmt3.setDouble(4, item.price);
+                    stmt3.executeUpdate();
+                }
+
+                conn.commit();
+                System.out.println("Purchased " + item.name + ".");
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static void viewInventory() throws Exception {
+        User user = loginUser();
+        if (user == null) return;
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setInt(1, user.id);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    System.out.println("Inventory:");
+                    while (rs.next()) {
+                        System.out.println("Item: " + rs.getString("name") + ", Quantity: " + rs.getInt("quantity"));
+                    }
+                }
+            }
+        }
+    }
+
+    private static void searchItems() throws Exception {
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Search keyword: ");
+        String keyword = scanner.nextLine();
+        System.out.println("Sort by: 1: Price Asc, 2: Price Desc, 3: Name Asc, 4: Name Desc");
+        String sortChoice = scanner.nextLine();
+
+        String sortSql = switch (sortChoice) {
+            case "1" -> "ORDER BY price ASC";
+            case "2" -> "ORDER BY price DESC";
+            case "3" -> "ORDER BY name ASC";
+            case "4" -> "ORDER BY name DESC";
+            default -> "";
+        };
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT id, name, price, is_prob FROM items WHERE name LIKE ? " + sortSql;
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, "%" + keyword + "%");
+                try (ResultSet rs = stmt.executeQuery()) {
+                    System.out.println("Search Results:");
+                    while (rs.next()) {
+                        System.out.println("ID: " + rs.getInt("id") + ", Name: " + rs.getString("name") + ", Price: " + rs.getDouble("price") + ", Probabilistic: " + rs.getBoolean("is_prob"));
+                    }
+                }
+            }
+        }
+    }
+
+    private static void viewHistory() throws Exception {
+        User user = loginUser();
+        if (user == null) return;
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT i.name, t.time, t.amount FROM transactions t JOIN items i ON t.item_id = i.id WHERE t.user_id = ? ORDER BY t.time DESC";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setInt(1, user.id);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    System.out.println("Transaction History:");
+                    while (rs.next()) {
+                        System.out.println("Item: " + rs.getString("name") + ", Time: " + rs.getTimestamp("time") + ", Amount: " + rs.getDouble("amount"));
+                    }
+                }
+            }
+        }
+    }
+
+    private static void useItem() throws Exception {
+        User user = loginUser();
+        if (user == null) return;
+
+        List<Inventory> invItems = getInventoryItems(user.id);
+        System.out.println("Your Items:");
+        for (Inventory item : invItems) {
+            System.out.println("ID: " + item.itemId + ", Name: " + item.quantity + ", Quantity: " + item.quantity);
+        }
+
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Enter item ID to use: ");
+        String input = scanner.nextLine();
+        int itemId;
+        try {
+            itemId = Integer.parseInt(input);
+        } catch (NumberFormatException e) {
+            return;
+        }
+
+        Inventory selectedItem = invItems.stream().filter(i -> i.itemId == itemId).findFirst().orElse(null);
+        if (selectedItem == null || selectedItem.quantity == 0) {
+            System.out.println("Invalid item or insufficient quantity.");
+            return;
+        }
+
+        Item itemDetails = getItemDetails(itemId);
+        if (itemDetails.isProb) {
+            processProbItem(user, itemDetails);
+        } else {
+            processRegularItem(user, itemDetails);
+        }
+    }
+
+    private static List<Inventory> getInventoryItems(int userId) throws Exception {
+        List<Inventory> items = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT inv.item_id, i.name, inv.quantity FROM inventory inv JOIN items i ON inv.item_id = i.id WHERE inv.user_id = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setInt(1, userId);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        Inventory item = new Inventory();
+                        item.itemId = rs.getInt("item_id");
+                        item.quantity = rs.getInt("quantity");
+                        items.add(item);
+                    }
+                }
+            }
+        }
+        return items;
+    }
+
+    private static Item getItemDetails(int itemId) throws Exception {
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT id, name, price, is_prob FROM items WHERE id = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setInt(1, itemId);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        Item item = new Item();
+                        item.id = rs.getInt("id");
+                        item.name = rs.getString("name");
+                        item.price = rs.getDouble("price");
+                        item.isProb = rs.getBoolean("is_prob");
+                        return item;
+                    }
+                    return null;
+                }
+            }
+        }
+    }
+
+    private static void processRegularItem(User user, Item item) throws Exception {
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            conn.setAutoCommit(false);
+            try {
+                String sql = "UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ? AND quantity > 0";
+                try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                    stmt.setInt(1, user.id);
+                    stmt.setInt(2, item.id);
+                    int rows = stmt.executeUpdate();
+                    if (rows == 0) {
+                        System.out.println("Failed to use item.");
+                        return;
+                    }
+                }
+                conn.commit();
+                System.out.println("Used " + item.name + ". Effect applied.");
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static void processProbItem(User user, Item item) throws Exception {
+        ProbAttempt attempt = getOrCreateAttempt(user.id, item.id);
+        attempt.attempts++;
+        attempt.points += (int) (Math.random() * 9) + 1;
+
+        int reqPoints = config.itemPointReqs.getOrDefault(item.name, 50);
+        boolean success = attempt.points >= reqPoints;
+
+        if (!success && attempt.attempts >= config.maxAttempts) {
+            success = Math.random() < config.baseProb;
+        }
+
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            conn.setAutoCommit(false);
+            try {
+                String sql1 = "UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ? AND quantity > 0";
+                try (PreparedStatement stmt1 = conn.prepareStatement(sql1)) {
+                    stmt1.setInt(1, user.id);
+                    stmt1.setInt(2, item.id);
+                    int rows = stmt1.executeUpdate();
+                    if (rows == 0) {
+                        System.out.println("Failed to use item.");
+                        return;
+                    }
+                }
+
+                String sql2 = "INSERT INTO prob_attempts (user_id, item_id, points, attempts) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE points = ?, attempts = ?";
+                try (PreparedStatement stmt2 = conn.prepareStatement(sql2)) {
+                    stmt2.setInt(1, user.id);
+                    stmt2.setInt(2, item.id);
+                    stmt2.setInt(3, attempt.points);
+                    stmt2.setInt(4, attempt.attempts);
+                    stmt2.setInt(5, attempt.points);
+                    stmt2.setInt(6, attempt.attempts);
+                    stmt2.executeUpdate();
+                }
+
+                conn.commit();
+                System.out.println(success ? "Success! " + item.name + " unlocked reward." : "Failed to unlock reward.");
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static ProbAttempt getOrCreateAttempt(int userId, int itemId) throws Exception {
+        try (Connection conn = DriverManager.getConnection(DB_URL)) {
+            String sql = "SELECT points, attempts FROM prob_attempts WHERE user_id = ? AND item_id = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setInt(1, userId);
+                stmt.setInt(2, itemId);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        ProbAttempt attempt = new ProbAttempt();
+                        attempt.userId = userId;
+                        attempt.itemId = itemId;
+                        attempt.points = rs.getInt("points");
+                        attempt.attempts = rs.getInt("attempts");
+                        return attempt;
+                    }
+                }
+            }
+        }
+        ProbAttempt attempt = new ProbAttempt();
+        attempt.userId = userId;
+        attempt.itemId = itemId;
+        attempt.points = 0;
+        attempt.attempts = 0;
+        return attempt;
+    }
+}

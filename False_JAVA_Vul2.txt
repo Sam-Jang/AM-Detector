@@ -1,0 +1,88 @@
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+
+import javax.servlet.http.HttpServletRequest;
+import java.util.HashMap;
+import java.util.Map;
+
+@SpringBootApplication
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
+
+@RestController
+public class UserController {
+
+    private final Map<String, String> users = new HashMap<>();
+
+    @PostMapping("/profile_link")
+    public String profileLink(@RequestParam String profile_url, @RequestParam String profile_name) {
+        return "<a href='" + profile_url + "'>" + profile_name + "</a>";
+    }
+
+    @PostMapping("/unsafe_login")
+    public String unsafeLogin(@RequestParam String username, @RequestParam String password) {
+        if (users.containsKey(username) && users.get(username).equals(password)) {
+            return "redirect:/home";
+        } else {
+            return "Invalid credentials";
+        }
+    }
+
+    @PostMapping("/unsafe_comment")
+    public String unsafeComment(@RequestParam String comment) {
+        return "<p>" + comment + "</p>";
+    }
+
+    @GetMapping("/unsafe_redirect")
+    public String unsafeRedirect(@RequestParam String next) {
+        return "redirect:" + next;
+    }
+
+    @PostMapping("/register")
+    public String register(@RequestParam String userid, @RequestParam String password, @RequestParam String confirm_password) {
+        if (!password.equals(confirm_password)) {
+            return "Passwords do not match";
+        } else {
+            users.put(userid, password);
+            return "Registration successful";
+        }
+    }
+
+    @PostMapping("/login")
+    public String login(@RequestParam String userid, @RequestParam String password) {
+        if (users.containsKey(userid) && users.get(userid).equals(password)) {
+            return "Login successful";
+        }
+        return "Login failed";
+    }
+
+    @PostMapping("/update_password")
+    public String updatePassword(@RequestParam String userid, @RequestParam String new_password) {
+        if (users.containsKey(userid)) {
+            users.put(userid, new_password);
+            return "Password updated successfully";
+        }
+        return "User not found";
+    }
+
+    @PostMapping("/delete_account")
+    public String deleteAccount(@RequestParam String userid) {
+        if (users.containsKey(userid)) {
+            users.remove(userid);
+            return "Account deleted successfully";
+        }
+        return "User not found";
+    }
+
+    @GetMapping("/get_user")
+    public String getUser(@RequestParam String userid) {
+        if (users.containsKey(userid)) {
+            return "User: " + userid;
+        }
+        return "User not found";
+    }
+}

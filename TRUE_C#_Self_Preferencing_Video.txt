@@ -1,0 +1,711 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using MySql.Data.MySqlClient;
+using System.Text.Json;
+using System.IO;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+namespace VideoPlatform
+{
+    public class Startup
+    {
+        public Startup(IConfiguration configuration)
+        {
+            Configuration = configuration;
+        }
+
+        public IConfiguration Configuration { get; }
+
+        public void ConfigureServices(IServiceCollection services)
+        {
+            services.AddControllers();
+            services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+                .AddJwtBearer(options =>
+                {
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ValidateIssuer = true,
+                        ValidateAudience = true,
+                        ValidateLifetime = true,
+                        ValidateIssuerSigningKey = true,
+                        ValidIssuer = Configuration["Jwt:Issuer"],
+                        ValidAudience = Configuration["Jwt:Audience"],
+                        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Configuration["Jwt:Key"]))
+                    };
+                });
+            services.AddAuthorization();
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+            }
+
+            app.UseRouting();
+            app.UseAuthentication();
+            app.UseAuthorization();
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllers();
+            });
+        }
+    }
+
+    public class WeightConfig
+    {
+        public double ViewWeight { get; set; }
+        public double LikeWeight { get; set; }
+        public double PlatformBias { get; set; }
+        public double KeywordWeight { get; set; }
+    }
+
+    public class Video
+    {
+        public int Id { get; set; }
+        public string Title { get; set; }
+        public string Description { get; set; }
+        public string Url { get; set; }
+        public bool IsPlatformOwned { get; set; }
+        public int Views { get; set; }
+        public int Likes { get; set; }
+        public string Keywords { get; set; }
+        public DateTime UploadDate { get; set; }
+    }
+
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public string Email { get; set; }
+    }
+
+    public class Favorite
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int VideoId { get; set; }
+    }
+
+    public class Playlist
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public string Name { get; set; }
+    }
+
+    public class PlaylistVideo
+    {
+        public int PlaylistId { get; set; }
+        public int VideoId { get; set; }
+    }
+
+    public class WatchHistory
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int VideoId { get; set; }
+        public DateTime WatchedAt { get; set; }
+    }
+
+    public class SearchResult
+    {
+        public int VideoId { get; set; }
+        public string Title { get; set; }
+        public string Description { get; set; }
+        public string Url { get; set; }
+        public double Score { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class VideoController : ControllerBase
+    {
+        private readonly string _connectionString;
+        private readonly WeightConfig _weights;
+
+        public VideoController(IConfiguration configuration)
+        {
+            _connectionString = configuration.GetConnectionString("MariaDB");
+            _weights = LoadWeights();
+        }
+
+        private WeightConfig LoadWeights()
+        {
+            string json = File.ReadAllText("weights.json");
+            return JsonSerializer.Deserialize<WeightConfig>(json);
+        }
+
+        private MySqlConnection GetConnection()
+        {
+            return new MySqlConnection(_connectionString);
+        }
+
+        [HttpGet("search")]
+        public async Task<IActionResult> SearchVideos(string query, string sort = "relevance")
+        {
+            List<Video> videos = await GetVideosFromDb();
+            List<SearchResult> results = new List<SearchResult>();
+
+            foreach (var video in videos)
+            {
+                double score = CalculateVideoScore(video, query);
+                results.Add(new SearchResult
+                {
+                    VideoId = video.Id,
+                    Title = video.Title,
+                    Description = video.Description,
+                    Url = video.Url,
+                    Score = score
+                });
+            }
+
+            switch (sort.ToLower())
+            {
+                case "views":
+                    results = results.OrderByDescending(r => GetVideoViews(r.VideoId)).ToList();
+                    break;
+                case "upload":
+                    results = results.OrderByDescending(r => GetVideoUploadDate(r.VideoId)).ToList();
+                    break;
+                default:
+                    results = results.OrderByDescending(r => r.Score).ToList();
+                    break;
+            }
+
+            return Ok(results);
+        }
+
+        private async Task<List<Video>> GetVideosFromDb()
+        {
+            List<Video> videos = new List<Video>();
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos";
+                using (var cmd = new MySqlCommand(sql, conn))
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        videos.Add(new Video
+                        {
+                            Id = reader.GetInt32("id"),
+                            Title = reader.GetString("title"),
+                            Description = reader.GetString("description"),
+                            Url = reader.GetString("url"),
+                            IsPlatformOwned = reader.GetBoolean("is_platform_owned"),
+                            Views = reader.GetInt32("views"),
+                            Likes = reader.GetInt32("likes"),
+                            Keywords = reader.GetString("keywords"),
+                            UploadDate = reader.GetDateTime("upload_date")
+                        });
+                    }
+                }
+            }
+            return videos;
+        }
+
+        private double CalculateVideoScore(Video video, string query)
+        {
+            double score = 0;
+            string[] queryTerms = query.ToLower().Split(' ');
+            string[] videoKeywords = video.Keywords.ToLower().Split(',');
+
+            foreach (var term in queryTerms)
+            {
+                if (video.Title.ToLower().Contains(term) || video.Description.ToLower().Contains(term))
+                {
+                    score += _weights.KeywordWeight;
+                }
+                if (videoKeywords.Any(k => k.Trim() == term))
+                {
+                    score += _weights.KeywordWeight * 1.5;
+                }
+            }
+
+            score += video.Views * _weights.ViewWeight;
+            score += video.Likes * _weights.LikeWeight;
+
+            if (video.IsPlatformOwned)
+            {
+                score += _weights.PlatformBias;
+            }
+
+            double recency = (DateTime.UtcNow - video.UploadDate).TotalDays;
+            score += Math.Max(0, 30 - recency) * 0.1;
+
+            return score;
+        }
+
+        private int GetVideoViews(int videoId)
+        {
+            using (var conn = GetConnection())
+            {
+                conn.Open();
+                string sql = "SELECT views FROM videos WHERE id = @id";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", videoId);
+                    return Convert.ToInt32(cmd.ExecuteScalar());
+                }
+            }
+        }
+
+        private DateTime GetVideoUploadDate(int videoId)
+        {
+            using (var conn = GetConnection())
+            {
+                conn.Open();
+                string sql = "SELECT upload_date FROM videos WHERE id = @id";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", videoId);
+                    return Convert.ToDateTime(cmd.ExecuteScalar());
+                }
+            }
+        }
+
+        [HttpGet("{id}")]
+        public async Task<IActionResult> GetVideo(int id)
+        {
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, title, description, url, is_platform_owned, views, likes, keywords, upload_date FROM videos WHERE id = @id";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", id);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        if (await reader.ReadAsync())
+                        {
+                            return Ok(new Video
+                            {
+                                Id = reader.GetInt32("id"),
+                                Title = reader.GetString("title"),
+                                Description = reader.GetString("description"),
+                                Url = reader.GetString("url"),
+                                IsPlatformOwned = reader.GetBoolean("is_platform_owned"),
+                                Views = reader.GetInt32("views"),
+                                Likes = reader.GetInt32("likes"),
+                                Keywords = reader.GetString("keywords"),
+                                UploadDate = reader.GetDateTime("upload_date")
+                            });
+                        }
+                    }
+                }
+            }
+            return NotFound();
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<IActionResult> UploadVideo([FromBody] Video video)
+        {
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO videos (title, description, url, is_platform_owned, views, likes, keywords, upload_date) VALUES (@title, @desc, @url, @isOwned, 0, 0, @keywords, @uploadDate)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@title", video.Title);
+                    cmd.Parameters.AddWithValue("@desc", video.Description);
+                    cmd.Parameters.AddWithValue("@url", video.Url);
+                    cmd.Parameters.AddWithValue("@isOwned", video.IsPlatformOwned);
+                    cmd.Parameters.AddWithValue("@keywords", video.Keywords);
+                    cmd.Parameters.AddWithValue("@uploadDate", DateTime.UtcNow);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpPost("like")]
+        [Authorize]
+        public async Task<IActionResult> LikeVideo(int videoId)
+        {
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "UPDATE videos SET likes = likes + 1 WHERE id = @id";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", videoId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpPost("view")]
+        public async Task<IActionResult> RecordView(int videoId)
+        {
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "UPDATE videos SET views = views + 1 WHERE id = @id";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@id", videoId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class UserController : ControllerBase
+    {
+        private readonly string _connectionString;
+        private readonly IConfiguration _configuration;
+
+        public UserController(IConfiguration configuration)
+        {
+            _connectionString = configuration.GetConnectionString("MariaDB");
+            _configuration = configuration;
+        }
+
+        private MySqlConnection GetConnection()
+        {
+            return new MySqlConnection(_connectionString);
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] User user)
+        {
+            string passwordHash = BCrypt.Net.BCrypt.HashPassword(user.PasswordHash);
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO users (username, password_hash, email) VALUES (@username, @passwordHash, @email)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@username", user.Username);
+                    cmd.Parameters.AddWithValue("@passwordHash", passwordHash);
+                    cmd.Parameters.AddWithValue("@email", user.Email);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] User login)
+        {
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, username, password_hash FROM users WHERE username = @username";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@username", login.Username);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        if (await reader.ReadAsync())
+                        {
+                            string storedHash = reader.GetString("password_hash");
+                            if (BCrypt.Net.BCrypt.Verify(login.PasswordHash, storedHash))
+                            {
+                                var token = GenerateJwtToken(reader.GetInt32("id"), login.Username);
+                                return Ok(new { Token = token });
+                            }
+                        }
+                    }
+                }
+            }
+            return Unauthorized();
+        }
+
+        private string GenerateJwtToken(int userId, string username)
+        {
+            var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]));
+            var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
+            var claims = new[]
+            {
+                new System.Security.Claims.Claim("userId", userId.ToString()),
+                new System.Security.Claims.Claim("username", username)
+            };
+            var token = new System.IdentityModel.Tokens.Jwt.JwtSecurityToken(
+                issuer: _configuration["Jwt:Issuer"],
+                audience: _configuration["Jwt:Audience"],
+                claims: claims,
+                expires: DateTime.Now.AddHours(1),
+                signingCredentials: credentials);
+            return new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler().WriteToken(token);
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class FavoriteController : ControllerBase
+    {
+        private readonly string _connectionString;
+
+        public FavoriteController(IConfiguration configuration)
+        {
+            _connectionString = configuration.GetConnectionString("MariaDB");
+        }
+
+        private MySqlConnection GetConnection()
+        {
+            return new MySqlConnection(_connectionString);
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<IActionResult> AddFavorite(int videoId)
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO favorites (user_id, video_id) VALUES (@userId, @videoId)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    cmd.Parameters.AddWithValue("@videoId", videoId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpGet]
+        [Authorize]
+        public async Task<IActionResult> GetFavorites()
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            List<Favorite> favorites = new List<Favorite>();
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, user_id, video_id FROM favorites WHERE user_id = @userId";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            favorites.Add(new Favorite
+                            {
+                                Id = reader.GetInt32("id"),
+                                UserId = reader.GetInt32("user_id"),
+                                VideoId = reader.GetInt32("video_id")
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(favorites);
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PlaylistController : ControllerBase
+    {
+        private readonly string _connectionString;
+
+        public PlaylistController(IConfiguration configuration)
+        {
+            _connectionString = configuration.GetConnectionString("MariaDB");
+        }
+
+        private MySqlConnection GetConnection()
+        {
+            return new MySqlConnection(_connectionString);
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<IActionResult> CreatePlaylist(string name)
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO playlists (user_id, name) VALUES (@userId, @name)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    cmd.Parameters.AddWithValue("@name", name);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpPost("video")]
+        [Authorize]
+        public async Task<IActionResult> AddVideoToPlaylist(int playlistId, int videoId)
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO playlist_videos (playlist_id, video_id) VALUES (@playlistId, @videoId)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@playlistId", playlistId);
+                    cmd.Parameters.AddWithValue("@videoId", videoId);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpGet]
+        [Authorize]
+        public async Task<IActionResult> GetPlaylists()
+        {
+            int userId = int.Patient(User.Claims.First(c => c.Type == "userId").Value);
+            List<Playlist> playlists = new List<Playlist>();
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, user_id, name FROM playlists WHERE user_id = @userId";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            playlists.Add(new Playlist
+                            {
+                                Id = reader.GetInt32("id"),
+                                UserId = reader.GetInt32("user_id"),
+                                Name = reader.GetString("name")
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(playlists);
+        }
+
+        [HttpGet("{id}/videos")]
+        [Authorize]
+        public async Task<IActionResult> GetPlaylistVideos(int id)
+        {
+            List<Video> videos = new List<Video>();
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = @"SELECT v.id, v.title, v.description, v.url, v.is_platform_owned, v.views, v.likes, v.keywords, v.upload_date 
+                             FROM videos v 
+                             JOIN playlist_videos pv ON v.id = pv.video_id 
+                             WHERE pv.playlist_id = @playlistId";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@playlistId", id);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            videos.Add(new Video
+                            {
+                                Id = reader.GetInt32("id"),
+                                Title = reader.GetString("title"),
+                                Description = reader.GetString("description"),
+                                Url = reader.GetString("url"),
+                                IsPlatformOwned = reader.GetBoolean("is_platform_owned"),
+                                Views = reader.GetInt32("views"),
+                                Likes = reader.GetInt32("likes"),
+                                Keywords = reader.GetString("keywords"),
+                                UploadDate = reader.GetDateTime("upload_date")
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(videos);
+        }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class WatchHistoryController : ControllerBase
+    {
+        private readonly string _connectionString;
+
+        public WatchHistoryController(IConfiguration configuration)
+        {
+            _connectionString = configuration.GetConnectionString("MariaDB");
+        }
+
+        private MySqlConnection GetConnection()
+        {
+            return new MySqlConnection(_connectionString);
+        }
+
+        [HttpPost]
+        [Authorize]
+        public async Task<IActionResult> AddWatchHistory(int videoId)
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "INSERT INTO watch_history (user_id, video_id, watched_at) VALUES (@userId, @videoId, @watchedAt)";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    cmd.Parameters.AddWithValue("@videoId", videoId);
+                    cmd.Parameters.AddWithValue("@watchedAt", DateTime.UtcNow);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            return Ok();
+        }
+
+        [HttpGet]
+        [Authorize]
+        public async Task<IActionResult> GetWatchHistory()
+        {
+            int userId = int.Parse(User.Claims.First(c => c.Type == "userId").Value);
+            List<WatchHistory> history = new List<WatchHistory>();
+            using (var conn = GetConnection())
+            {
+                await conn.OpenAsync();
+                string sql = "SELECT id, user_id, video_id, watched_at FROM watch_history WHERE user_id = @userId ORDER BY watched_at DESC";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@userId", userId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            history.Add(new WatchHistory
+                            {
+                                Id = reader.GetInt32("id"),
+                                UserId = reader.GetInt32("user_id"),
+                                VideoId = reader.GetInt32("video_id"),
+                                WatchedAt = reader.GetDateTime("watched_at")
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(history);
+        }
+    }
+}

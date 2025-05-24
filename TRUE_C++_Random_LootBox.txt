@@ -1,0 +1,429 @@
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <random>
+#include <vector>
+#include <string>
+#include <filesystem>
+#include <algorithm>
+
+using json = nlohmann::json;
+
+struct Item {
+    int id;
+    std::string name;
+    std::string rarity;
+    double price;
+    double baseProbability;
+    int popularity;
+};
+
+struct User {
+    int id;
+    std::string username;
+    double balance;
+    int totalSpent;
+    int purchaseCount;
+};
+
+struct CartItem {
+    int itemId;
+    int quantity;
+};
+
+struct Cart {
+    int userId;
+    std::vector<CartItem> items;
+};
+
+struct Transaction {
+    int id;
+    int userId;
+    int itemId;
+    double amount;
+    std::string timestamp;
+};
+
+struct ProbabilityConfig {
+    std::map<std::string, double> rarityWeights;
+    std::map<std::string, double> spendingModifiers;
+};
+
+class DatabaseManager {
+    sqlite3* db;
+    std::string dbPath;
+
+public:
+    DatabaseManager() {
+        dbPath = "game.db";
+        sqlite3_open(dbPath.c_str(), &db);
+        InitializeDatabase();
+    }
+
+    ~DatabaseManager() {
+        sqlite3_close(db);
+    }
+
+    void InitializeDatabase() {
+        std::string sql = 
+            "CREATE TABLE IF NOT EXISTS Items ("
+            "Id INTEGER PRIMARY KEY,"
+            "Name TEXT,"
+            "Rarity TEXT,"
+            "Price REAL,"
+            "BaseProbability REAL,"
+            "Popularity INTEGER"
+            ");"
+            "CREATE TABLE IF NOT EXISTS Users ("
+            "Id INTEGER PRIMARY KEY,"
+            "Username TEXT,"
+            "Balance REAL,"
+            "TotalSpent INTEGER,"
+            "PurchaseCount INTEGER"
+            ");"
+            "CREATE TABLE IF NOT EXISTS Carts ("
+            "UserId INTEGER,"
+            "ItemId INTEGER,"
+            "Quantity INTEGER"
+            ");"
+            "CREATE TABLE IF NOT EXISTS Transactions ("
+            "Id INTEGER PRIMARY KEY,"
+            "UserId INTEGER,"
+            "ItemId INTEGER,"
+            "Amount REAL,"
+            "Timestamp TEXT"
+            ");"
+            "INSERT OR IGNORE INTO Items (Id, Name, Rarity, Price, BaseProbability, Popularity) VALUES "
+            "(1, 'Common Sword', 'Common', 10.0, 0.5, 100),"
+            "(2, 'Rare Armor', 'Rare', 50.0, 0.3, 50),"
+            "(3, 'Epic Staff', 'Epic', 100.0, 0.15, 25),"
+            "(4, 'Legendary Crown', 'Legendary', 500.0, 0.05, 10);"
+            "INSERT OR IGNORE INTO Users (Id, Username, Balance, TotalSpent, PurchaseCount) VALUES "
+            "(1, 'player1', 1000.0, 0, 0),"
+            "(2, 'player2', 500.0, 100, 2);";
+
+        sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
+    }
+
+    std::vector<Item> GetItems() {
+        std::vector<Item> items;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Items", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            items.push_back({
+                sqlite3_column_int(stmt, 0),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2))),
+                sqlite3_column_double(stmt, 3),
+                sqlite3_column_double(stmt, 4),
+                sqlite3_column_int(stmt, 5)
+            });
+        }
+        sqlite3_finalize(stmt);
+        return items;
+    }
+
+    User GetUser(int userId) {
+        User user;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Users WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            user = {
+                sqlite3_column_int(stmt, 0),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
+                sqlite3_column_double(stmt, 2),
+                sqlite3_column_int(stmt, 3),
+                sqlite3_column_int(stmt, 4)
+            };
+        }
+        sqlite3_finalize(stmt);
+        return user;
+    }
+
+    void UpdateUser(const User& user) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "UPDATE Users SET Balance = ?, TotalSpent = ?, PurchaseCount = ? WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_double(stmt, 1, user.balance);
+        sqlite3_bind_int(stmt, 2, user.totalSpent);
+        sqlite3_bind_int(stmt, 3, user.purchaseCount);
+        sqlite3_bind_int(stmt, 4, user.id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    Cart GetCart(int userId) {
+        Cart cart{userId, {}};
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Carts WHERE UserId = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            cart.items.push_back({
+                sqlite3_column_int(stmt, 1),
+                sqlite3_column_int(stmt, 2)
+            });
+        }
+        sqlite3_finalize(stmt);
+        return cart;
+    }
+
+    void AddToCart(int userId, int itemId, int quantity) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "INSERT INTO Carts (UserId, ItemId, Quantity) VALUES (?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        sqlite3_bind_int(stmt, 2, itemId);
+        sqlite3_bind_int(stmt, 3, quantity);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    void ClearCart(int userId) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "DELETE FROM Carts WHERE UserId = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    void LogTransaction(int userId, int itemId, double amount) {
+        sqlite3_stmt* stmt;
+        auto timestamp = std::time(nullptr);
+        char buffer[32];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&timestamp));
+        sqlite3_prepare_v2(db, "INSERT INTO Transactions (UserId, ItemId, Amount, Timestamp) VALUES (?, ?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        sqlite3_bind_int(stmt, 2, itemId);
+        sqlite3_bind_double(stmt, 3, amount);
+        sqlite3_bind_text(stmt, 4, buffer, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+};
+
+class ConfigManager {
+public:
+    ProbabilityConfig LoadProbabilityConfig() {
+        std::ifstream file("probability_config.json");
+        json j;
+        file >> j;
+        ProbabilityConfig config;
+        config.rarityWeights = j["RarityWeights"].get<std::map<std::string, double>>();
+        config.spendingModifiers = j["SpendingModifiers"].get<std::map<std::string, double>>();
+        return config;
+    }
+};
+
+class LootBoxManager {
+    DatabaseManager& dbManager;
+    ConfigManager& configManager;
+    std::mt19937 rng;
+
+public:
+    LootBoxManager(DatabaseManager& db, ConfigManager& cfg) : dbManager(db), configManager(cfg), rng(std::random_device{}()) {}
+
+    Item DrawItem(int userId) {
+        auto user = dbManager.GetUser(userId);
+        auto items = dbManager.GetItems();
+        auto config = configManager.LoadProbabilityConfig();
+
+        std::vector<std::pair<Item, double>> weights;
+        double totalWeight = 0.0;
+
+        for (const auto& item : items) {
+            double weight = item.baseProbability * config.rarityWeights[item.rarity];
+            if (user.totalSpent > 1000) {
+                weight *= config.spendingModifiers["HighSpender"];
+            } else if (user.totalSpent < 100) {
+                weight *= config.spendingModifiers["LowSpender"];
+            }
+            weights.emplace_back(item, weight);
+            totalWeight += weight;
+        }
+
+        std::uniform_real_distribution<double> dist(0.0, totalWeight);
+        double roll = dist(rng);
+        double current = 0.0;
+
+        for (const auto& [item, weight] : weights) {
+            current += weight;
+            if (roll <= current) {
+                return item;
+            }
+        }
+
+        return items.back();
+    }
+};
+
+class ItemService {
+    DatabaseManager& dbManager;
+
+public:
+    ItemService(DatabaseManager& db) : dbManager(db) {}
+
+    std::vector<Item> SearchItems(std::string keyword, std::string sortBy) {
+        auto items = dbManager.GetItems();
+        if (!keyword.empty()) {
+            std::transform(keyword.begin(), keyword.end(), keyword.begin(), ::tolower);
+            items.erase(std::remove_if(items.begin(), items.end(), 
+                [&keyword](const Item& i) {
+                    std::string name = i.name;
+                    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+                    return name.find(keyword) == std::string::npos;
+                }), items.end());
+        }
+
+        if (sortBy == "price") {
+            std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.price < b.price; });
+        } else if (sortBy == "rarity") {
+            std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { 
+                return GetRarityValue(a.rarity) < GetRarityValue(b.rarity); 
+            });
+        } else if (sortBy == "popularity") {
+            std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.popularity > b.popularity; });
+        }
+
+        return items;
+    }
+
+private:
+    static int GetRarityValue(const std::string& rarity) {
+        if (rarity == "Common") return 1;
+        if (rarity == "Rare") return 2;
+        if (rarity == "Epic") return 3;
+        if (rarity == "Legendary") return 4;
+        return 0;
+    }
+};
+
+class CartService {
+    DatabaseManager& dbManager;
+
+public:
+    CartService(DatabaseManager& db) : dbManager(db) {}
+
+    Cart GetCart(int userId) {
+        return dbManager.GetCart(userId);
+    }
+
+    void AddToCart(int userId, int itemId, int quantity) {
+        dbManager.AddToCart(userId, itemId, quantity);
+    }
+
+    std::string Checkout(int userId) {
+        auto cart = dbManager.GetCart(userId);
+        auto user = dbManager.GetUser(userId);
+        auto items = dbManager.GetItems();
+
+        double totalCost = 0.0;
+        for (const auto& cartItem : cart.items) {
+            auto it = std::find_if(items.begin(), items.end(), 
+                [&cartItem](const Item& i) { return i.id == cartItem.itemId; });
+            if (it != items.end()) {
+                totalCost += it->price * cartItem.quantity;
+            }
+        }
+
+        if (user.balance >= totalCost) {
+            user.balance -= totalCost;
+            user.totalSpent += static_cast<int>(totalCost);
+            user.purchaseCount += 1;
+            dbManager.UpdateUser(user);
+
+            for (const auto& cartItem : cart.items) {
+                auto it = std::find_if(items.begin(), items.end(), 
+                    [&cartItem](const Item& i) { return i.id == cartItem.itemId; });
+                if (it != items.end()) {
+                    dbManager.LogTransaction(userId, cartItem.itemId, it->price * cartItem.quantity);
+                }
+            }
+
+            dbManager.ClearCart(userId);
+            return "Checkout successful";
+        }
+
+        return "Insufficient balance";
+    }
+};
+
+class TransactionService {
+    DatabaseManager& dbManager;
+
+public:
+    TransactionService(DatabaseManager& db) : dbManager(db) {}
+
+    std::vector<Transaction> GetUserTransactions(int userId) {
+        std::vector<Transaction> transactions;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(dbManager.db, "SELECT * FROM Transactions WHERE UserId = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            transactions.push_back({
+                sqlite3_column_int(stmt, 0),
+                sqlite3_column_int(stmt, 1),
+                sqlite3_column_int(stmt, 2),
+                sqlite3_column_double(stmt, 3),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)))
+            });
+        }
+        sqlite3_finalize(stmt);
+        return transactions;
+    }
+};
+
+class GameBackend {
+    DatabaseManager dbManager;
+    ConfigManager configManager;
+    LootBoxManager lootBoxManager;
+    ItemService itemService;
+    CartService cartService;
+    TransactionService transactionService;
+
+public:
+    GameBackend() : lootBoxManager(dbManager, configManager), itemService(dbManager), 
+                    cartService(dbManager), transactionService(dbManager) {}
+
+    Item DrawItem(int userId) {
+        return lootBoxManager.DrawItem(userId);
+    }
+
+    std::vector<Item> SearchItems(std::string keyword, std::string sortBy) {
+        return itemService.SearchItems(keyword, sortBy);
+    }
+
+    Cart GetCart(int userId) {
+        return cartService.GetCart(userId);
+    }
+
+    void AddToCart(int userId, int itemId, int quantity) {
+        cartService.AddToCart(userId, itemId, quantity);
+    }
+
+    std::string Checkout(int userId) {
+        return cartService.Checkout(userId);
+    }
+
+    std::vector<Transaction> GetTransactions(int userId) {
+        return transactionService.GetUserTransactions(userId);
+    }
+};
+
+struct DrawRequest {
+    int userId;
+};
+
+struct AddToCartRequest {
+    int userId;
+    int itemId;
+    int quantity;
+};
+
+struct CheckoutRequest {
+    int userId;
+};
+
+struct DrawResponse {
+    int itemId;
+    std::string itemName;
+    std::string rarity;
+};

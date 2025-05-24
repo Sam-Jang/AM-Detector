@@ -1,0 +1,114 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+
+public class Startup
+{
+    public void ConfigureServices(IServiceCollection services)
+    {
+        services.AddControllersWithViews();
+        services.AddRazorPages();
+    }
+
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+    {
+        if (env.IsDevelopment())
+        {
+            app.UseDeveloperExceptionPage();
+        }
+        else
+        {
+            app.UseExceptionHandler("/Home/Error");
+            app.UseHsts();
+        }
+
+        app.UseHttpsRedirection();
+        app.UseStaticFiles();
+
+        app.UseRouting();
+        app.UseAuthorization();
+
+        app.UseEndpoints(endpoints =>
+        {
+            endpoints.MapControllerRoute(
+                name: "default",
+                pattern: "{controller=Home}/{action=Index}/{id?}");
+        });
+    }
+}
+
+public class HomeController : Controller
+{
+    private static List<(string Username, string Comment)> comments = new List<(string, string)>();
+
+    public IActionResult Index()
+    {
+        return View();
+    }
+
+    public IActionResult Form1(string name)
+    {
+        ViewData["Name"] = name;
+        return View();
+    }
+
+    [HttpGet]
+    public IActionResult Form2()
+    {
+        return View();
+    }
+
+    [HttpPost]
+    public IActionResult Submit2(string username, string comment)
+    {
+        comments.Add((username, comment));
+        return RedirectToAction("Comments");
+    }
+
+    public IActionResult Form3(string message)
+    {
+        ViewData["Message"] = message;
+        return View();
+    }
+
+    public IActionResult Form4()
+    {
+        var userAgent = Request.Headers["User-Agent"].ToString();
+        ViewData["UserAgent"] = userAgent;
+        return View();
+    }
+
+    public IActionResult Form5()
+    {
+        return View();
+    }
+
+    public IActionResult Comments()
+    {
+        ViewData["Comments"] = comments;
+        return View();
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> Upload(IFormFile products)
+    {
+        if (products == null || products.Length == 0)
+        {
+            return BadRequest("No files were uploaded.");
+        }
+
+        var filePath = Path.Combine("/usr/app/temp", products.FileName);
+        using (var stream = new FileStream(filePath, FileMode.Create))
+        {
+            await products.CopyToAsync(stream);
+        }
+
+        return Ok("Upload success");
+    }
+}

@@ -1,0 +1,490 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.IO;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Configuration;
+
+namespace RpgGameBackend
+{
+    public class User
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string PasswordHash { get; set; }
+        public decimal Balance { get; set; }
+        public int TotalSpent { get; set; }
+    }
+
+    public class Character
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public string Name { get; set; }
+        public int Level { get; set; }
+        public int Experience { get; set; }
+    }
+
+    public class Item
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public string Type { get; set; }
+        public int Rarity { get; set; }
+        public decimal Price { get; set; }
+        public double BaseDropRate { get; set; }
+    }
+
+    public class InventoryItem
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class CartItem
+    {
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class PurchaseHistory
+    {
+        public int Id { get; set; }
+        public int UserId { get; set; }
+        public decimal Amount { get; set; }
+        public DateTime Timestamp { get; set; }
+    }
+
+    public class DropRateConfig
+    {
+        public Dictionary<int, double> ItemDropRates { get; set; }
+        public double HighSpenderBonus { get; set; }
+        public double LowSpenderPenalty { get; set; }
+    }
+
+    [ApiController]
+    [Route("api")]
+    public class GameController : ControllerBase
+    {
+        private readonly string _dbPath;
+        private readonly DropRateConfig _dropConfig;
+
+        public GameController(IConfiguration config)
+        {
+            _dbPath = config.GetValue<string>("Database:Path");
+            var configPath = config.GetValue<string>("Config:DropRates");
+            _dropConfig = LoadDropConfig(configPath);
+            InitializeDatabase();
+        }
+
+        private DropRateConfig LoadDropConfig(string path)
+        {
+            var json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<DropRateConfig>(json);
+        }
+
+        private void InitializeDatabase()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                CREATE TABLE IF NOT EXISTS Users (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Username TEXT UNIQUE,
+                    PasswordHash TEXT,
+                    Balance REAL,
+                    TotalSpent INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS Characters (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    UserId INTEGER,
+                    Name TEXT,
+                    Level INTEGER,
+                    Experience INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS Items (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Name TEXT,
+                    Type TEXT,
+                    Rarity INTEGER,
+                    Price REAL,
+                    BaseDropRate REAL
+                );
+                CREATE TABLE IF NOT EXISTS Inventory (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    UserId INTEGER,
+                    ItemId INTEGER,
+                    Quantity INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS PurchaseHistory (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    UserId INTEGER,
+                    Amount REAL,
+                    Timestamp TEXT
+                );";
+            cmd.ExecuteNonQuery();
+        }
+
+        private string HashPassword(string password)
+        {
+            using var sha256 = SHA256.Create();
+            var bytes = Encoding.UTF8.GetBytes(password);
+            var hash = sha256.ComputeHash(bytes);
+            return Convert.ToBaseString(hash);
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] RegisterRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO Users (Username, PasswordHash, Balance, TotalSpent) VALUES ($username, $hash, $balance, $spent)";
+            cmd.Parameters.AddWithValue("$username", req.Username);
+            cmd.Parameters.AddWithValue("$hash", HashPassword(req.Password));
+            cmd.Parameters.AddWithValue("$balance", 1000.0);
+            cmd.Parameters.AddWithValue("$spent", 0);
+            try
+            {
+                await cmd.ExecuteNonQueryAsync();
+                return Ok(new { Message = "Registration successful" });
+            }
+            catch (SqliteException)
+            {
+                return BadRequest(new { Error = "Username already exists" });
+            }
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, PasswordHash FROM Users WHERE Username = $username";
+            cmd.Parameters.AddWithValue("$username", req.Username);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                var id = reader.GetInt32(0);
+                var hash = reader.GetString(1);
+                if (hash == HashPassword(req.Password))
+                {
+                    var token = Guid.NewGuid().ToString();
+                    return Ok(new { Token = token, UserId = id });
+                }
+            }
+            return Unauthorized(new { Error = "Invalid credentials" });
+        }
+
+        [HttpPost("characters")]
+        public async Task<IActionResult> CreateCharacter([FromBody] CharacterRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO Characters (UserId, Name, Level, Experience) VALUES ($userId, $name, $level, $exp)";
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            cmd.Parameters.AddWithValue("$name", req.Name);
+            cmd.Parameters.AddWithValue("$level", 1);
+            cmd.Parameters.AddWithValue("$exp", 0);
+            await cmd.ExecuteNonQueryAsync();
+            return Ok(new { Message = "Character created" });
+        }
+
+        [HttpGet("characters/{userId}")]
+        public async Task<IActionResult> GetCharacters(int userId)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, Name, Level, Experience FROM Characters WHERE UserId = $userId";
+            cmd.Parameters.AddWithValue("$userId", userId);
+            var characters = new List<Character>();
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                characters.Add(new Character
+                {
+                    Id = reader.GetInt32(0),
+                    Name = reader.GetString(1),
+                    Level = reader.GetInt32(2),
+                    Experience = reader.GetInt32(3)
+                });
+            }
+            return Ok(characters);
+        }
+
+        [HttpGet("items")]
+        public async Task<IActionResult> GetItems([FromQuery] string keyword = "", [FromQuery] string sort = "name")
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            var query = "SELECT Id, Name, Type, Rarity, Price, BaseDropRate FROM Items";
+            if (!string.IsNullOrEmpty(keyword))
+            {
+                query += " WHERE Name LIKE $keyword";
+                cmd.Parameters.AddWithValue("$keyword", $"%{keyword}%");
+            }
+            query += sort switch
+            {
+                "price" => " ORDER BY Price ASC",
+                "rarity" => " ORDER BY Rarity DESC",
+                "name" => " ORDER BY Name ASC",
+                _ => " ORDER BY Name ASC"
+            };
+            cmd.CommandText = query;
+            var items = new List<Item>();
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                items.Add(new Item
+                {
+                    Id = reader.GetInt32(0),
+                    Name = reader.GetString(1),
+                    Type = reader.GetString(2),
+                    Rarity = reader.GetInt32(3),
+                    Price = reader.GetDecimal(4),
+                    BaseDropRate = reader.GetDouble(5)
+                });
+            }
+            return Ok(items);
+        }
+
+        [HttpPost("cart/add")]
+        public async Task<IActionResult> AddToCart([FromBody] CartRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Price FROM Items WHERE Id = $itemId";
+            cmd.Parameters.AddWithValue("$itemId", req.ItemId);
+            var price = (decimal)(await cmd.ExecuteScalarAsync());
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE Users SET Balance = Balance - $amount, TotalSpent = TotalSpent + $amount WHERE Id = $userId AND Balance >= $amount";
+            cmd.Parameters.AddWithValue("$amount", price * req.Quantity);
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            var rows = await cmd.ExecuteNonQueryAsync();
+            if (rows == 0)
+            {
+                return BadRequest(new { Error = "Insufficient balance" });
+            }
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES ($userId, $itemId, $quantity) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + $quantity";
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            cmd.Parameters.AddWithValue("$itemId", req.ItemId);
+            cmd.Parameters.AddWithValue("$quantity", req.Quantity);
+            await cmd.ExecuteNonQueryAsync();
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO PurchaseHistory (UserId, Amount, Timestamp) VALUES ($userId, $amount, $time)";
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            cmd.Parameters.AddWithValue("$amount", price * req.Quantity);
+            cmd.Parameters.AddWithValue("$time", DateTime.UtcNow.ToString("o"));
+            await cmd.ExecuteNonQueryAsync();
+            return Ok(new { Message = "Item added to inventory" });
+        }
+
+        [HttpGet("inventory/{userId}")]
+        public async Task<IActionResult> GetInventory(int userId)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT i.Id, i.ItemId, i.Quantity, it.Name, it.Type, it.Rarity, it.Price FROM Inventory i JOIN Items it ON i.ItemId = it.Id WHERE i.UserId = $userId";
+            cmd.Parameters.AddWithValue("$userId", userId);
+            var inventory = new List<InventoryItemResponse>();
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                inventory.Add(new InventoryItemResponse
+                {
+                    Id = reader.GetInt32(0),
+                    ItemId = reader.GetInt32(1),
+                    Quantity = reader.GetInt32(2),
+                    ItemName = reader.GetString(3),
+                    ItemType = reader.GetString(4),
+                    Rarity = reader.GetInt32(5),
+                    Price = reader.GetDecimal(6)
+                });
+            }
+            return Ok(inventory);
+        }
+
+        [HttpPost("gacha")]
+        public async Task<IActionResult> RollGacha([FromBody] GachaRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT TotalSpent FROM Users WHERE Id = $userId";
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            var totalSpent = (int)(await cmd.ExecuteScalarAsync());
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT Id, BaseDropRate FROM Items WHERE Type = 'Premium'";
+            var items = new List<Item>();
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                items.Add(new Item
+                {
+                    Id = reader.GetInt32(0),
+                    BaseDropRate = reader.GetDouble(1)
+                });
+            }
+            var adjustedRates = AdjustDropRates(items, totalSpent);
+            var rng = new Random();
+            var roll = rng.NextDouble() * adjustedRates.Sum(r => r.Value);
+            double cumulative = 0;
+            int selectedItemId = 0;
+            foreach (var rate in adjustedRates)
+            {
+                cumulative += rate.Value;
+                if (roll <= cumulative)
+                {
+                    selectedItemId = rate.Key;
+                    break;
+                }
+            }
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO Inventory (UserId, ItemId, Quantity) VALUES ($userId, $itemId, $quantity) ON CONFLICT(UserId, ItemId) DO UPDATE SET Quantity = Quantity + $quantity";
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            cmd.Parameters.AddWithValue("$itemId", selectedItemId);
+            cmd.Parameters.AddWithValue("$quantity", 1);
+            await cmd.ExecuteNonQueryAsync();
+            cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE Users SET Balance = Balance - $cost WHERE Id = $userId AND Balance >= $cost";
+            cmd.Parameters.AddWithValue("$cost", 100.0);
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            var rows = await cmd.ExecuteNonQueryAsync();
+            if (rows == 0)
+            {
+                return BadRequest(new { Error = "Insufficient balance for gacha" });
+            }
+            return Ok(new { ItemId = selectedItemId });
+        }
+
+        private Dictionary<int, double> AdjustDropRates(List<Item> items, int totalSpent)
+        {
+            var adjusted = new Dictionary<int, double>();
+            double modifier = totalSpent > 10000 ? _dropConfig.HighSpenderBonus : _dropConfig.LowSpenderPenalty;
+            foreach (var item in items)
+            {
+                var rate = _dropConfig.ItemDropRates.ContainsKey(item.Id)
+                    ? _dropConfig.ItemDropRates[item.Id]
+                    : item.BaseDropRate;
+                adjusted[item.Id] = rate * modifier;
+            }
+            return adjusted;
+        }
+
+        [HttpGet("leaderboard")]
+        public async Task<IActionResult> GetLeaderboard()
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT u.Username, MAX(c.Level) as TopLevel FROM Users u JOIN Characters c ON u.Id = c.UserId GROUP BY u.Id ORDER BY TopLevel DESC LIMIT 10";
+            var leaderboard = new List<LeaderboardEntry>();
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                leaderboard.Add(new LeaderboardEntry
+                {
+                    Username = reader.GetString(0),
+                    TopLevel = reader.GetInt32(1)
+                });
+            }
+            return Ok(leaderboard);
+        }
+
+        [HttpPost("deposit")]
+        public async Task<IActionResult> Deposit([FromBody] DepositRequest req)
+        {
+            using var conn = new SqliteConnection($"Data Source={_dbPath}");
+            await conn.OpenAsync();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE Users SET Balance = Balance + $amount WHERE Id = $userId";
+            cmd.Parameters.AddWithValue("$amount", req.Amount);
+            cmd.Parameters.AddWithValue("$userId", req.UserId);
+            await cmd.ExecuteNonQueryAsync();
+            return Ok(new { Message = "Deposit successful" });
+        }
+    }
+
+    public class RegisterRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class LoginRequest
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+    }
+
+    public class CharacterRequest
+    {
+        public int UserId { get; set; }
+        public string Name { get; set; }
+    }
+
+    public class CartRequest
+    {
+        public int UserId { get; set; }
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    public class GachaRequest
+    {
+        public int UserId { get; set; }
+    }
+
+    public class DepositRequest
+    {
+        public int UserId { get; set; }
+        public decimal Amount { get; set; }
+    }
+
+    public class InventoryItemResponse
+    {
+        public int Id { get; set; }
+        public int ItemId { get; set; }
+        public int Quantity { get; set; }
+        public string ItemName { get; set; }
+        public string ItemType { get; set; }
+        public int Rarity { get; set; }
+        public decimal Price { get; set; }
+    }
+
+    public class LeaderboardEntry
+    {
+        public string Username { get; set; }
+        public int TopLevel { get; set; }
+    }
+
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Configuration.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+            builder.Services.AddControllers();
+            var app = builder.Build();
+            app.UseRouting();
+            app.MapControllers();
+            await app.RunAsync();
+        }
+    }
+}

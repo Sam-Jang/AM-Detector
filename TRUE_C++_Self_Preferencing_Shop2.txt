@@ -1,0 +1,597 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <memory>
+#include <sqlite3.h>
+#include <crow.h>
+#include <nlohmann/json.hpp>
+#include <bcrypt.h>
+
+using json = nlohmann::json;
+
+struct Product {
+    int id;
+    std::string name;
+    std::string description;
+    double price;
+    double discountedPrice;
+    bool isSponsored;
+    bool isOwnBrand;
+    int stockQuantity;
+    std::string category;
+};
+
+struct User {
+    int id;
+    std::string username;
+    std::string email;
+    std::string passwordHash;
+};
+
+struct CartItem {
+    int id;
+    int userId;
+    int productId;
+    int quantity;
+};
+
+struct SearchConfig {
+    double relevanceWeight;
+    double priceWeight;
+    double discountWeight;
+    double sponsorBias;
+    double ownBrandBias;
+};
+
+class Database {
+private:
+    sqlite3* db;
+
+public:
+    Database(const std::string& path) {
+        sqlite3_open(path.c_str(), &db);
+        createTables();
+    }
+
+    ~Database() {
+        sqlite3_close(db);
+    }
+
+    void createTables() {
+        const char* sql = 
+            "CREATE TABLE IF NOT EXISTS Products ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "Name TEXT NOT NULL, "
+            "Description TEXT, "
+            "Price REAL, "
+            "DiscountedPrice REAL, "
+            "IsSponsored INTEGER, "
+            "IsOwnBrand INTEGER, "
+            "StockQuantity INTEGER, "
+            "Category TEXT, "
+            "FULLTEXT INDEX idx_name (Name), "
+            "FULLTEXT INDEX idx_desc (Description));"
+            "CREATE TABLE IF NOT EXISTS Users ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "Username TEXT NOT NULL UNIQUE, "
+            "Email TEXT, "
+            "PasswordHash TEXT);"
+            "CREATE TABLE IF NOT EXISTS CartItems ("
+            "Id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "UserId INTEGER, "
+            "ProductId INTEGER, "
+            "Quantity INTEGER, "
+            "FOREIGN KEY(UserId) REFERENCES Users(Id), "
+            "FOREIGN KEY(ProductId) REFERENCES Products(Id));";
+        sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+    }
+
+    std::vector<Product> searchProducts(const std::string& query) {
+        std::vector<Product> products;
+        std::string sql = "SELECT * FROM Products WHERE Name LIKE ? OR Description LIKE ?";
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+        std::string likeQuery = "%" + query + "%";
+        sqlite3_bind_text(stmt, 1, likeQuery.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, likeQuery.c_str(), -1, SQLITE_STATIC);
+        
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Product p;
+            p.id = sqlite3_column_int(stmt, 0);
+            p.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            p.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            p.price = sqlite3_column_double(stmt, 3);
+            p.discountedPrice = sqlite3_column_double(stmt, 4);
+            p.isSponsored = sqlite3_column_int(stmt, 5);
+            p.isOwnBrand = sqlite3_column_int(stmt, 6);
+            p.stockQuantity = sqlite3_column_int(stmt, 7);
+            p.category = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+            products.push_back(p);
+        }
+        sqlite3_finalize(stmt);
+        return products;
+    }
+
+    double getMaxPrice() {
+        double maxPrice = 0;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT MAX(Price) FROM Products", -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            maxPrice = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        return maxPrice;
+    }
+
+    std::vector<CartItem> getCart(int userId) {
+        std::vector<CartItem> items;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM CartItems WHERE UserId = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, userId);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CartItem item;
+            item.id = sqlite3_column_int(stmt, 0);
+            item.userId = sqlite3_column_int(stmt, 1);
+            item.productId = sqlite3_column_int(stmt, 2);
+            item.quantity = sqlite3_column_int(stmt, 3);
+            items.push_back(item);
+        }
+        sqlite3_finalize(stmt);
+        return items;
+    }
+
+    bool addCartItem(CartItem item) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT StockQuantity FROM Products WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, item.productId);
+        if (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) < item.quantity) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "INSERT INTO CartItems (UserId, ProductId, Quantity) VALUES (?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, item.userId);
+        sqlite3_bind_int(stmt, 2, item.productId);
+        sqlite3_bind_int(stmt, 3, item.quantity);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+
+        if (success) {
+            sqlite3_prepare_v2(db, "UPDATE Products SET StockQuantity = StockQuantity - ? WHERE Id = ?", -1, &stmt, nullptr);
+            sqlite3_bind_int(stmt, 1, item.quantity);
+            sqlite3_bind_int(stmt, 2, item.productId);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        return success;
+    }
+
+    bool updateCartItem(int id, int quantity) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT ProductId, Quantity FROM CartItems WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        int productId = sqlite3_column_int(stmt, 0);
+        int oldQuantity = sqlite3_column_int(stmt, 1);
+        sqlite3_finalize(stmt);
+
+        int quantityDiff = quantity - oldQuantity;
+        sqlite3_prepare_v2(db, "SELECT StockQuantity FROM Products WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, productId);
+        if (sqlite3_step(stmt) != SQLITE_ROW || sqlite3_column_int(stmt, 0) < quantityDiff) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "UPDATE CartItems SET Quantity = ? WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, quantity);
+        sqlite3_bind_int(stmt, 2, id);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+
+        if (success) {
+            sqlite3_prepare_v2(db, "UPDATE Products SET StockQuantity = StockQuantity - ? WHERE Id = ?", -1, &stmt, nullptr);
+            sqlite3_bind_int(stmt, 1, quantityDiff);
+            sqlite3_bind_int(stmt, 2, productId);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        return success;
+    }
+
+    bool removeCartItem(int id) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT ProductId, Quantity FROM CartItems WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        int productId = sqlite3_column_int(stmt, 0);
+        int quantity = sqlite3_column_int(stmt, 1);
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "DELETE FROM CartItems WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+
+        if (success) {
+            sqlite3_prepare_v2(db, "UPDATE Products SET StockQuantity = StockQuantity + ? WHERE Id = ?", -1, &stmt, nullptr);
+            sqlite3_bind_int(stmt, 1, quantity);
+            sqlite3_bind_int(stmt, 2, productId);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        return success;
+    }
+
+    bool registerUser(User user) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT Id FROM Users WHERE Username = ?", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, user.username.c_str(), -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "INSERT INTO Users (Username, Email, PasswordHash) VALUES (?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, user.username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, user.email.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, user.passwordHash.c_str(), -1, SQLITE_STATIC);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return success;
+    }
+
+    User loginUser(const std::string& username, const std::string& password) {
+        User user;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Users WHERE Username = ?", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            user.id = sqlite3_column_int(stmt, 0);
+            user.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            user.email = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            user.passwordHash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            if (bcrypt_checkpw(password.c_str(), user.passwordHash.c_str()) == 0) {
+                sqlite3_finalize(stmt);
+                return user;
+            }
+        }
+        sqlite3_finalize(stmt);
+        return User();
+    }
+
+    User getUser(int id) {
+        User user;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Users WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            user.id = sqlite3_column_int(stmt, 0);
+            user.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            user.email = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            user.passwordHash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        }
+        sqlite3_finalize(stmt);
+        return user;
+    }
+
+    std::vector<Product> getProducts() {
+        std::vector<Product> products;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Products", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Product p;
+            p.id = sqlite3_column_int(stmt, 0);
+            p.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            p.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            p.price = sqlite3_column_double(stmt, 3);
+            p.discountedPrice = sqlite3_column_double(stmt, 4);
+            p.isSponsored = sqlite3_column_int(stmt, 5);
+            p.isOwnBrand = sqlite3_column_int(stmt, 6);
+            p.stockQuantity = sqlite3_column_int(stmt, 7);
+            p.category = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+            products.push_back(p);
+        }
+        sqlite3_finalize(stmt);
+        return products;
+    }
+
+    Product getProduct(int id) {
+        Product p;
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Products WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            p.id = sqlite3_column_int(stmt, 0);
+            p.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            p.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            p.price = sqlite3_column_double(stmt, 3);
+            p.discountedPrice = sqlite3_column_double(stmt, 4);
+            p.isSponsored = sqlite3_column_int(stmt, 5);
+            p.isOwnBrand = sqlite3_column_int(stmt, 6);
+            p.stockQuantity = sqlite3_column_int(stmt, 7);
+            p.category = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        }
+        sqlite3_finalize(stmt);
+        return p;
+    }
+
+    bool createProduct(Product p) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "INSERT INTO Products (Name, Description, Price, DiscountedPrice, IsSponsored, IsOwnBrand, StockQuantity, Category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, p.name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, p.description.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 3, p.price);
+        sqlite3_bind_double(stmt, 4, p.discountedPrice);
+        sqlite3_bind_int(stmt, 5, p.isSponsored);
+        sqlite3_bind_int(stmt, 6, p.isOwnBrand);
+        sqlite3_bind_int(stmt, 7, p.stockQuantity);
+        sqlite3_bind_text(stmt, 8, p.category.c_str(), -1, SQLITE_STATIC);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return success;
+    }
+
+    bool updateProduct(int id, Product p) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "UPDATE Products SET Name = ?, Description = ?, Price = ?, DiscountedPrice = ?, IsSponsored = ?, IsOwnBrand = ?, StockQuantity = ?, Category = ? WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, p.name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, p.description.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 3, p.price);
+        sqlite3_bind_double(stmt, 4, p.discountedPrice);
+        sqlite3_bind_int(stmt, 5, p.isSponsored);
+        sqlite3_bind_int(stmt, 6, p.isOwnBrand);
+        sqlite3_bind_int(stmt, 7, p.stockQuantity);
+        sqlite3_bind_text(stmt, 8, p.category.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 9, id);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return success;
+    }
+
+    bool deleteProduct(int id) {
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "DELETE FROM Products WHERE Id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int(stmt, 1, id);
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return success;
+    }
+};
+
+class SearchService {
+private:
+    Database& db;
+    SearchConfig config;
+
+    double calculateRelevanceScore(const Product& product, const std::string& query) {
+        std::vector<std::string> queryWords;
+        std::string temp;
+        for (char c : query) {
+            if (c == ' ') {
+                if (!temp.empty()) queryWords.push_back(temp);
+                temp.clear();
+            } else {
+                temp += std::tolower(c);
+            }
+        }
+        if (!temp.empty()) queryWords.push_back(temp);
+
+        std::vector<std::string> nameWords;
+        temp.clear();
+        for (char c : product.name) {
+            if (c == ' ') {
+                if (!temp.empty()) nameWords.push_back(temp);
+                temp.clear();
+            } else {
+                temp += std::tolower(c);
+            }
+        }
+        if (!temp.empty()) nameWords.push_back(temp);
+
+        std::vector<std::string> descWords;
+        temp.clear();
+        for (char c : product.description) {
+            if (c == ' ') {
+                if (!temp.empty()) descWords.push_back(temp);
+                temp.clear();
+            } else {
+                temp += std::tolower(c);
+            }
+        }
+        if (!temp.empty()) descWords.push_back(temp);
+
+        double score = 0;
+        for (const auto& qw : queryWords) {
+            for (const auto& nw : nameWords) {
+                if (qw == nw) score += 0.6;
+            }
+            for (const auto& dw : descWords) {
+                if (qw == dw) score += 0.4;
+            }
+        }
+        return queryWords.empty() ? 0 : score / queryWords.size();
+    }
+
+    double calculateProductScore(const Product& product, const std::string& query, const std::string& sortBy) {
+        double score = 0;
+        if (sortBy == "relevance") {
+            score += calculateRelevanceScore(product, query) * config.relevanceWeight;
+            score += (1 - (product.price / db.getMaxPrice())) * config.priceWeight;
+            score += (product.price - product.discountedPrice) / product.price * config.discountWeight;
+            if (product.isSponsored) score += config.sponsorBias;
+            if (product.isOwnBrand) score += config.ownBrandBias;
+        } else if (sortBy == "price_asc") {
+            score = product.discountedPrice == 0 ? product.price : product.discountedPrice;
+            score = 1 / (score + 1);
+        } else if (sortBy == "price_desc") {
+            score = product.discountedPrice == 0 ? product.price : product.discountedPrice;
+        } else if (sortBy == "discount") {
+            score = (product.price - product.discountedPrice) / product.price;
+        }
+        return score;
+    }
+
+public:
+    SearchService(Database& database, const std::string& configPath) : db(database) {
+        std::ifstream file(configPath);
+        json j;
+        file >> j;
+        config.relevanceWeight = j["RelevanceWeight"];
+        config.priceWeight = j["PriceWeight"];
+        config.discountWeight = j["DiscountWeight"];
+        config.sponsorBias = j["SponsorBias"];
+        config.ownBrandBias = j["OwnBrandBias"];
+    }
+
+    std::vector<Product> search(const std::string& query, const std::string& sortBy, int page, int pageSize) {
+        auto products = db.searchProducts(query);
+        std::vector<std::pair<Product, double>> scoredProducts;
+        for (const auto& p : products) {
+            scoredProducts.emplace_back(p, calculateProductScore(p, query, sortBy));
+        }
+        std::sort(scoredProducts.begin(), scoredProducts.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        std::vector<Product> result;
+        int start = (page - 1) * pageSize;
+        int end = std::min(start + pageSize, static_cast<int>(scoredProducts.size()));
+        for (int i = start; i < end; ++i) {
+            result.push_back(scoredProducts[i].first);
+        }
+        return result;
+    }
+};
+
+int main() {
+    Database db("ecommerce.db");
+    SearchService search(db, "search_config.json");
+    crow::SimpleApp app;
+
+    CROW_ROUTE(app, "/api/search")([&search](const crow::request& req) {
+        auto query = req.url_params.get("query");
+        auto sortBy = req.url_params.get("sortBy") ? std::string(req.url_params.get("sortBy")) : "relevance";
+        int page = req.url_params.get("page") ? std::stoi(req.url_params.get("page")) : 1;
+        int pageSize = req.url_params.get("pageSize") ? std::stoi(req.url_params.get("pageSize")) : 10;
+        
+        if (!query) return crow::response(400, "Query parameter required");
+        
+        auto products = search.search(query, sortBy, page, pageSize);
+        json j = products;
+        return crow::response(j.dump());
+    });
+
+    CROW_ROUTE(app, "/api/cart/<int>")([&db](int userId) {
+        auto items = db.getCart(userId);
+        json j = items;
+        return crow::response(j.dump());
+    });
+
+    CROW_ROUTE(app, "/api/cart").methods("POST"_method)([&db](const crow::request& req) {
+        auto j = json::parse(req.body);
+        CartItem item{j["UserId"], j["UserId"], j["ProductId"], j["Quantity"]};
+        if (db.addCartItem(item)) {
+            json result = item;
+            return crow::response(201, result.dump());
+        }
+        return crow::response(400, "Product unavailable or insufficient stock");
+    });
+
+    CROW_ROUTE(app, "/api/cart/<int>").methods("PUT"_method)([&db](const crow::request& req, int id) {
+        auto j = json::parse(req.body);
+        if (db.updateCartItem(id, j["Quantity"])) {
+            return crow::response(204);
+        }
+        return crow::response(400, "Insufficient stock or item not found");
+    });
+
+    CROW_ROUTE(app, "/api/cart/<int>").methods("DELETE"_method)([&db](int id) {
+        if (db.removeCartItem(id)) {
+            return crow::response(204);
+        }
+        return crow::response(404, "Item not found");
+    });
+
+    CROW_ROUTE(app, "/api/user/register").methods("POST"_method)([&db](const crow::request& req) {
+        auto j = json::parse(req.body);
+        User user{0, j["Username"], j["Email"], bcrypt_hashpw(j["Password"].get<std::string>().c_str(), bcrypt_gensalt().get())};
+        if (db.registerUser(user)) {
+            json result = user;
+            return crow::response(201, result.dump());
+        }
+        return crow::response(400, "Username already exists");
+    });
+
+    CROW_ROUTE(app, "/api/user/login").methods("POST"_method)([&db](const crow::request& req) {
+        auto j = json::parse(req.body);
+        auto user = db.loginUser(j["Username"], j["Password"]);
+        if (user.id != 0) {
+            json result = user;
+            return crow::response(result.dump());
+        }
+        return crow::response(401, "Invalid credentials");
+    });
+
+    CROW_ROUTE(app, "/api/user/<int>")([&db](int id) {
+        auto user = db.getUser(id);
+        if (user.id != 0) {
+            json j = user;
+            return crow::response(j.dump());
+        }
+        return crow::response(404, "User not found");
+    });
+
+    CROW_ROUTE(app, "/api/product")([&db] {
+        auto products = db.getProducts();
+        json j = products;
+        return crow::response(j.dump());
+    });
+
+    CROW_ROUTE(app, "/api/product/<int>")([&db](int id) {
+        auto product = db.getProduct(id);
+        if (product.id != 0) {
+            json j = product;
+            return crow::response(j.dump());
+        }
+        return crow::response(404, "Product not found");
+    });
+
+    CROW_ROUTE(app, "/api/product").methods("POST"_method)([&db](const crow::request& req) {
+        auto j = json::parse(req.body);
+        Product p{0, j["Name"], j["Description"], j["Price"], j["DiscountedPrice"], j["IsSponsored"], j["IsOwnBrand"], j["StockQuantity"], j["Category"]};
+        if (db.createProduct(p)) {
+            json result = p;
+            return crow::response(201, result.dump());
+        }
+        return crow::response(400);
+    });
+
+    CROW_ROUTE(app, "/api/product/<int>").methods("PUT"_method)([&db](const crow::request& req, int id) {
+        auto j = json::parse(req.body);
+        Product p{0, j["Name"], j["Description"], j["Price"], j["DiscountedPrice"], j["IsSponsored"], j["IsOwnBrand"], j["StockQuantity"], j["Category"]};
+        if (db.updateProduct(id, p)) {
+            return crow::response(204);
+        }
+        return crow::response(404, "Product not found");
+    });
+
+    CROW_ROUTE(app, "/api/product/<int>").methods("DELETE"_method)([&db](int id) {
+        if (db.deleteProduct(id)) {
+            return crow::response(204);
+        }
+        return crow::response(404, "Product not found");
+    });
+
+    app.port(8080).multithreaded().run();
+    return 0;
+}

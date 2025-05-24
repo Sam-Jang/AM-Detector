@@ -1,0 +1,649 @@
+package com.taxi.app;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.*;
+import jakarta.persistence.*;
+import jakarta.transaction.Transactional;
+import lombok.Data;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.security.Key;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+
+@SpringBootApplication
+public class TaxiMatchingApp {
+    public static void main(String[] args) {
+        SpringApplication.run(TaxiMatchingApp.class, args);
+    }
+}
+
+@Configuration
+@EnableWebSecurity
+class SecurityConfig {
+    private final JwtAuthenticationFilter jwtAuthFilter;
+    private final UserDetailsService userDetailsService;
+
+    public SecurityConfig(JwtAuthenticationFilter jwtAuthFilter, UserDetailsService userDetailsService) {
+        this.jwtAuthFilter = jwtAuthFilter;
+        this.userDetailsService = userDetailsService;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf().disable()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            .and()
+            .authorizeHttpRequests()
+            .requestMatchers("/api/users/register", "/api/users/login", "/api/drivers/register").permitAll()
+            .anyRequest().authenticated()
+            .and()
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+
+@Service
+class JwtAuthenticationFilter extends UsernamePasswordAuthenticationFilter {
+    private final AuthenticationManager authenticationManager;
+    private final Key jwtKey;
+    private final String jwtIssuer;
+    private final String jwtAudience;
+
+    public JwtAuthenticationFilter(AuthenticationManager authenticationManager,
+                                 @Value("${jwt.key}") String jwtKey,
+                                 @Value("${jwt.issuer}") String jwtIssuer,
+                                 @Value("${jwt.audience}") String jwtAudience) {
+        this.authenticationManager = authenticationManager;
+        this.jwtKey = Keys.hmacShaKeyFor(jwtKey.getBytes());
+        this.jwtIssuer = jwtIssuer;
+        this.jwtAudience = jwtAudience;
+        setFilterProcessesUrl("/api/users/login");
+    }
+
+    @Override
+    public Authentication attemptAuthentication(jakarta.servlet.http.HttpServletRequest request,
+                                              jakarta.servlet.http.HttpServletResponse response) throws org.springframework.security.core.AuthenticationException {
+        try {
+            UserLoginDto creds = new ObjectMapper().readValue(request.getInputStream(), UserLoginDto.class);
+            return authenticationManager.authenticate(
+                new UsernamePasswordAuthenticationToken(creds.getUsername(), creds.getPassword())
+            );
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    protected void successfulAuthentication(jakarta.servlet.http.HttpServletRequest request,
+                                          jakarta.servlet.http.HttpServletResponse response,
+                                          jakarta.servlet.FilterChain chain,
+                                          Authentication authResult) throws java.io.IOException, jakarta.servlet.ServletException {
+        String token = Jwts.builder()
+            .setSubject(authResult.getName())
+            .claim("roles", authResult.getAuthorities())
+            .setIssuer(jwtIssuer)
+            .setAudience(jwtAudience)
+            .setExpiration(Date.from(Instant.now().plus(1, ChronoUnit.HOURS)))
+            .signWith(jwtKey, SignatureAlgorithm.HS256)
+            .compact();
+        response.addHeader("Authorization", "Bearer " + token);
+        response.getWriter().write("{\"token\": \"" + token + "\"}");
+    }
+}
+
+@Service
+class CustomUserDetailsService implements UserDetailsService {
+    private final UserRepository userRepository;
+
+    public CustomUserDetailsService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        User user = userRepository.findByUsername(username)
+            .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+        return org.springframework.security.core.userdetails.User
+            .withUsername(user.getUsername())
+            .password(user.getPasswordHash())
+            .roles(user.getRole())
+            .build();
+    }
+}
+
+@Data
+@Entity
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private String username;
+    private String passwordHash;
+    private String email;
+    private String phone;
+    private String role;
+}
+
+@Data
+@Entity
+class Driver {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private String name;
+    private boolean isAffiliated;
+    private double latitude;
+    private double longitude;
+    private boolean isAvailable;
+    private double acceptanceRate;
+    private double rating;
+}
+
+@Data
+@Entity
+class Ride {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private int riderId;
+    @ManyToOne
+    @JoinColumn(name = "riderId", insertable = false, updatable = false)
+    private User rider;
+    private Integer driverId;
+    @ManyToOne
+    @JoinColumn(name = "driverId", insertable = false, updatable = false)
+    private Driver driver;
+    private double startLat;
+    private double startLon;
+    private double endLat;
+    private double endLon;
+    private String status;
+    private Date requestTime;
+    private Date acceptTime;
+    private Date completeTime;
+    private double distance;
+    private double estimatedFare;
+}
+
+@Data
+@Entity
+class Payment {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private int rideId;
+    @ManyToOne
+    @JoinColumn(name = "rideId", insertable = false, updatable = false)
+    private Ride ride;
+    private double amount;
+    private String status;
+    private Date paymentTime;
+}
+
+@Data
+@Entity
+class RideHistory {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+    private int riderId;
+    @ManyToOne
+    @JoinColumn(name = "riderId", insertable = false, updatable = false)
+    private User rider;
+    private int driverId;
+    @ManyToOne
+    @JoinColumn(name = "driverId", insertable = false, updatable = false)
+    private Driver driver;
+    private double distance;
+    private double fare;
+    private Date rideDate;
+    private double rating;
+}
+
+@Data
+class MatchingConfig {
+    private double maxRadiusKm;
+    private double affiliationWeight;
+    private double distanceWeight;
+    private double acceptanceRateWeight;
+    private double minDistanceKm;
+    private double baseFare;
+    private double perKmFare;
+    private double nightSurcharge;
+}
+
+@Service
+class ConfigService {
+    private final MatchingConfig config;
+
+    public ConfigService(@Value("${config.path:config.json}") String configPath) throws Exception {
+        this.config = new ObjectMapper().readValue(new java.io.File(configPath), MatchingConfig.class);
+    }
+
+    public MatchingConfig getConfig() {
+        return config;
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+class RideMatchingService {
+    private final ConfigService configService;
+    private final DriverRepository driverRepository;
+
+    @Transactional
+    public Driver matchDriver(Ride ride) {
+        MatchingConfig config = configService.getConfig();
+        List<Driver> drivers = driverRepository.findByIsAvailableTrue();
+        List<DriverScore> scoredDrivers = new ArrayList<>();
+
+        for (Driver driver : drivers) {
+            double distance = calculateDistance(ride.getStartLat(), ride.getStartLon(),
+                                             driver.getLatitude(), driver.getLongitude());
+            if (distance > config.getMaxRadiusKm()) continue;
+            if (distance < config.getMinDistanceKm() && driver.isAffiliated()) continue;
+
+            double score = calculateDriverScore(driver, distance, config);
+            scoredDrivers.add(new DriverScore(driver, score));
+        }
+
+        return scoredDrivers.stream()
+            .max(Comparator.comparingDouble(DriverScore::getScore))
+            .map(DriverScore::getDriver)
+            .orElse(null);
+    }
+
+    private double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+        final double R = 6371;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                   Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+                   Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return R * c;
+    }
+
+    private double calculateDriverScore(Driver driver, double distance, MatchingConfig config) {
+        double affiliationScore = driver.isAffiliated() ? config.getAffiliationWeight() : 0;
+        double distanceScore = (config.getMaxRadiusKm() - distance) / config.getMaxRadiusKm() * config.getDistanceWeight();
+        double acceptanceScore = driver.getAcceptanceRate() * config.getAcceptanceRateWeight();
+        return affiliationScore + distanceScore + acceptanceScore;
+    }
+
+    private record DriverScore(Driver driver, double score) {}
+}
+
+@Service
+@RequiredArgsConstructor
+class PaymentService {
+    private final ConfigService configService;
+
+    public double calculateFare(Ride ride) {
+        MatchingConfig config = configService.getConfig();
+        double baseFare = config.getBaseFare();
+        double distanceFare = ride.getDistance() * config.getPerKmFare();
+        double nightSurcharge = isNightTime(ride.getRequestTime()) ? config.getNightSurcharge() : 0;
+        return baseFare + distanceFare + nightSurcharge;
+    }
+
+    private boolean isNightTime(Date time) {
+        Calendar cal = Calendar.getInstance();
+        cal.setTime(time);
+        int hour = cal.get(Calendar.HOUR_OF_DAY);
+        return hour >= 0 && hour < 4;
+    }
+}
+
+interface UserRepository extends JpaRepository<User, Integer> {
+    Optional<User> findByUsername(String username);
+}
+
+interface DriverRepository extends JpaRepository<Driver, Integer> {
+    List<Driver> findByIsAvailableTrue();
+}
+
+interface RideRepository extends JpaRepository<Ride, Integer> {
+    long countByDriverId(int driverId);
+    long countByDriverIdAndStatusNot(int driverId, String status);
+}
+
+interface PaymentRepository extends JpaRepository<Payment, Integer> {}
+
+interface RideHistoryRepository extends JpaRepository<RideHistory, Integer> {
+    List<RideHistory> findByRiderId(int riderId);
+    List<RideHistory> findByDriverId(int driverId);
+    List<RideHistory> findByDriverIdAndRatingGreaterThan(int driverId, double rating);
+}
+
+@RestController
+@RequestMapping("/api/users")
+@RequiredArgsConstructor
+class UserController {
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final AuthenticationManager authenticationManager;
+
+    @PostMapping("/register")
+    public ResponseEntity<?> register(@RequestBody UserRegisterDto dto) {
+        User user = new User();
+        user.setUsername(dto.getUsername());
+        user.setPasswordHash(passwordEncoder.encode(dto.getPassword()));
+        user.setEmail(dto.getEmail());
+        user.setPhone(dto.getPhone());
+        user.setRole("Rider");
+        userRepository.save(user);
+        return ResponseEntity.ok(Map.of("message", "User registered"));
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody UserLoginDto dto) {
+        Authentication authentication = authenticationManager.authenticate(
+            new UsernamePasswordAuthenticationToken(dto.getUsername(), dto.getPassword())
+        );
+        String token = Jwts.builder()
+            .setSubject(authentication.getName())
+            .claim("roles", authentication.getAuthorities())
+            .setIssuer("issuer")
+            .setAudience("audience")
+            .setExpiration(Date.from(Instant.now().plus(1, ChronoUnit.HOURS)))
+            .signWith(Keys.hmacShaKeyFor("secretkey".getBytes()), SignatureAlgorithm.HS256)
+            .compact();
+        return ResponseEntity.ok(Map.of("token", token));
+    }
+}
+
+@RestController
+@RequestMapping("/api/drivers")
+@RequiredArgsConstructor
+class DriverController {
+    private final DriverRepository driverRepository;
+
+    @PostMapping("/register")
+    public ResponseEntity<?> registerDriver(@RequestBody DriverRegisterDto dto) {
+        Driver driver = new Driver();
+        driver.setName(dto.getName());
+        driver.setAffiliated(dto.isAffiliated());
+        driver.setLatitude(dto.getLatitude());
+        driver.setLongitude(dto.getLongitude());
+        driver.setAvailable(true);
+        driver.setAcceptanceRate(0.0);
+        driver.setRating(0.0);
+        driverRepository.save(driver);
+        return ResponseEntity.ok(Map.of("message", "Driver registered"));
+    }
+
+    @PostMapping("/update-location")
+    public ResponseEntity<?> updateLocation(@RequestBody LocationUpdateDto dto) {
+        Driver driver = driverRepository.findById(dto.getDriverId())
+            .orElseThrow(() -> new RuntimeException("Driver not found"));
+        driver.setLatitude(dto.getLatitude());
+        driver.setLongitude(dto.getLongitude());
+        driver.setAvailable(dto.isAvailable());
+        driverRepository.save(driver);
+        return ResponseEntity.ok(Map.of("message", "Location updated"));
+    }
+}
+
+@RestController
+@RequestMapping("/api/rides")
+@RequiredArgsConstructor
+class RideController {
+    private final RideRepository rideRepository;
+    private final DriverRepository driverRepository;
+    private final RideMatchingService matchingService;
+    private final PaymentService paymentService;
+    private final PaymentRepository paymentRepository;
+    private final RideHistoryRepository rideHistoryRepository;
+
+    @PostMapping("/request")
+    public ResponseEntity<?> requestRide(@RequestBody RideRequestDto dto, Authentication auth) {
+        int riderId = Integer.parseInt(auth.getName());
+        Ride ride = new Ride();
+        ride.setRiderId(riderId);
+        ride.setStartLat(dto.getStartLat());
+        ride.setStartLon(dto.getStartLon());
+        ride.setEndLat(dto.getEndLat());
+        ride.setEndLon(dto.getEndLon());
+        ride.setStatus("Requested");
+        ride.setRequestTime(new Date());
+        ride.setDistance(matchingService.calculateDistance(dto.getStartLat(), dto.getStartLon(), dto.getEndLat(), dto.getEndLon()));
+        ride.setEstimatedFare(paymentService.calculateFare(ride));
+        rideRepository.save(ride);
+
+        Driver driver = matchingService.matchDriver(ride);
+        if (driver == null) {
+            return ResponseEntity.badRequest().body(Map.of("message", "No drivers available"));
+        }
+
+        ride.setDriverId(driver.getId());
+        ride.setStatus("Assigned");
+        ride.setAcceptTime(new Date());
+        driver.setAvailable(false);
+        driverRepository.save(driver);
+        rideRepository.save(ride);
+        return ResponseEntity.ok(Map.of("rideId", ride.getId(), "driverId", driver.getId()));
+    }
+
+    @PostMapping("/complete")
+    @Transactional
+    public ResponseEntity<?> completeRide(@RequestBody RideCompleteDto dto) {
+        Ride ride = rideRepository.findById(dto.getRideId())
+            .orElseThrow(() -> new RuntimeException("Ride not found"));
+        ride.setStatus("Completed");
+        ride.setCompleteTime(new Date());
+
+        Driver driver = driverRepository.findById(ride.getDriverId())
+            .orElseThrow(() -> new RuntimeException("Driver not found"));
+        driver.setAvailable(true);
+        driver.setAcceptanceRate(calculateNewAcceptanceRate(driver));
+        driverRepository.save(driver);
+
+        Payment payment = new Payment();
+        payment.setRideId(ride.getId());
+        payment.setAmount(paymentService.calculateFare(ride));
+        payment.setStatus("Pending");
+        payment.setPaymentTime(new Date());
+        paymentRepository.save(payment);
+
+        RideHistory history = new RideHistory();
+        history.setRiderId(ride.getRiderId());
+        history.setDriverId(ride.getDriverId());
+        history.setDistance(ride.getDistance());
+        history.setFare(payment.getAmount());
+        history.setRideDate(new Date());
+        history.setRating(0.0);
+        rideHistoryRepository.save(history);
+
+        rideRepository.save(ride);
+        return ResponseEntity.ok(Map.of("message", "Ride completed", "paymentId", payment.getId()));
+    }
+
+    @PostMapping("/cancel")
+    public ResponseEntity<?> cancelRide(@RequestBody RideCancelDto dto) {
+        Ride ride = rideRepository.findById(dto.getRideId())
+            .orElseThrow(() -> new RuntimeException("Ride not found"));
+        ride.setStatus("Cancelled");
+        if (ride.getDriverId() != null) {
+            Driver driver = driverRepository.findById(ride.getDriverId())
+                .orElseThrow(() -> new RuntimeException("Driver not found"));
+            driver.setAvailable(true);
+            driverRepository.save(driver);
+        }
+        rideRepository.save(ride);
+        return ResponseEntity.ok(Map.of("message", "Ride cancelled"));
+    }
+
+    private double calculateNewAcceptanceRate(Driver driver) {
+        long totalRides = rideRepository.countByDriverId(driver.getId());
+        long acceptedRides = rideRepository.countByDriverIdAndStatusNot(driver.getId(), "Cancelled");
+        return totalRides > 0 ? (double) acceptedRides / totalRides : 0.0;
+    }
+}
+
+@RestController
+@RequestMapping("/api/payments")
+@RequiredArgsConstructor
+class PaymentController {
+    private final PaymentRepository paymentRepository;
+
+    @PostMapping("/process")
+    public ResponseEntity<?> processPayment(@RequestBody PaymentProcessDto dto) {
+        Payment payment = paymentRepository.findById(dto.getPaymentId())
+            .orElseThrow(() -> new RuntimeException("Payment not found"));
+        payment.setStatus("Completed");
+        payment.setPaymentTime(new Date());
+        paymentRepository.save(payment);
+        return ResponseEntity.ok(Map.of("message", "Payment processed"));
+    }
+}
+
+@RestController
+@RequestMapping("/api/history")
+@RequiredArgsConstructor
+class RideHistoryController {
+    private final RideHistoryRepository rideHistoryRepository;
+    private final DriverRepository driverRepository;
+
+    @GetMapping("/rider")
+    public ResponseEntity<?> getRiderHistory(Authentication auth) {
+        int riderId = Integer.parseInt(auth.getName());
+        List<RideHistory> history = rideHistoryRepository.findByRiderId(riderId);
+        List<Map<String, Object>> result = history.stream().map(rh -> Map.of(
+            "id", rh.getId(),
+            "driverName", rh.getDriver().getName(),
+            "distance", rh.getDistance(),
+            "fare", rh.getFare(),
+            "rideDate", rh.getRideDate(),
+            "rating", rh.getRating()
+        )).collect(Collectors.toList());
+        return ResponseEntity.ok(result);
+    }
+
+    @GetMapping("/driver")
+    public ResponseEntity<?> getDriverHistory(Authentication auth) {
+        int driverId = Integer.parseInt(auth.getName());
+        List<RideHistory> history = rideHistoryRepository.findByDriverId(driverId);
+        List<Map<String, Object>> result = history.stream().map(rh -> Map.of(
+            "id", rh.getId(),
+            "riderUsername", rh.getRider().getUsername(),
+            "distance", rh.getDistance(),
+            "fare", rh.getFare(),
+            "rideDate", rh.getRideDate(),
+            "rating", rh.getRating()
+        )).collect(Collectors.toList());
+        return ResponseEntity.ok(result);
+    }
+
+    @PostMapping("/rate")
+    @Transactional
+    public ResponseEntity<?> rateRide(@RequestBody RideRatingDto dto) {
+        RideHistory history = rideHistoryRepository.findById(dto.getRideHistoryId())
+            .orElseThrow(() -> new RuntimeException("Ride history not found"));
+        history.setRating(dto.getRating());
+        Driver driver = driverRepository.findById(history.getDriverId())
+            .orElseThrow(() -> new RuntimeException("Driver not found"));
+        List<RideHistory> driverRatings = rideHistoryRepository.findByDriverIdAndRatingGreaterThan(driver.getId(), 0);
+        driver.setRating(driverRatings.isEmpty() ? 0.0 : driverRatings.stream().mapToDouble(RideHistory::getRating).average().orElse(0.0));
+        rideHistoryRepository.save(history);
+        driverRepository.save(driver);
+        return ResponseEntity.ok(Map.of("message", "Rating submitted"));
+    }
+}
+
+@Data
+class UserRegisterDto {
+    private String username;
+    private String password;
+    private String email;
+    private String phone;
+}
+
+@Data
+class UserLoginDto {
+    private String username;
+    private String password;
+}
+
+@Data
+class DriverRegisterDto {
+    private String name;
+    private boolean isAffiliated;
+    private double latitude;
+    private double longitude;
+}
+
+@Data
+class LocationUpdateDto {
+    private int driverId;
+    private double latitude;
+    private double longitude;
+    private boolean isAvailable;
+}
+
+@Data
+class RideRequestDto {
+    private double startLat;
+    private double startLon;
+    private double endLat;
+    private double endLon;
+}
+
+@Data
+class RideCompleteDto {
+    private int rideId;
+}
+
+@Data
+class RideCancelDto {
+    private int rideId;
+}
+
+@Data
+class PaymentProcessDto {
+    private int paymentId;
+}
+
+@Data
+class RideRatingDto {
+    private int rideHistoryId;
+    private double rating;
+}

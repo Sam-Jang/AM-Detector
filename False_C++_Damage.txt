@@ -1,0 +1,89 @@
+#include <mysql_driver.h>
+#include <mysql_connection.h>
+#include <cppconn/prepared_statement.h>
+#include <cppconn/resultset.h>
+#include <iostream>
+#include <algorithm>
+
+int calculateDamage(int attackPower, int armorPenetration, int monsterDefense) {
+    int effectiveDefense = std::max(monsterDefense - armorPenetration, 0);
+    return std::max(attackPower - effectiveDefense, 0);
+}
+
+int main() {
+    sql::mysql::MySQL_Driver *driver;
+    sql::Connection *con;
+    driver = sql::mysql::get_mysql_driver_instance();
+    con = driver->connect("tcp://127.0.0.1:3306/rpg_db", "root", "yourpassword");
+
+    sql::PreparedStatement *pstmt = con->prepareStatement("SELECT Id FROM Monsters LIMIT 1");
+    sql::ResultSet *res = pstmt->executeQuery();
+    int monsterId;
+    if (res->next()) {
+        monsterId = res->getInt("Id");
+    } else {
+        std::cerr << "No monsters found" << std::endl;
+        delete res;
+        delete pstmt;
+        delete con;
+        return 1;
+    }
+    delete res;
+    delete pstmt;
+
+    pstmt = con->prepareStatement("SELECT Id FROM Users LIMIT 1");
+    res = pstmt->executeQuery();
+    int userId;
+    if (res->next()) {
+        userId = res->getInt("Id");
+    } else {
+        std::cerr << "No users found" << std::endl;
+        delete res;
+        delete pstmt;
+        delete con;
+        return 1;
+    }
+    delete res;
+    delete pstmt;
+
+    pstmt = con->prepareStatement("SELECT Health, Defense FROM Monsters WHERE Id = ?");
+    pstmt->setInt(1, monsterId);
+    res = pstmt->executeQuery();
+    int monsterHealth, monsterDefense;
+    if (res->next()) {
+        monsterHealth = res->getInt("Health");
+        monsterDefense = res->getInt("Defense");
+    } else {
+        std::cerr << "Monster not found" << std::endl;
+        delete res;
+        delete pstmt;
+        delete con;
+        return 1;
+    }
+    delete res;
+    delete pstmt;
+
+    pstmt = con->prepareStatement("SELECT AttackPower, ArmorPenetration FROM Users WHERE Id = ?");
+    pstmt->setInt(1, userId);
+    res = pstmt->executeQuery();
+    int userAttackPower, userArmorPenetration;
+    if (res->next()) {
+        userAttackPower = res->getInt("AttackPower");
+        userArmorPenetration = res->getInt("ArmorPenetration");
+    } else {
+        std::cerr << "User not found" << std::endl;
+        delete res;
+        delete pstmt;
+        delete con;
+        return 1;
+    }
+    delete res;
+    delete pstmt;
+
+    int damage = calculateDamage(userAttackPower, userArmorPenetration, monsterDefense);
+    std::cout << "Calculated Damage: " << damage << std::endl;
+    std::cout << "Monster's Remaining Health: " << std::max(monsterHealth - damage, 0) << std::endl;
+
+    delete con;
+    return 0;
+}

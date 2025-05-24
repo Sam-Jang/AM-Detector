@@ -1,0 +1,455 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <sqlite3.h>
+
+class Coupon {
+public:
+    std::string Code;
+    double Discount;
+
+    Coupon(const std::string& code, double discount) : Code(code), Discount(discount) {}
+};
+
+class UserProfile {
+public:
+    std::string Username;
+    std::string Password;
+    std::string Address;
+    std::vector<Coupon> Coupons;
+
+    UserProfile(const std::string& username, const std::string& password, const std::string& address)
+        : Username(username), Password(password), Address(address) {}
+};
+
+class Category {
+public:
+    std::string Name;
+    std::string Description;
+
+    Category(const std::string& name, const std::string& description) : Name(name), Description(description) {}
+};
+
+class Review;
+
+class Product {
+public:
+    std::string Name;
+    std::string Description;
+    double Price;
+    std::string Category;
+    int Stock;
+    std::vector<std::string> LikedBy;
+    std::vector<Review> Reviews;
+
+    Product(const std::string& name, const std::string& description, double price, const std::string& category, int stock)
+        : Name(name), Description(description), Price(price), Category(category), Stock(stock) {}
+};
+
+class Review {
+public:
+    UserProfile* User;
+    std::string Comment;
+    int Rating;
+
+    Review(UserProfile* user, const std::string& comment, int rating) : User(user), Comment(comment), Rating(rating) {}
+};
+
+class Order {
+public:
+    UserProfile* User;
+    Product* Product;
+    int Quantity;
+    std::string Status;
+
+    Order(UserProfile* user, Product* product, int quantity)
+        : User(user), Product(product), Quantity(quantity), Status("Processing") {}
+};
+
+class SupportTicket {
+public:
+    UserProfile* User;
+    std::string Message;
+    std::string Status;
+
+    SupportTicket(UserProfile* user, const std::string& message) : User(user), Message(message), Status("Open") {}
+};
+
+class ShoppingCart {
+public:
+    std::vector<Order*> Items;
+
+    void AddProduct(Order* order) {
+        Items.push_back(order);
+    }
+
+    void RemoveProduct(Order* order) {
+        Items.erase(std::remove(Items.begin(), Items.end(), order), Items.end());
+    }
+
+    double CalculateTotal() {
+        double total = 0.0;
+        for (const auto& item : Items) {
+            total += item->Product->Price * item->Quantity;
+        }
+        return total;
+    }
+
+    double ApplyCoupon(Coupon* coupon) {
+        return CalculateTotal() * (1 - coupon->Discount / 100);
+    }
+};
+
+class Shop {
+private:
+    std::vector<UserProfile*> users;
+    std::vector<Category*> categories;
+    std::vector<Product*> products;
+    std::vector<Coupon*> availableCoupons;
+    std::vector<SupportTicket*> supportTickets;
+    std::vector<Order*> orders;
+    ShoppingCart shoppingCart;
+    UserProfile* currentUser = nullptr;
+    const char* dbFilename = "shop.db";
+
+public:
+    Shop() {
+        LoadDataFromDatabase();
+    }
+
+    void LoadDataFromDatabase() {
+        sqlite3* db;
+        sqlite3_open(dbFilename, &db);
+
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "SELECT * FROM Users", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            users.push_back(new UserProfile(
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)))
+            ));
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "SELECT * FROM Categories", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            categories.push_back(new Category(
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)))
+            ));
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "SELECT * FROM Products", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            products.push_back(new Product(
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
+                sqlite3_column_double(stmt, 2),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3))),
+                sqlite3_column_int(stmt, 4)
+            ));
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db, "SELECT * FROM Coupons", -1, &stmt, nullptr);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            availableCoupons.push_back(new Coupon(
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))),
+                sqlite3_column_double(stmt, 1)
+            ));
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_close(db);
+    }
+
+    bool Login(const std::string& username, const std::string& password) {
+        for (auto user : users) {
+            if (user->Username == username && user->Password == password) {
+                currentUser = user;
+                std::cout << "Logged in as " << username << std::endl;
+                return true;
+            }
+        }
+        std::cout << "Login failed" << std::endl;
+        return false;
+    }
+
+    void Signup(const std::string& username, const std::string& password, const std::string& address) {
+        sqlite3* db;
+        sqlite3_open(dbFilename, &db);
+
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "INSERT INTO Users (Username, Password, Address) VALUES (?, ?, ?)", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, password.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, address.c_str(), -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        sqlite3_close(db);
+
+        users.push_back(new UserProfile(username, password, address));
+        std::cout << "User registered successfully!" << std::endl;
+    }
+
+    void SearchProducts(const std::string& query) {
+        std::cout << "Search results for '" << query << "':" << std::endl;
+        for (const auto& product : products) {
+            if (product->Name.find(query) != std::string::npos || product->Description.find(query) != std::string::npos) {
+                std::cout << product->Name << " - " << product->Price << " USD" << std::endl;
+            }
+        }
+    }
+
+    void FilterProductsByCategory(const std::string& category) {
+        std::cout << "Products in category '" << category << "':" << std::endl;
+        for (const auto& product : products) {
+            if (product->Category == category) {
+                std::cout << product->Name << " - " << product->Price << " USD" << std::endl;
+            }
+        }
+    }
+
+    void ToggleLikeProduct(const std::string& productName) {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        for (auto& product : products) {
+            if (product->Name == productName) {
+                auto it = std::find(product->LikedBy.begin(), product->LikedBy.end(), currentUser->Username);
+                if (it != product->LikedBy.end()) {
+                    product->LikedBy.erase(it);
+                    std::cout << "Product removed from wishlist." << std::endl;
+                } else {
+                    product->LikedBy.push_back(currentUser->Username);
+                    std::cout << "Product added to wishlist." << std::endl;
+                }
+                return;
+            }
+        }
+        std::cout << "Product not found." << std::endl;
+    }
+
+    void AddToCart(const std::string& productName, int quantity) {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        for (auto& product : products) {
+            if (product->Name == productName) {
+                if (product->Stock >= quantity) {
+                    auto order = new Order(currentUser, product, quantity);
+                    shoppingCart.AddProduct(order);
+                    orders.push_back(order);
+                    std::cout << productName << " added to cart." << std::endl;
+                } else {
+                    std::cout << "Not enough stock for " << productName << ". Only " << product->Stock << " left." << std::endl;
+                }
+                return;
+            }
+        }
+        std::cout << "Product not found." << std::endl;
+    }
+
+    void ViewCart() {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        std::cout << "Your Cart:" << std::endl;
+        for (const auto& order : shoppingCart.Items) {
+            if (order->User == currentUser) {
+                std::cout << order->Product->Name << " - " << order->Quantity << " units - " << order->Product->Price * order->Quantity << " USD" << std::endl;
+            }
+        }
+    }
+
+    void ApplyCoupon(const std::string& couponCode) {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        auto it = std::find_if(availableCoupons.begin(), availableCoupons.end(), [&couponCode](Coupon* c) {
+            return c->Code == couponCode;
+        });
+
+        if (it != availableCoupons.end()) {
+            double total = shoppingCart.ApplyCoupon(*it);
+            std::cout << "Coupon applied. Total after discount: " << total << " USD" << std::endl;
+        } else {
+            std::cout << "Invalid coupon code." << std::endl;
+        }
+    }
+
+    void Checkout() {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        double total = shoppingCart.CalculateTotal();
+        std::cout << "Total amount to pay: " << total << " USD" << std::endl;
+        std::cout << "Order placed successfully!" << std::endl;
+
+        for (auto& order : shoppingCart.Items) {
+            order->Product->Stock -= order->Quantity;
+        }
+
+        shoppingCart.Items.clear();
+    }
+
+    void WriteReview(const std::string& productName, const std::string& comment, int rating) {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        for (auto& product : products) {
+            if (product->Name == productName) {
+                product->Reviews.emplace_back(currentUser, comment, rating);
+                std::cout << "Review added." << std::endl;
+                return;
+            }
+        }
+        std::cout << "Product not found." << std::endl;
+    }
+
+    void ViewReviews(const std::string& productName) {
+        for (const auto& product : products) {
+            if (product->Name == productName) {
+                std::cout << "Reviews for " << product->Name << ":" << std::endl;
+                for (const auto& review : product->Reviews) {
+                    std::cout << review.User->Username << ": " << review.Comment << " (Rating: " << review.Rating << "/5)" << std::endl;
+                }
+                return;
+            }
+        }
+        std::cout << "Product not found." << std::endl;
+    }
+
+    void ContactSupport(const std::string& message) {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        supportTickets.push_back(new SupportTicket(currentUser, message));
+        std::cout << "Support ticket created. We will get back to you soon." << std::endl;
+    }
+
+    void ViewSupportTickets() {
+        if (!currentUser) {
+            std::cout << "Please login first." << std::endl;
+            return;
+        }
+
+        std::cout << "Your Support Tickets:" << std::endl;
+        for (const auto& ticket : supportTickets) {
+            if (ticket->User == currentUser) {
+                std::cout << ticket->Message << " - Status: " << ticket->Status << std::endl;
+            }
+        }
+    }
+
+    void Run() {
+        std::string command;
+
+        while (true) {
+            std::cout << "\nEnter a command (signup, login, search, category, like, add, cart, applycoupon, checkout, review, viewreviews, support, viewsupport, exit): ";
+            std::cin >> command;
+
+            if (command == "signup") {
+                std::string username, password, address;
+                std::cout << "Username: ";
+                std::cin >> username;
+                std::cout << "Password: ";
+                std::cin >> password;
+                std::cout << "Address: ";
+                std::cin >> address;
+                Signup(username, password, address);
+            } else if (command == "login") {
+                std::string username, password;
+                std::cout << "Username: ";
+                std::cin >> username;
+                std::cout << "Password: ";
+                std::cin >> password;
+                Login(username, password);
+            } else if (command == "search") {
+                std::string query;
+                std::cout << "Search: ";
+                std::cin >> query;
+                SearchProducts(query);
+            } else if (command == "category") {
+                std::string category;
+                std::cout << "Category: ";
+                std::cin >> category;
+                FilterProductsByCategory(category);
+            } else if (command == "like") {
+                std::string productName;
+                std::cout << "Product name: ";
+                std::cin >> productName;
+                ToggleLikeProduct(productName);
+            } else if (command == "add") {
+                std::string productName;
+                int quantity;
+                std::cout << "Product name: ";
+                std::cin >> productName;
+                std::cout << "Quantity: ";
+                std::cin >> quantity;
+                AddToCart(productName, quantity);
+            } else if (command == "cart") {
+                ViewCart();
+            } else if (command == "applycoupon") {
+                std::string couponCode;
+                std::cout << "Coupon code: ";
+                std::cin >> couponCode;
+                ApplyCoupon(couponCode);
+            } else if (command == "checkout") {
+                Checkout();
+            } else if (command == "review") {
+                std::string productName, comment;
+                int rating;
+                std::cout << "Product name: ";
+                std::cin >> productName;
+                std::cout << "Your review: ";
+                std::cin.ignore();
+                std::getline(std::cin, comment);
+                std::cout << "Rating (1-5): ";
+                std::cin >> rating;
+                WriteReview(productName, comment, rating);
+            } else if (command == "viewreviews") {
+                std::string productName;
+                std::cout << "Product name: ";
+                std::cin >> productName;
+                ViewReviews(productName);
+            } else if (command == "support") {
+                std::string message;
+                std::cout << "Your message: ";
+                std::cin.ignore();
+                std::getline(std::cin, message);
+                ContactSupport(message);
+            } else if (command == "viewsupport") {
+                ViewSupportTickets();
+            } else if (command == "exit") {
+                break;
+            } else {
+                std::cout << "Invalid command" << std::endl;
+            }
+        }
+    }
+};
+
+int main() {
+    Shop shop;
+    shop.Run();
+    return 0;
+}

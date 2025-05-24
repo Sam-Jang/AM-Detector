@@ -1,0 +1,77 @@
+def _test_option_type(option_type):
+    if (option_type != "c") and (option_type != "p"):
+        raise GBS_InputError("Invalid Input option_type ({0}). Acceptable value are: c, p".format(option_type))
+
+def _gbs_test_inputs(option_type, fs, x, t, r, b, v):
+
+    _test_option_type(option_type)
+
+    if (x < _GBS_Limits.MIN_X) or (x > _GBS_Limits.MAX_X):
+        raise GBS_InputError(
+            "Invalid Input Strike Price (X). Acceptable range for inputs is {1} to {2}".format(x, _GBS_Limits.MIN_X,
+                                                                                               _GBS_Limits.MAX_X))
+
+    if (fs < _GBS_Limits.MIN_FS) or (fs > _GBS_Limits.MAX_FS):
+        raise GBS_InputError(
+            "Invalid Input Forward/Spot Price (FS). Acceptable range for inputs is {1} to {2}".format(fs,
+                                                                                                      _GBS_Limits.MIN_FS,
+                                                                                                      _GBS_Limits.MAX_FS))
+
+    if (t < _GBS_Limits.MIN_T) or (t > _GBS_Limits.MAX_T):
+        raise GBS_InputError(
+            "Invalid Input Time (T = {0}). Acceptable range for inputs is {1} to {2}".format(t, _GBS_Limits.MIN_T,
+                                                                                             _GBS_Limits.MAX_T))
+
+    if (b < _GBS_Limits.MIN_b) or (b > _GBS_Limits.MAX_b):
+        raise GBS_InputError(
+            "Invalid Input Cost of Carry (b = {0}). Acceptable range for inputs is {1} to {2}".format(b,
+                                                                                                      _GBS_Limits.MIN_b,
+                                                                                                      _GBS_Limits.MAX_b))
+
+    if (r < _GBS_Limits.MIN_r) or (r > _GBS_Limits.MAX_r):
+        raise GBS_InputError(
+            "Invalid Input Risk Free Rate (r = {0}). Acceptable range for inputs is {1} to {2}".format(r,
+                                                                                                       _GBS_Limits.MIN_r,
+                                                                                                       _GBS_Limits.MAX_r))
+
+    if (v < _GBS_Limits.MIN_V) or (v > _GBS_Limits.MAX_V):
+        raise GBS_InputError(
+            "Invalid Input Implied Volatility (V = {0}). Acceptable range for inputs is {1} to {2}".format(v,
+                                                                                                           _GBS_Limits.MIN_V,
+                                                                                                           _GBS_Limits.MAX_V))
+
+
+def _gbs(option_type, fs, x, t, r, b, v):
+    _debug("Debugging Information: _gbs()")
+
+    _gbs_test_inputs(option_type, fs, x, t, r, b, v)
+
+    t__sqrt = math.sqrt(t)
+    d1 = (math.log(fs / x) + (b + (v * v) / 2) * t) / (v * t__sqrt)
+    d2 = d1 - v * t__sqrt
+
+    if option_type == "c":
+        _debug("     Call Option")
+        value = fs * math.exp((b - r) * t) * norm.cdf(d1) - x * math.exp(-r * t) * norm.cdf(d2)
+        delta = math.exp((b - r) * t) * norm.cdf(d1)
+        gamma = math.exp((b - r) * t) * norm.pdf(d1) / (fs * v * t__sqrt)
+        theta = -(fs * v * math.exp((b - r) * t) * norm.pdf(d1)) / (2 * t__sqrt) - (b - r) * fs * math.exp(
+            (b - r) * t) * norm.cdf(d1) - r * x * math.exp(-r * t) * norm.cdf(d2)
+        vega = math.exp((b - r) * t) * fs * t__sqrt * norm.pdf(d1)
+        rho = x * t * math.exp(-r * t) * norm.cdf(d2)
+    else:
+        _debug("     Put Option")
+        value = x * math.exp(-r * t) * norm.cdf(-d2) - (fs * math.exp((b - r) * t) * norm.cdf(-d1))
+        delta = -math.exp((b - r) * t) * norm.cdf(-d1)
+        gamma = math.exp((b - r) * t) * norm.pdf(d1) / (fs * v * t__sqrt)
+        theta = -(fs * v * math.exp((b - r) * t) * norm.pdf(d1)) / (2 * t__sqrt) + (b - r) * fs * math.exp(
+            (b - r) * t) * norm.cdf(-d1) + r * x * math.exp(-r * t) * norm.cdf(-d2)
+        vega = math.exp((b - r) * t) * fs * t__sqrt * norm.pdf(d1)
+        rho = -x * t * math.exp(-r * t) * norm.cdf(-d2)
+
+    _debug("     d1= {0}\n     d2 = {1}".format(d1, d2))
+    _debug("     delta = {0}\n     gamma = {1}\n     theta = {2}\n     vega = {3}\n     rho={4}".format(delta, gamma,
+                                                                                                        theta, vega,
+                                                                                                        rho))
+    
+    return value, delta, gamma, theta, vega, rho
