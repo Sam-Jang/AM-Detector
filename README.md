@@ -51,5 +51,5 @@ Fine-Tuning_code.py
 ******
 
 ## 4. Inference Code
-Inference_code.py
+AM_Detector_infer.ipynb
 ******
