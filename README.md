@@ -1,3 +1,174 @@
+# AM Detector: Detecting Algorithmic Manipulation in Digital Markets with LLMs
+
+[![Journal](https://img.shields.io/badge/Journal-Journal%20of%20Digital%20Forensics%20(Jun%202026)-blue)](http://www.kdfs.or.kr)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Base Model](https://img.shields.io/badge/Base%20Model-LLaMA--3.1--8B--Instruct-orange)](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+
+> **Official Repository for the Paper:**  
+> **"Detecting Algorithmic Manipulation in Digital Markets with LLM"** (*Journal of Digital Forensics*, Vol. 20, No. 3, pp. 90–107, June 2026)  
+> Authors: Donggeun Jang, Sihyeon Park, Yeonsu Yeo, Sanghyeob Ko, Gibum Kim (Sungkyunkwan University & SK Telecom)
+
+---
+
+## 📌 Overview
+
+Due to information asymmetry between digital platforms and consumers, service providers often unfairly manipulate algorithms to favor their own products/services (**self-preferencing**), alter loot box probabilities (**loot box manipulation**), or facilitate tacit price coordination (**price fixing**). Traditional digital forensics approaches face severe limitations when sifting through vast amounts of source code manually.
+
+**AM Detector** is an AI-assisted digital forensic investigation tool designed to inspect source code and detect illegal algorithmic manipulation patterns in e-commerce and digital market platforms using **Large Language Models (LLMs)**.
+
+### Key Capabilities
+- **High Accuracy Detection:** Fine-tuned on regulatory decisions and court rulings, achieving **93% accuracy** on source code detection tasks.
+- **Privacy & On-Premise Execution:** Employs lightweight 8B parameter models (`LLaMA-3.1-8B-Instruct`) optimized with 8-bit quantization and QLoRA, allowing investigators to run models locally without exposing sensitive source code to public APIs.
+- **Multi-Language Support:** Evaluated and capable of inspecting C#, C++, Java, and Python source code.
+- **Chain-of-Thought (CoT) Explanations:** Provides explicit reasoning and pinpoints specific suspicious logic blocks alongside binary classification (`Found` / `Not Found`).
+
+---
+
+## 🏗 System Architecture
+
+The project explores and compares two distinct architectural paradigms:
+
+```
+[Target Source Code] ---> [ AM Detector ] ---> [ Forensic Inspection Report ]
+                               |
+       +-----------------------+-----------------------+
+       |                                               |
+[ Fine-Tuned Model (LoRA) ]               [ RAG + Reranker System ]
+  • Base: LLaMA-3.1-8B-Instruct             • Vector DB: ChromaDB (BAAI/bge-m3)
+  • Trained on 500 synthetic cases          • Reranker: BAAI/bge-reranker-v2-m3
+    derived from official court rulings.      • Knowledge Base: Regulatory Press Releases
+  • Accuracy: 93% (F1: 0.93)                • Accuracy: 79% (F1: 0.83)
+```
+
+1. **Fine-Tuned LLM (Recommended):** Base model (`LLaMA-3.1-8B-Instruct`) fine-tuned via LoRA ($r=8, lpha=16$) on a curated dataset of 500 synthetic summaries generated from 8 major regulatory ruling precedents (KFTC, US DOJ, EU Commission).
+2. **RAG System:** Utilizes ChromaDB vector storage with `bge-m3` embeddings and `bge-reranker-v2-m3` reranking over official enforcement press releases to reduce hallucination and supply explicit regulatory context.
+
+---
+
+## 📊 Experimental Results
+
+Evaluated on 96 synthetic source code samples (covering Self-Preferencing, Loot Box Manipulation, Price Fixing, and Non-Issue baseline code across 4 programming languages) and 4 real-world investigative source code files provided by competition authorities:
+
+| Method / Model | Accuracy | Precision | Recall | F1 Score | VRAM Usage |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Base Model (LLaMA-3.1-8B)** | 0.50 | 0.50 | 0.98 | 0.66 | ~16 GB |
+| **RAG System (BAAI Reranker)** | 0.79 | 0.70 | **1.00** | 0.83 | ~23 GB |
+| **AM Detector (Fine-Tuned)** | **0.93** | **0.91** | 0.96 | **0.93** | ~16 GB |
+| *GPT-5 (Benchmark)* | *0.95* | *0.91* | *1.00* | *0.95* | *Cloud API* |
+
+*Note: On-site investigative requirements strictly necessitate local/on-premise model execution to protect proprietary corporate source code from external leaks.*
+
+---
+
+## 🔍 Forensic Investigation Workflow
+
+`AM Detector` integrates into on-site digital forensic investigations following a structured standard operating procedure:
+
+```
+[ Pre-Interview ] ──> [ Target & Period Selection ] ──> [ Code Filtering ]
+                                                              │
+[ Report / Evidence ] <── [ Revision History / Email ] <── [ AM Detector ]
+```
+
+1. **Pre-Interview:** Identify repository management structures (Git, SVN), project names, and key function naming conventions.
+2. **Filtering & Scope:** Isolate target code versions, configuration/constant files, and relevant algorithms (e.g., search ranking, recommendation, probability tables).
+3. **AM Detector Analysis:** Input selected code modules into `AM Detector` for automated pattern identification.
+4. **Targeted Evidence Collection:** Collect full commit histories, developer communications (emails, design docs, QA records) corresponding to detected illegal logic.
+
+---
+
+## 📁 Repository Structure
+
+```
+.
+├── data/
+│   ├── synthetic_test_set/    # 96 multi-language source code samples (C#, C++, Java, Python)
+│   ├── vector_db/             # ChromaDB index containing regulatory press releases
+│   └── train_synthetic.json   # 500 fine-tuning data pairs
+├── models/
+│   └── lora_weights/          # LoRA adapter weights for LLaMA-3.1-8B-Instruct
+├── prompts/
+│   └── forensic_prompt.txt    # Zero-shot investigation prompt template
+├── src/
+│   ├── detect.py              # Main inference script
+│   ├── rag_retriever.py       # RAG & Reranker pipeline
+│   └── train_lora.py          # Fine-tuning script
+├── README.md
+└── requirements.txt
+```
+
+---
+
+## 🛠 Quick Start
+
+### Hardware Requirements
+- **GPU:** NVIDIA RTX 3090 (24GB VRAM) or equivalent
+- **RAM:** 32 GB DDR4+
+- **OS:** Windows 10 / Linux
+
+### Installation
+
+```bash
+git clone https://github.com/Sam-Jang/AM-Detector.git
+cd AM-Detector
+pip install -r requirements.txt
+```
+
+### Running Inference
+
+To analyze a source code file for potential algorithmic manipulation:
+
+```bash
+python src/detect.py --input_file data/synthetic_test_set/csharp/sample_01.cs --model_path models/lora_weights
+```
+
+### Example Output
+
+```text
+Suspicious Pattern: Found
+Detail: [Prime Bias in Offer Scoring]
+The system introduces a PrimeBiasFactor that increases the score of offers from platform-retail sellers by 1.0 + PrimeBiasFactor. This creates a structural advantage for Amazon's own offers, as they are more likely to be featured and selected by users. This is a form of self-preferencing, where the platform gives its own offers an unfair advantage over those of third-party sellers.
+```
+
+---
+
+## 🏷 Classification Categories
+
+AM Detector classifies suspicious source code patterns into three core categories defined in competition law:
+
+1. **Self-Preferencing (자사우대):** Unfairly boosting the visibility, rank, or allocation of a platform's own products/services (e.g., search ranking bias, preferential taxi dispatch algorithms).
+2. **Loot Box / Probability Manipulation (확률형 아이템 조작):** Altering in-game item drop rates, dynamic probability adjustments, or misleading consumers regarding randomized outcomes.
+3. **Price Fixing / Algorithmic Collusion (가격 담합):** Multi-party or software-driven price coordination algorithms designed to maintain inflated price floors.
+
+---
+
+## 📜 Citation
+
+If you find this research or repository useful in your work, please cite our paper:
+
+```bibtex
+@article{jang2026detecting,
+  title={Detecting Algorithmic Manipulation in Digital Markets with LLM},
+  author={Jang, Donggeun and Park, Sihyeon and Yeo, Yeonsu and Ko, Sanghyeob and Kim, Gibum},
+  journal={Journal of Digital Forensics},
+  volume={20},
+  number={3},
+  pages={90--107},
+  year={2026},
+  publisher={Korean Digital Forensics Society},
+  doi={10.22798/kdfs.2026.20.3.90}
+}
+```
+
+---
+
+## 📄 License
+
+This project is released under the [MIT License](LICENSE).
+
+
+
+
 ## 1. Test Dataset is generated by xAI Grok3
 Prompt :
 ******
